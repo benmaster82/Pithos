@@ -997,6 +997,7 @@ struct Job {
     int ps, clixml;                 /* PowerShell; its stderr turned out to be CLIXML */
     Buf pend;                       /* CLIXML not decoded yet */
     char *script;                   /* temporary script file, removed at the end */
+    int chains;                     /* '&&' / '||' rewritten for Windows PowerShell 5.1 */
 };
 
 static const char *const SHELL_ENV[] = { "NO_COLOR=1", "TERM=dumb", "GIT_TERMINAL_PROMPT=0", "GIT_PAGER=cat", "PAGER=cat",
@@ -1135,6 +1136,47 @@ static int ps_script(const char *script, char *path, int cap) {
 }
 #endif
 
+/* Windows PowerShell 5.1 has no '&&' / '||', and models write them all the time: outside
+ * quotes, braces and parentheses "a && b" becomes "a; if (-not $?) { exit <code> }; b" (the
+ * command fails with a's exit code, as in a shell) and "a || b" "a; if (-not $?) { b }".
+ * Returns the number of rewrites. */
+static int ps_rewrite_chains(const char *cmd, Buf *out) {
+    int n = (int)strlen(cmd), depth = 0, rewrites = 0, seg = 0;
+    char q = 0;
+    Buf b = { 0 };
+    int closes = 0; /* if-blocks to close at the end */
+    for (int i = 0; i < n; i++) {
+        char c = cmd[i];
+        if (q) {
+            if (c == '`' && q == '"' && i + 1 < n) { i++; continue; }
+            if (c == q) q = 0;
+            continue;
+        }
+        if (c == '\'' || c == '"') { q = c; continue; }
+        if (c == '{' || c == '(') depth++;
+        else if ((c == '}' || c == ')') && depth > 0) depth--;
+        else if (!depth && i + 1 < n && ((c == '&' && cmd[i + 1] == '&') || (c == '|' && cmd[i + 1] == '|'))) {
+            buf_add(&b, cmd + seg, i - seg);
+            while (b.n && b.s[b.n - 1] == ' ') b.n--;
+            if (c == '&') {
+                buf_add(&b, "; if (-not $?) { exit $(if ($LASTEXITCODE) { $LASTEXITCODE } else { 1 }) }; ", -1);
+            } else {
+                buf_add(&b, "; if (-not $?) { ", -1);
+                closes++;
+            }
+            rewrites++;
+            i++;
+            while (i + 1 < n && cmd[i + 1] == ' ') i++;
+            seg = i + 1;
+        }
+    }
+    buf_add(&b, cmd + seg, n - seg);
+    for (int k = 0; k < closes; k++) buf_add(&b, " }", 2);
+    if (rewrites) buf_add(out, b.s, b.n);
+    buf_free(&b);
+    return rewrites;
+}
+
 static int is_abs_path(const char *p) {
     return p[0] == '/' || p[0] == '\\' || (isalpha((unsigned char)p[0]) && p[1] == ':');
 }
@@ -1157,6 +1199,7 @@ static Job *job_start(Tools *T, const Json *args, Buf *err) {
     int na = 0;
     char *script = NULL, *cmdline = NULL;
     char used[16], script_path[1100] = "";
+    int chains = 0;
 #if defined(_WIN32)
     if (!strcmp(shell, "cmd")) {
         snprintf(used, sizeof(used), "cmd");
@@ -1171,9 +1214,13 @@ static Job *job_start(Tools *T, const Json *args, Buf *err) {
         static const char head[] = "$ProgressPreference='SilentlyContinue'; try { [Console]::OutputEncoding="
                                    "[Text.Encoding]::UTF8 } catch {}; $OutputEncoding=[Text.Encoding]::UTF8\n";
         static const char tail[] = "\nexit $(if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 })\n";
-        size_t l = sizeof(head) + strlen(cmd) + sizeof(tail);
+        Buf fixed = { 0 };
+        if (!pwsh) chains = ps_rewrite_chains(cmd, &fixed);
+        const char *body = chains ? fixed.s : cmd;
+        size_t l = sizeof(head) + strlen(body) + sizeof(tail);
         script = (char *)malloc(l);
-        snprintf(script, l, "%s%s%s", head, cmd, tail);
+        snprintf(script, l, "%s%s%s", head, body, tail);
+        buf_free(&fixed);
         if (!ps_script(script, script_path, sizeof(script_path))) {
             free(script);
             buf_add(err, "error: cannot write the command to the temporary folder", -1);
@@ -1229,6 +1276,7 @@ static Job *job_start(Tools *T, const Json *args, Buf *err) {
     j->t0 = time_sec();
     j->refs = 4;
     j->ps = !strcmp(used, "powershell") || !strcmp(used, "pwsh");
+    j->chains = chains;
     if (script_path[0]) j->script = dupstr(script_path);
     if (!thread_spawn(job_read_out, j)) { j->out_eof = 1; j->refs--; }
     if (!thread_spawn(job_read_err, j)) { j->err_eof = 1; j->refs--; }
@@ -1276,8 +1324,22 @@ static void clean_output(const char *s, int n, Buf *o) {
         int need = (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
         int ok = need && i + need <= n;
         for (int k = 1; ok && k < need; k++) ok = ((unsigned char)s[i + k] & 0xC0) == 0x80;
-        if (ok) { buf_add(o, s + i, need); i += need; }
-        else { buf_add(o, "?", 1); i++; }
+        if (ok) { buf_add(o, s + i, need); i += need; continue; }
+#if defined(_WIN32)
+        /* not UTF-8: a console program writing in the OEM code page (e.g. PowerShell's own
+         * parse errors, printed before the script can switch to UTF-8) */
+        wchar_t w;
+        char u[4];
+        int k;
+        if (MultiByteToWideChar(CP_OEMCP, 0, s + i, 1, &w, 1) == 1 &&
+            (k = WideCharToMultiByte(CP_UTF8, 0, &w, 1, u, sizeof(u), NULL, NULL)) > 0) {
+            buf_add(o, u, k);
+            i++;
+            continue;
+        }
+#endif
+        buf_add(o, "?", 1);
+        i++;
     }
 }
 
@@ -1363,6 +1425,8 @@ static int tool_run(Tools *T, const Json *args, Buf *out) {
                         "(server, watcher), use start_process; otherwise give it a larger timeout | %s", timeout, j->shell);
     const char *cwd = json_str(json_get(args, "cwd"), "");
     if (*cwd) buf_printf(out, " | cwd: %s", cwd);
+    if (j->chains)
+        buf_add(out, "\n(note: Windows PowerShell 5.1 has no '&&' / '||': they were run with 'if ($?)' checks)", -1);
     int before = out->n;
     show_stream(out, "stdout", j->out.s ? j->out.s : "", j->out.n, j->out_drop, 12000);
     show_stream(out, "stderr", j->err.s ? j->err.s : "", j->err.n, j->err_drop, 6000);
@@ -1611,7 +1675,8 @@ static void build_env_info(Tools *T) {
     buf_add(&b,
             "- This is Windows: do not use Linux commands or paths (no ls -la, grep, cat | head, rm -rf, touch, which, export, /dev/null, ~/).\n"
             "- PowerShell syntax: separate commands with ';'. Windows PowerShell 5.1 has no '&&' and '||': run the next command "
-            "only on success with 'if ($?) { ... }'. The exit code of the last program is $LASTEXITCODE.\n"
+            "only on success with 'if ($?) { ... }' (a top-level '&&' is rewritten that way). The exit code of the last "
+            "program is $LASTEXITCODE. To run in another folder, pass cwd instead of 'cd'.\n"
             "- PowerShell equivalents: Get-ChildItem (ls), Get-ChildItem -Recurse -Filter *.c (find), Select-String -Pattern x -Path *.c (grep), "
             "Get-Content f -TotalCount 20 / -Tail 20 (head / tail), Remove-Item -Recurse -Force (rm -rf), "
             "New-Item -ItemType Directory -Force (mkdir -p), Get-Command (which), $env:NAME = 'v' (export), $null (/dev/null), "
@@ -1962,6 +2027,7 @@ Tools *tools_create(const ToolsConfig *cfg) {
         t->builtin = id;
     }
     if (cfg->mcp_config && *cfg->mcp_config) load_mcp_config(T, cfg->mcp_config);
+    if (cfg->shell) build_env_info(T); /* now, not lazily: server threads read it */
     return T;
 }
 
@@ -2046,8 +2112,13 @@ void tools_list_json(Tools *T, Buf *b) {
     }
     buf_add(b, "],\"workspace\":", -1);
     buf_json_str(b, T->workspace, -1);
-    buf_printf(b, ",\"web\":%s}", T->has_curl ? "true" : "false");
+    buf_printf(b, ",\"web\":%s", T->has_curl ? "true" : "false");
     lock_release(T->lock);
+    if (T->cfg.shell) { /* the system and shell rules the model needs to write commands */
+        buf_add(b, ",\"env\":", -1);
+        buf_json_str(b, tools_env_info(T), -1);
+    }
+    buf_add(b, "}", 1);
 }
 
 int tools_call(Tools *T, const char *name, const Json *args, Buf *out) {

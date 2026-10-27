@@ -352,6 +352,7 @@ const I = {
   clock: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
   plug: '<svg viewBox="0 0 24 24"><path d="M9 2v6M15 2v6M6 8h12v3a6 6 0 0 1-12 0zM12 17v5"/></svg>',
   pen: '<svg viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4z"/></svg>',
+  term: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/></svg>',
 };
 
 /* ---------------- storage (per browser) ---------------- */
@@ -498,7 +499,9 @@ function statsText(st) {
 /* ---------------- tool cards ---------------- */
 const TOOL_LABELS = { web_search: ["Web search", "search"], fetch_url: ["Read page", "globe"], calculator: ["Calculator", "calc"],
   get_current_datetime: ["Date and time", "clock"], list_directory: ["List folder", "folder"], read_file: ["Read file", "file"],
-  find_files: ["Find files", "search"], search_text: ["Search in files", "search"], write_file: ["Write file", "pen"] };
+  find_files: ["Find files", "search"], search_text: ["Search in files", "search"], write_file: ["Write file", "pen"],
+  edit_file: ["Edit file", "pen"], run_command: ["Run command", "term"], start_process: ["Start process", "term"],
+  read_process: ["Process output", "term"], stop_process: ["Stop process", "term"], list_processes: ["Processes", "term"] };
 
 function toolLabel(name) {
   if (TOOL_LABELS[name]) return { title: TOOL_LABELS[name][0], icon: I[TOOL_LABELS[name][1]] };
@@ -514,7 +517,8 @@ function parseArgs(s) {
 
 function argSummary(args) {
   if (!args || typeof args !== "object") return String(args || "");
-  for (const k of ["query", "url", "path", "pattern", "expression", "text"]) if (typeof args[k] === "string") return args[k];
+  for (const k of ["command", "query", "url", "path", "pattern", "expression", "text"]) if (typeof args[k] === "string") return args[k];
+  if (args.id !== undefined) return "process " + args.id;
   const v = Object.values(args)[0];
   return v === undefined ? "" : typeof v === "string" ? v : JSON.stringify(v);
 }
@@ -691,6 +695,9 @@ function agentPrompt() {
   if (toolsInfo.workspace && names.some((n) => /file|directory|search_text/.test(n)))
     p += " The file tools work inside the user's workspace folder; paths are relative to it.";
   p += " Call several tools at once when they are independent. Answer in the user's language.";
+  if (toolsInfo.env && names.includes("run_command"))
+    p += "\n\nThe computer you run commands on:\n" + toolsInfo.env +
+      "\nAfter each command read the exit code and the errors; when one fails, fix the cause before trying again.";
   return p;
 }
 

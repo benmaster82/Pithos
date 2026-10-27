@@ -54,6 +54,20 @@ int main(void) {
     check(!ok && strstr(r, "exit code 3") && strstr(r, "out1") && strstr(r, "--- stderr ---") && strstr(r, "err1"),
           "exit code, stdout and stderr apart");
     free(r);
+#if defined(_WIN32)
+    r = call(t, "run_command", "{\"command\": \"Write-Output one && Write-Output 'two && three'\"}", &ok);
+    check(ok && strstr(r, "one") && strstr(r, "two && three"), "'&&' works in Windows PowerShell 5.1");
+    free(r);
+    r = call(t, "run_command", "{\"command\": \"cmd /c exit 4 && Write-Output never\"}", &ok);
+    check(!ok && strstr(r, "exit code 4") && !strstr(r, "\nnever"), "'&&' stops at the first failure");
+    free(r);
+    r = call(t, "run_command", "{\"command\": \"cmd /c exit 4 || Write-Output fallback\"}", &ok);
+    check(ok && strstr(r, "fallback"), "'||' runs the fallback");
+    free(r);
+    r = call(t, "run_command", "{\"command\": \"Write-Output (1 +\"}", &ok);
+    check(!ok && strstr(r, "--- stderr ---") && !strstr(r, " ? "), "parse errors readable (OEM code page decoded)");
+    free(r);
+#endif
     r = call(t, "run_command", sleep, &ok);
     check(!ok && strstr(r, "TIMED OUT"), "timeout stops the command");
     free(r);

@@ -168,6 +168,67 @@ static void build_request(Buf *b) {
     buf_add(b, "}", 1);
 }
 
+/* ------------------------------------------------------------------ Markdown on the terminal */
+
+/* The answer arrives in pieces: a small state machine turns **bold**, `code`, ``` blocks and
+ * # headings into terminal styles as it streams (plain text without colors). */
+static struct {
+    int bold, code, block, stars, ticks, line_start, heading;
+} md = { 0, 0, 0, 0, 0, 1, 0 };
+
+static void md_style(void) {
+    out(RESET);
+    if (md.block) out(DIM);
+    else if (md.code) out(CYAN);
+    if (md.bold || md.heading) out(BOLD);
+}
+
+static void md_flush_marks(void) {
+    if (md.ticks) {
+        if (md.ticks >= 3) { md.block = !md.block; md.code = 0; } /* the fence itself is not shown */
+        else if (!md.block) md.code = !md.code;
+        else out("``");
+        md.ticks = 0;
+        md_style();
+    }
+    if (md.stars) {
+        if (md.stars == 2 && !md.code && !md.block) { md.bold = !md.bold; md_style(); }
+        else outn("***", md.stars > 3 ? 3 : md.stars);
+        md.stars = 0;
+    }
+}
+
+static void md_reset(void) {
+    memset(&md, 0, sizeof(md));
+    md.line_start = 1;
+}
+
+static void md_out(const char *s, int n) {
+    if (!C->color) { outn(s, n); return; }
+    for (int i = 0; i < n; i++) {
+        char c = s[i];
+        if (c == '`') { if (md.stars) md_flush_marks(); md.ticks++; continue; }
+        if (c == '*' && !md.code && !md.block) { if (md.ticks) md_flush_marks(); md.stars++; continue; }
+        md_flush_marks();
+        if (md.line_start && c == '#' && !md.block) { md.heading = 1; continue; } /* "## Title" -> bold title */
+        if (md.heading && md.line_start && c == ' ') { md_style(); continue; }
+        if (c == '\n') {
+            if (md.heading) { md.heading = 0; md_style(); }
+            md.line_start = 1;
+            out("\n");
+            continue;
+        }
+        md.line_start = 0;
+        outn(&c, 1);
+    }
+}
+
+static void md_end(void) {
+    md_flush_marks();
+    if (C->color) out(RESET);
+    md_reset();
+}
+
 /* ------------------------------------------------------------------ one model call */
 
 typedef struct {
@@ -236,7 +297,7 @@ static void on_event(Stream *s, const char *data, int n) {
                 s->content_started = 1;
             }
             buf_add(&s->content, c->s, c->len);
-            outn(c->s, c->len);
+            md_out(c->s, c->len);
         }
         const Json *tc = json_get(d, "tool_calls");
         for (const Json *t = tc && tc->t == J_ARR ? tc->child : NULL; t; t = t->next) {
@@ -298,7 +359,10 @@ static int model_call(Stream *s) {
     buf_free(&req);
     if (C->show_think && s->think_started && !s->content_started) col(RESET);
     if (!s->content_started) status_clear();
-    else out("\n");
+    else {
+        md_end();
+        out("\n");
+    }
     if (s->status != 200 && !s->error[0]) {
         Json *j = s->body.s ? json_parse(s->body.s, s->body.n, NULL, 0) : NULL;
         snprintf(s->error, sizeof(s->error), "%s",
@@ -619,7 +683,7 @@ static void build_system(void) {
             "- Before saying that the task is done, verify the result: run the program or the tests, read the file back.\n"
             "- Several independent tool calls can go in the same answer.\n"
             "- Be brief. At the end, summarize what you did and how you verified it.\n"
-            "- Always write your answers in the language of the user's request (Italian if the user writes in Italian).",
+            "- Write your answers in the same language as the user's latest request.",
             -1);
     if (C->system && *C->system) {
         buf_add(&b, "\n\n", 2);
@@ -791,8 +855,7 @@ static void out_fit(const char *s, int max, int keep_end) {
 }
 
 static void banner(const char *os, const char *folder) {
-    const char *mode = g_auto ? (C->yolo ? "autonomous mode, without the safety checks"
-                                         : "autonomous mode: destructive commands still ask")
+    const char *mode = g_auto ? (C->yolo ? "autonomous mode, no safety checks" : "autonomous mode: risky commands ask first")
                               : "safe mode: every action needs your approval";
     char title[64];
     snprintf(title, sizeof(title), "local AI agent  v%s", C->version ? C->version : "");

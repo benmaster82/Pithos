@@ -1,11 +1,35 @@
-# Pithos — a C inference engine for LFM2.5-24B-A2B
+<p align="center">
+  <img src="docs/terminal-banner.png" width="760" alt="Pithos: the terminal agent starting up">
+</p>
+
+<h1 align="center">Pithos</h1>
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="web/brand/pandora-mark-dark-ui.png">
-    <img src="web/brand/pandora-mark-light-ui.png" width="120" alt="Pandora">
-  </picture>
+  <b>A dependency-free C inference engine for Liquid AI's LFM2 / LFM2.5 models.</b><br>
+  Terminal chat, an OpenAI-compatible server, a web agent and a terminal agent, all in one executable.
 </p>
+
+<p align="center">
+  <img alt="C11, no dependencies" src="https://img.shields.io/badge/C11-no%20dependencies-7c5cf6">
+  <img alt="Windows, Linux, macOS" src="https://img.shields.io/badge/Windows%20%7C%20Linux%20%7C%20macOS-x86--64%20%26%20ARM64-ec5c8c">
+  <img alt="GPU: OpenCL, optional" src="https://img.shields.io/badge/GPU-OpenCL%2C%20optional-f5a05a">
+  <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-2ea043"></a>
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#screenshots">Screenshots</a> ·
+  <a href="#results">Results</a> ·
+  <a href="#terminal-agent">Terminal agent</a> ·
+  <a href="#adding-mcp-servers">MCP</a> ·
+  <a href="ROADMAP.md">Roadmap</a>
+</p>
+
+| | |
+|---|---|
+| **About 1.9× faster than llama.cpp** | 17–22 tok/s against 11 tok/s with CUDA, on the same laptop and model ([head-to-head](#head-to-head-with-llamacpp-v04-2026-10-24)) |
+| **Runs a 13.5 GB model on 16 GB of RAM** | experts stream from disk, the hot ones live in a 4 GB GPU |
+| **Agents included** | Pandora in the browser, and a terminal agent that runs commands, fixes code and checks its own work |
 
 Pithos is an inference engine written from scratch in C11 with **no dependencies**: no external
 libraries at build time, only the operating system API (Win32 or POSIX). It runs GGUF models of
@@ -24,6 +48,29 @@ model). **Pandora** is the agent in the web interface.
   MCP server.
 - **A terminal agent** that works on tasks with shell commands, background processes, files and
   the web, on Windows and Linux, in a safe mode (you approve every action) or an autonomous one.
+
+## Screenshots
+
+**Pandora**, the web agent, answers with real tools. Here it runs two git commands through the
+shell tools (`pithos --server --shell`) and summarizes them. Each card shows the command, the exit
+code, the run time and the output.
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/pandora-dark.png">
+    <img src="docs/pandora-light.png" width="860" alt="Pandora web UI: an agent turn with two shell commands">
+  </picture>
+</p>
+
+**The terminal agent** in autonomous mode (`pithos --auto`). It is asked to make failing tests
+pass. It reads the code, finds the bug, fixes it with `edit_file`, runs the tests and reads the
+file back. On Windows PowerShell 5.1 the `&&` it wrote was rewritten automatically.
+
+<p align="center">
+  <img src="docs/terminal-agent.png" width="860" alt="Terminal agent fixing a bug and running the tests">
+</p>
+
+Both are real sessions with LFM2.5-24B-A2B on the reference laptop (i5-10500H, GTX 1650 4 GB).
 
 ## Quick start
 
@@ -253,7 +300,8 @@ generation or command and gives the prompt back. During a session: `/auto`, `/sa
 `/tools`, `/help`, `/exit`.
 
 The shell tools are also available to Pandora with `pithos --server --shell`, behind the usual
-Allow / Deny cards. `tests/test_shell.c` checks them without the model (`build.cmd test`, then run
+Allow / Deny cards. Pandora receives the same system information and shell rules (`GET /v1/tools`
+returns them as `env`). `tests/test_shell.c` checks them without the model (`build.cmd test`, then run
 `build\test_shell.exe` from an empty folder).
 
 ### Adding MCP servers
