@@ -22,12 +22,12 @@ model). **Pandora** is the agent in the web interface.
 - OpenAI-compatible HTTP server with prompt reuse across turns, also after a restart.
 - **Pandora**, a single-file web chat with an agent mode: web search, files, calculator and any
   MCP server.
+- **A terminal agent** that works on tasks with shell commands, background processes, files and
+  the web, on Windows and Linux, in a safe mode (you approve every action) or an autonomous one.
 
 ## Quick start
 
-1. **Get the model.** Download `LFM2.5-24B-A2B-Q4_K_M.gguf` (13.5 GB) from
-   [LiquidAI/LFM2.5-24B-A2B-GGUF](https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF) and put it
-   in `models/`, either inside this folder or next to it (`../models`). Any other path works with `-m`.
+1. **Get the model** (see [Downloading the model](#downloading-the-model) below).
 2. **Build.** On Windows run `build.cmd`; on Linux / macOS run `make` (see [Building](#building)).
 3. **Run.**
 
@@ -36,8 +36,63 @@ server.cmd                                 server + web chat in the browser (htt
 build\pithos.exe                           interactive chat in the terminal
 build\pithos.exe -p "Hello, who are you?"  single answer
 build\pithos.exe --server                  OpenAI-compatible API + web interface
+build\pithos.exe --agent                   terminal agent in the current folder (safe mode)
 build\pithos.exe --bench                   prompt and generation benchmark
 ```
+
+On Linux / macOS the binary is `build/pithos`, with the same options.
+
+### Downloading the model
+Pithos uses the file **`LFM2.5-24B-A2B-Q4_K_M.gguf`** from Liquid AI's public repository
+[LiquidAI/LFM2.5-24B-A2B-GGUF](https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF). No account
+is needed.
+
+| | |
+|---|---|
+| Size | 14,526,258,464 bytes (13.5 GiB): keep about 15 GB free on the disk |
+| SHA-256 | `d3334405b96228eb9908cdebb5c6194908f2da64282bda852afc3a3910c64e7d` |
+| Direct link | https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF/resolve/main/LFM2.5-24B-A2B-Q4_K_M.gguf |
+| License | LFM Open License v1.0 (see the model card) |
+
+**Where to put it.** Pithos looks for `models/LFM2.5-24B-A2B-Q4_K_M.gguf` in the current folder, then
+in `../models` and `../../models`. The simplest choice is a `models` folder inside the Pithos folder,
+which `.gitignore` already excludes. Any other location works with `-m PATH`, and the terminal agent,
+which runs in your project folders, usually needs it.
+
+The commands below run from the Pithos folder. All of them resume an interrupted download when you
+run them again.
+
+**Windows (PowerShell).** `curl.exe` ships with Windows 10 and 11. Write `curl.exe`, not `curl`,
+which in Windows PowerShell 5.1 is an alias of a different command.
+
+```powershell
+New-Item -ItemType Directory -Force models | Out-Null
+curl.exe -L -C - -o models\LFM2.5-24B-A2B-Q4_K_M.gguf https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF/resolve/main/LFM2.5-24B-A2B-Q4_K_M.gguf
+Get-FileHash models\LFM2.5-24B-A2B-Q4_K_M.gguf -Algorithm SHA256    # compare with the SHA-256 above
+```
+
+**Linux / macOS.**
+
+```bash
+mkdir -p models
+curl -L -C - -o models/LFM2.5-24B-A2B-Q4_K_M.gguf https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF/resolve/main/LFM2.5-24B-A2B-Q4_K_M.gguf
+# or: wget -c -O models/LFM2.5-24B-A2B-Q4_K_M.gguf <the same URL>
+sha256sum models/LFM2.5-24B-A2B-Q4_K_M.gguf     # macOS: shasum -a 256 models/LFM2.5-24B-A2B-Q4_K_M.gguf
+```
+
+**With the Hugging Face CLI (any system).** If Python is installed, this is the most robust option
+on slow or unstable connections.
+
+```
+pip install -U huggingface_hub
+hf download LiquidAI/LFM2.5-24B-A2B-GGUF LFM2.5-24B-A2B-Q4_K_M.gguf --local-dir models
+```
+
+**With a browser.** Open the direct link above and save the file into the `models` folder.
+
+To check that the file is found and complete, run `build\pithos.exe -p "Hello"` (Linux:
+`build/pithos -p "Hello"`). The first lines report the model (`model: lfm2moe | 40 layers ...`).
+Pithos also rejects a truncated file and names the tensor that is missing.
 
 ## Results
 
@@ -145,6 +200,57 @@ Built-in tools, run by the server:
 The server starts with a 16k-token context, because tool results take space. The agent system prompt
 and the tool list (~1,200 tokens) stay cached after the first request, so each later step only
 processes the new result.
+
+### Terminal agent
+`pithos --agent` starts an agent session in the current folder: you give it a task, it works through
+the tools until the task is done, then waits for the next one. The conversation continues across
+tasks.
+
+```
+cd my-project
+pithos --agent                         safe mode: every action needs your approval
+pithos --auto                          autonomous mode: it works on its own until the goal is reached
+pithos --auto -p "make the tests pass" one task, then exit
+```
+
+**Modes.**
+- **Safe** (default): each tool call is shown before it runs. You answer **y** (run it), **n**
+  (skip it), **a** (always allow this tool for the session), or type what to do instead. Your
+  words go back to the model.
+- **Autonomous** (`--auto`, or `/auto` during the session): it plans, runs, checks and fixes on its
+  own, up to `--max-steps` model calls per task (default 40). Commands that look destructive still
+  ask first: recursive deletes, formatting, `git push`, `git reset --hard`, killing processes,
+  registry changes, `sudo`, piping downloads into a shell. `--yolo` turns these checks off.
+
+**Knows the system it runs on.** At start-up the agent detects the operating system (name, version,
+build, architecture), the shell, the working folder and the programs on the PATH (git, python, node,
+gcc, cargo, docker...). It also receives the syntax rules of that shell. On Windows the rules say
+that Windows PowerShell 5.1 has no `&&`, which cmdlets replace `grep`, `rm -rf` and `head`, and how
+quotes behave. On Linux, bash syntax applies and `sudo` cannot ask for a password.
+
+**Commands it can check.**
+
+| Tool | What it does |
+|---|---|
+| `run_command` | runs a command and waits for it. Returns exit code, run time, stdout and stderr apart. Default timeout 120 s, then the command is stopped with everything it started. |
+| `start_process` | starts a long-running program (server, watcher, `npm run dev`) and returns at once with an id and its first output |
+| `read_process` | status (running / exit code), elapsed time and new output. Can wait for the end or for a text such as `listening on` |
+| `stop_process`, `list_processes` | stop a background process (and its children), list them |
+| `edit_file` | replaces an exact piece of text in a file (must be unique, CRLF files work too) |
+
+These come on top of the file and web tools. Commands run without a terminal and without input,
+so a program waiting for an answer sees end of input instead of hanging. Pagers and colors are
+turned off. Output is cleaned of escape sequences and progress bars, and long output keeps its start
+and its end.
+
+When a command fails, the model sees the exit code and the error and corrects itself. If it repeats
+the exact same failing call three times, it is told to change approach. **Ctrl+C** stops the current
+generation or command and gives the prompt back. During a session: `/auto`, `/safe`, `/reset`,
+`/tools`, `/help`, `/exit`.
+
+The shell tools are also available to Pandora with `pithos --server --shell`, behind the usual
+Allow / Deny cards. `tests/test_shell.c` checks them without the model (`build.cmd test`, then run
+`build\test_shell.exe` from an empty folder).
 
 ### Adding MCP servers
 Pithos is an [MCP](https://modelcontextprotocol.io) (Model Context Protocol) client. **No
@@ -263,7 +369,10 @@ checkpoint and only processes the rest:
 | `--alias NAME`, `--api-key KEY` | model name in the API, key required on `/v1` |
 | `--cache-dir DIR`, `--cache-mb N`, `--no-cache` | prompt reuse on disk |
 | `--ui FILE` | serve an external HTML file instead of the embedded interface |
-| `--workspace DIR` | folder for the file tools (default `./workspace`) |
+| `--agent`, `--auto`, `--yolo` | terminal agent: safe mode, autonomous mode, autonomous without the checks on destructive commands |
+| `--max-steps N`, `--show-think` | agent: model calls per task (default 40), stream the reasoning |
+| `--workspace DIR` | folder for the file tools (default `./workspace`; for the agent, the current folder) |
+| `--shell` | also offer `run_command` and the process tools in the web UI |
 | `--mcp FILE` | MCP servers to start (default `./mcp.json` if present) |
 | `--read-only`, `--no-web`, `--no-tools` | no `write_file`, no web tools, no tools at all |
 | `--tools-list`, `--tool NAME [JSON]` | list / run one tool without loading the model |
@@ -307,7 +416,8 @@ for each of the 30 convolution layers.
 | `src/sampler.c`, `src/main.c` | sampling, CLI, terminal chat |
 | `src/server.c`, `src/json.c` | HTTP server, OpenAI API, chat template, tool calls, JSON |
 | `src/pcache.c` | prompt reuse: recurrent-state checkpoints, sessions on disk |
-| `src/tools.c`, `src/proc.c` | agent tools, MCP client (JSON-RPC over stdio), child processes with pipes |
+| `src/tools.c`, `src/proc.c` | agent tools (files, web, shell commands, background processes), MCP client (JSON-RPC over stdio), child processes with pipes |
+| `src/agent.c` | terminal agent: conversation, approvals, safe / autonomous modes (talks to the server in-process) |
 | `web/index.html` | web interface (embedded into `src/webui_html.h` by `tools/embed.py`) |
 | `web/brand/` | Pandora logo: vector mark (`currentColor`), dark version for light UIs and light version for dark UIs (SVG, 512 px PNG), original in `pandora-logo.jpg` |
 
@@ -368,6 +478,8 @@ for each of the 30 convolution layers.
   streaming, prompt reuse across turns, tool calls, completions, stop strings, errors.
 - `python tests/versus.py [ROUNDS] [llama.cpp|llama.cpp-cuda]`: head-to-head with llama-server
   (the paths of the llama.cpp builds are at the top of the script).
+- `build\test_shell.exe` (from an empty folder): shell tools without the model, covering exit codes,
+  stderr, timeouts, working folder, background processes, `edit_file` and destructive-command checks.
 - `python tests/test_tools.py` (server started with `--mcp tests/mcp_test.json`): built-in tools,
   workspace isolation, web, MCP client (pagination, errors, `readOnlyHint`) with the test MCP server
   `tests/mcp_test_server.py`.
@@ -390,7 +502,8 @@ Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
 - Only the `lfm2` / `lfm2moe` architectures. Formats Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16 and F32;
   on the GPU only Q4_K and Q6_K.
 - The NEON kernels and the GPU f32 path are written for ARM64/AMD/Intel, but have only been tested
-  on x86-64 and NVIDIA.
+  on x86-64 and NVIDIA. The terminal agent's POSIX code (bash, process groups) is written for Linux
+  and macOS, but has only been run on Windows so far.
 - On Windows (WDDM) every queued command costs ~20 µs in the driver. With the dense layers on the
   GPU this leaves ~200 launches and one sync per MoE layer, about 21 ms per token on top of the experts. The
   current limit is computing the non-resident experts on the CPU (30–45 ms per token on the

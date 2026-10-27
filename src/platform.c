@@ -225,6 +225,133 @@ double time_sec(void) {
 #endif
 }
 
+/* ------------------------------------------------------------------ console */
+
+static void (*g_on_interrupt)(void);
+
+#if defined(_WIN32)
+int console_read_line(char *buf, int cap) {
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode;
+    if (GetConsoleMode(h, &mode)) {
+        static wchar_t wbuf[16384];
+        DWORD nread = 0;
+        if (!ReadConsoleW(h, wbuf, 16383, &nread, NULL) || nread == 0) return 0;
+        while (nread > 0 && (wbuf[nread - 1] == L'\n' || wbuf[nread - 1] == L'\r')) nread--;
+        if (nread == 1 && wbuf[0] == 26) return 0; /* Ctrl+Z */
+        int n = WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)nread, buf, cap - 1, NULL, NULL);
+        buf[n] = 0;
+        return 1;
+    }
+    if (!fgets(buf, cap, stdin)) return 0;
+    size_t l = strlen(buf);
+    while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = 0;
+    return 1;
+}
+
+static BOOL WINAPI ctrl_handler(DWORD type) {
+    if ((type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) && g_on_interrupt) {
+        g_on_interrupt();
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void console_on_interrupt(void (*fn)(void)) {
+    g_on_interrupt = fn;
+    SetConsoleCtrlHandler(ctrl_handler, fn != NULL);
+}
+#else
+#include <signal.h>
+int console_read_line(char *buf, int cap) {
+    if (!fgets(buf, cap, stdin)) { clearerr(stdin); return 0; }
+    size_t l = strlen(buf);
+    while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = 0;
+    return 1;
+}
+
+static void sigint_handler(int sig) {
+    (void)sig;
+    if (g_on_interrupt) g_on_interrupt();
+}
+
+void console_on_interrupt(void (*fn)(void)) {
+    g_on_interrupt = fn;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = fn ? sigint_handler : SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0; /* no SA_RESTART: a pending read returns, so the prompt can react */
+    sigaction(SIGINT, &sa, NULL);
+}
+#endif
+
+/* ------------------------------------------------------------------ operating system */
+
+#if defined(_WIN32)
+#ifdef _MSC_VER
+#pragma comment(lib, "advapi32.lib")
+#endif
+static int reg_str(const wchar_t *name, char *out, int cap) {
+    wchar_t w[256];
+    DWORD sz = sizeof(w);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", name, RRF_RT_REG_SZ, NULL,
+                     w, &sz) != ERROR_SUCCESS)
+        return 0;
+    return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL) > 1;
+}
+
+void os_describe(char *out, int cap) {
+    /* GetVersionEx reports what the manifest allows: ask ntdll for the real version */
+    typedef LONG(WINAPI * RtlGetVersionFn)(OSVERSIONINFOW *);
+    OSVERSIONINFOW v;
+    memset(&v, 0, sizeof(v));
+    v.dwOSVersionInfoSize = sizeof(v);
+    RtlGetVersionFn rgv = (RtlGetVersionFn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    if (rgv) rgv(&v);
+    char product[128] = "Windows", display[32] = "";
+    reg_str(L"ProductName", product, sizeof(product));
+    reg_str(L"DisplayVersion", display, sizeof(display));
+    /* Windows 11 still says "Windows 10" in ProductName */
+    char *ten = strstr(product, "Windows 10");
+    if (ten && v.dwBuildNumber >= 22000) ten[9] = '1';
+    SYSTEM_INFO si;
+    GetNativeSystemInfo(&si);
+    const char *arch = si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? "x64"
+                     : si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64 ? "arm64"
+                     : si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL ? "x86" : "unknown";
+    snprintf(out, (size_t)cap, "%s%s%s (version %lu.%lu, build %lu), %s", product, display[0] ? " " : "", display,
+             (unsigned long)v.dwMajorVersion, (unsigned long)v.dwMinorVersion, (unsigned long)v.dwBuildNumber, arch);
+}
+#else
+#include <sys/utsname.h>
+void os_describe(char *out, int cap) {
+    struct utsname u;
+    if (uname(&u) != 0) { snprintf(out, (size_t)cap, "Unix"); return; }
+    char pretty[288] = "";
+    FILE *f = fopen("/etc/os-release", "r");
+    if (f) {
+        char line[256];
+        while (fgets(line, sizeof(line), f))
+            if (!strncmp(line, "PRETTY_NAME=", 12)) {
+                char *s = line + 12, *e;
+                if (*s == '"') s++;
+                if ((e = strpbrk(s, "\"\n"))) *e = 0;
+                snprintf(pretty, sizeof(pretty), "%s", s);
+                break;
+            }
+        fclose(f);
+    }
+#if defined(__APPLE__)
+    char ver[32] = "";
+    size_t vl = sizeof(ver);
+    if (sysctlbyname("kern.osproductversion", ver, &vl, NULL, 0) == 0) snprintf(pretty, sizeof(pretty), "macOS %s", ver);
+#endif
+    if (pretty[0]) snprintf(out, (size_t)cap, "%s (%s %s), %s", pretty, u.sysname, u.release, u.machine);
+    else snprintf(out, (size_t)cap, "%s %s, %s", u.sysname, u.release, u.machine);
+}
+#endif
+
 /* ------------------------------------------------------------------ system info */
 
 #if defined(PITHOS_X86)

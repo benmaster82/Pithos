@@ -26,4 +26,12 @@ typedef struct {
 /* Serves until the process is terminated. Returns non-zero if the socket cannot be opened. */
 int server_run(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *tk, PCache *pc);
 
+/* In-process use without HTTP (the terminal agent): server_attach() once, then each
+ * server_local_chat() runs a /v1/chat/completions request (JSON body) and hands the raw response
+ * to sink: the HTTP head, then the SSE events when "stream" is true. Generation stops early
+ * when *stop becomes non-zero. */
+void server_attach(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *tk, PCache *pc);
+void server_local_chat(const char *body, int len, void (*sink)(void *u, const char *s, int n), void *u,
+                       volatile int *stop);
+
 #endif

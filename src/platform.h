@@ -92,6 +92,14 @@ int   dir_list(const char *dir, void (*cb)(const char *name, void *u), void *u);
 /* Like dir_list but also directories (hidden entries skipped), with a flag and the file size. */
 int   dir_entries(const char *dir, void (*cb)(const char *name, int is_dir, uint64_t size, void *u), void *u);
 
+/* ---- console ---- */
+/* Read one line of UTF-8 input (newline removed). Returns 0 on end of input or when Ctrl+C
+ * interrupts the read. */
+int  console_read_line(char *buf, int cap);
+/* Ctrl+C calls fn (from a signal handler or a system thread: it should only set flags)
+ * instead of ending the process. */
+void console_on_interrupt(void (*fn)(void));
+
 /* ---- dynamic libraries ---- */
 void *lib_open(const char *name);
 void *lib_sym(void *lib, const char *name);
@@ -115,6 +123,9 @@ typedef struct {
     char brand[64];
 } SysInfo;
 void sys_info(SysInfo *si);
+/* Operating system for humans and the agent, e.g. "Windows 11 Home 24H2 (version 10.0, build 26200), x64"
+ * or "Ubuntu 24.04 LTS (Linux 6.8.0), x86_64". */
+void os_describe(char *out, int cap);
 
 /* ---- threads ---- */
 typedef struct ThreadPool ThreadPool;

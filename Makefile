@@ -6,7 +6,7 @@
 CC      ?= cc
 CFLAGS  ?= -O3 -std=c11 -Wall -Wextra -Wno-unused-parameter
 SRC      = src/main.c src/model.c src/gguf.c src/tokenizer.c src/sampler.c src/quant.c src/platform.c \
-           src/quant_neon.c src/gpu_opencl.c src/json.c src/pcache.c src/server.c src/proc.c src/tools.c
+           src/quant_neon.c src/gpu_opencl.c src/json.c src/pcache.c src/server.c src/proc.c src/tools.c src/agent.c
 BUILD    = build
 UNAME_S := $(shell uname -s 2>/dev/null)
 UNAME_M := $(shell uname -m 2>/dev/null)
@@ -54,6 +54,7 @@ $(BUILD)/pithos$(EXE): $(SRC) $(EXTRA_OBJ) src/*.h | $(BUILD)
 test: all
 	$(CC) $(CFLAGS) $(ARCHFLAGS) tests/test_kernels.c src/gguf.c src/quant.c src/platform.c src/quant_neon.c $(EXTRA_OBJ) -o $(BUILD)/test_kernels$(EXE) $(LDLIBS)
 	$(CC) $(CFLAGS) $(ARCHFLAGS) tests/test_gpu.c src/model.c src/gguf.c src/quant.c src/platform.c src/quant_neon.c src/gpu_opencl.c $(EXTRA_OBJ) -o $(BUILD)/test_gpu$(EXE) $(LDLIBS)
+	$(CC) $(CFLAGS) tests/test_shell.c src/tools.c src/proc.c src/platform.c src/json.c -o $(BUILD)/test_shell$(EXE) $(LDLIBS)
 
 # regenerate embedded sources (needs Python; outputs are committed)
 gen:

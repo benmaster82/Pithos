@@ -1,17 +1,29 @@
-/* proc.h - child processes with pipes (used for MCP servers and for curl). */
+/* proc.h - child processes with pipes (MCP servers, curl, the agent's shell commands). */
 #ifndef PITHOS_PROC_H
 #define PITHOS_PROC_H
 
 typedef struct Proc Proc;
 
-/* Start argv[0] (searched in PATH; on Windows also .cmd/.bat scripts such as npx) with
- * stdin/stdout connected to pipes. env: NULL-terminated "KEY=VALUE" entries added to the
- * inherited environment, or NULL. quiet: discard stderr instead of sharing ours.
- * Children and their descendants are terminated together with this process (Windows) or by
- * proc_kill / proc_free (POSIX: the child gets its own process group). */
+enum { PROC_ERR_SHARE, PROC_ERR_NULL, PROC_ERR_PIPE };
+
+typedef struct {
+    const char *const *argv;    /* program (searched in PATH) and arguments */
+    const char *const *env;     /* NULL-terminated "KEY=VALUE" entries added to the inherited environment */
+    const char *cwd;            /* working folder of the child (NULL: ours) */
+    int err_mode;               /* PROC_ERR_SHARE: our stderr, PROC_ERR_NULL: discarded, PROC_ERR_PIPE: proc_read_err */
+    const char *win_cmdline;    /* Windows: command line passed verbatim instead of quoting argv (cmd.exe /s /c "...") */
+} ProcOptions;
+
+/* Start a child with stdin/stdout (and optionally stderr) connected to pipes. On Windows .cmd/.bat
+ * scripts such as npx are found too. Children and their descendants are terminated together with
+ * this process (Windows) or by proc_kill / proc_free (POSIX: the child gets its own process group). */
+Proc *proc_start(const ProcOptions *o, char *err, int errlen);
+/* proc_start with argv and env only; quiet: discard stderr instead of sharing ours. */
 Proc *proc_spawn(const char *const *argv, const char *const *env, int quiet, char *err, int errlen);
+int   proc_pid(Proc *p);
 int   proc_write(Proc *p, const char *s, int n);   /* 1 if everything was written */
 int   proc_read(Proc *p, char *buf, int cap);      /* blocking: bytes read, 0 at end of output */
+int   proc_read_err(Proc *p, char *buf, int cap);  /* the same for stderr (PROC_ERR_PIPE only) */
 void  proc_close_stdin(Proc *p);
 int   proc_wait(Proc *p, int timeout_ms);          /* exit code, or -1 if still running */
 void  proc_kill(Proc *p);                          /* the child and everything it started */

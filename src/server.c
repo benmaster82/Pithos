@@ -73,10 +73,18 @@ typedef struct {
     sock_t s;
     int dead, closed;
     char peer[64];
+    /* in-process client (server_local_chat): the response goes to sink instead of a socket */
+    void (*sink)(void *u, const char *s, int n);
+    void *sink_u;
+    volatile int *stop;
 } Conn;
 
 static int conn_send(Conn *c, const char *p, int n) {
     if (n < 0) n = (int)strlen(p);
+    if (c->sink) {
+        c->sink(c->sink_u, p, n);
+        return 1;
+    }
     while (n > 0 && !c->dead) {
         int k = (int)send(c->s, p, n, 0);
         if (k <= 0) { c->dead = 1; break; }
@@ -89,6 +97,7 @@ static int conn_send(Conn *c, const char *p, int n) {
 /* Non-blocking check: has the client closed the connection? */
 static int conn_gone(Conn *c) {
     if (c->dead) return 1;
+    if (c->sink) return c->stop && *c->stop;
     fd_set rs;
     FD_ZERO(&rs);
     FD_SET(c->s, &rs);
@@ -114,6 +123,7 @@ static void set_recv_timeout(sock_t s, int ms) {
 static void conn_close(Conn *c) {
     if (c->closed) return;
     c->closed = 1;
+    if (c->sink) return;
 #if defined(_WIN32)
     shutdown(c->s, SD_SEND);
 #else
@@ -1002,6 +1012,7 @@ static void gen_free(Gen *g) {
 }
 
 static void log_request(const char *what, Gen *g) {
+    if (g->c->sink) return; /* the in-process client shows its own statistics */
     int pn = g->n_prompt - g->n_reused;
     fprintf(stderr, "[%s] %s | prompt %d tok (%d cached, %d processed, %.1f tok/s) | answer %d tok, %.2f tok/s | %s\n",
             g->c->peer, what, g->n_prompt, g->n_reused, pn, pn / (g->t_prompt > 0 ? g->t_prompt : 1e-9), g->n_gen,
@@ -1336,7 +1347,7 @@ static void conn_main(void *arg) {
 
 /* ------------------------------------------------------------------ main loop */
 
-int server_run(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *tk, PCache *pc) {
+void server_attach(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *tk, PCache *pc) {
     memset(&S, 0, sizeof(S));
     S.cfg = *cfg;
     S.m = m;
@@ -1351,6 +1362,30 @@ int server_run(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *tk, P
     S.t_tc_start = tok_find(tk, "<|tool_call_start|>");
     S.t_tc_end = tok_find(tk, "<|tool_call_end|>");
     S.rng = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ull | 1;
+}
+
+void server_local_chat(const char *body, int len, void (*sink)(void *u, const char *s, int n), void *u,
+                       volatile int *stop) {
+    Conn c;
+    memset(&c, 0, sizeof(c));
+    c.sink = sink;
+    c.sink_u = u;
+    c.stop = stop;
+    snprintf(c.peer, sizeof(c.peer), "local");
+    char err[160];
+    Json *j = json_parse(body, len, err, sizeof(err));
+    if (!j || j->t != J_OBJ) {
+        char msg[220];
+        snprintf(msg, sizeof(msg), "invalid JSON body: %s", j ? "expected an object" : err);
+        send_error(&c, 400, "invalid_request_error", msg);
+    } else {
+        handle_chat(&c, j);
+    }
+    json_free(j);
+}
+
+int server_run(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *tk, PCache *pc) {
+    server_attach(cfg, m, ctx, tk, pc);
 
 #if defined(_WIN32)
     WSADATA wd;

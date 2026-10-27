@@ -7,7 +7,7 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 if not exist build mkdir build
 
-set SRC=src\main.c src\model.c src\gguf.c src\tokenizer.c src\sampler.c src\quant.c src\platform.c src\quant_neon.c src\gpu_opencl.c src\json.c src\pcache.c src\server.c src\proc.c src\tools.c
+set SRC=src\main.c src\model.c src\gguf.c src\tokenizer.c src\sampler.c src\quant.c src\platform.c src\quant_neon.c src\gpu_opencl.c src\json.c src\pcache.c src\server.c src\proc.c src\tools.c src\agent.c
 set WANT=%1
 
 if /i "%WANT%"=="msvc" goto msvc
@@ -30,6 +30,7 @@ gcc %CFLAGS% -municode %SRC% build\quant_avx2.o -o build\pithos.exe -lm -lws2_32
 if /i "%WANT%"=="test" (
     gcc %CFLAGS% tests\test_kernels.c src\gguf.c src\quant.c src\platform.c build\quant_avx2.o -o build\test_kernels.exe -lm || goto fail
     gcc %CFLAGS% tests\test_gpu.c src\model.c src\gguf.c src\quant.c src\platform.c src\gpu_opencl.c build\quant_avx2.o -o build\test_gpu.exe -lm || goto fail
+    gcc %CFLAGS% tests\test_shell.c src\tools.c src\proc.c src\platform.c src\json.c -o build\test_shell.exe -lm || goto fail
 )
 goto ok
 
@@ -47,6 +48,7 @@ cl %CLFLAGS% /arch:AVX2 /c src\quant_avx2.c /Fobuild\quant_avx2.obj || goto fail
 cl %CLFLAGS% %SRC% build\quant_avx2.obj /Fobuild\ /Febuild\pithos.exe /link /LTCG || goto fail
 if /i "%2"=="test" (
     cl %CLFLAGS% tests\test_kernels.c src\gguf.c src\quant.c src\platform.c build\quant_avx2.obj /Fobuild\ /Febuild\test_kernels.exe /link /LTCG || goto fail
+    cl %CLFLAGS% tests\test_shell.c src\tools.c src\proc.c src\platform.c src\json.c /Fobuild\ /Febuild\test_shell.exe /link /LTCG || goto fail
 )
 goto ok
 

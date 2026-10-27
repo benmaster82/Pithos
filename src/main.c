@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "agent.h"
 #include "gpu.h"
 #include "model.h"
 #include "pcache.h"
@@ -29,7 +30,8 @@ typedef struct {
     const char *model, *prompt, *system, *kernels, *tokenize, *ppl;
     const char *host, *alias, *api_key, *cache_dir, *ui_path, *workspace, *mcp, *tool_name, *tool_args;
     int tools_list;
-    int port, server, cache_mb, open_browser, tools, web, read_only, ctx_set;
+    int port, server, cache_mb, open_browser, tools, web, read_only, ctx_set, shell, workspace_set;
+    int agent, agent_auto, yolo, max_steps, agent_think;
     int threads, n_ctx, n_batch, n_predict;
     int interactive, raw, bench, show_think, keep_think, prefetch, mlock, stats, verbose, ids;
     int gpu, gpu_device, gpu_mem, gpu_dense;
@@ -55,28 +57,6 @@ static void console_init(void) {
 #else
     g_color = isatty(1);
 #endif
-}
-
-/* Read one line of UTF-8 input. Returns 0 on EOF. */
-static int read_line(char *buf, int cap) {
-#if defined(_WIN32)
-    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD mode;
-    if (GetConsoleMode(h, &mode)) {
-        static wchar_t wbuf[16384];
-        DWORD nread = 0;
-        if (!ReadConsoleW(h, wbuf, 16383, &nread, NULL) || nread == 0) return 0;
-        while (nread > 0 && (wbuf[nread - 1] == L'\n' || wbuf[nread - 1] == L'\r')) nread--;
-        if (nread == 1 && wbuf[0] == 26) return 0; /* Ctrl+Z */
-        int n = WideCharToMultiByte(CP_UTF8, 0, wbuf, (int)nread, buf, cap - 1, NULL, NULL);
-        buf[n] = 0;
-        return 1;
-    }
-#endif
-    if (!fgets(buf, cap, stdin)) return 0;
-    size_t l = strlen(buf);
-    while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = 0;
-    return 1;
 }
 
 /* Streams token bytes to stdout, holding back incomplete UTF-8 sequences. */
@@ -192,8 +172,16 @@ static void usage(void) {
         "      --no-cache          keep reused prompts in memory only\n"
         "      --ui FILE           serve this HTML file instead of the embedded interface\n"
         "      --open              open the web interface in the browser when ready\n"
+        "\nterminal agent (works on tasks with shell commands, files, web and MCP tools):\n"
+        "      --agent             interactive agent session in safe mode: every action needs your approval\n"
+        "      --auto              autonomous mode: works on its own until the task is done (also /auto, /safe)\n"
+        "      --yolo              with --auto, do not ask even for destructive commands (rm -rf, git push...)\n"
+        "      --max-steps N       model calls per task before stopping to ask (default 40)\n"
+        "      --show-think        stream the reasoning instead of a counter\n"
+        "      -p / -f TASK        run one task and exit\n"
         "\nagent tools (web UI agent mode, /v1/tools):\n"
-        "      --workspace DIR     folder the file tools can read and write (default ./workspace)\n"
+        "      --workspace DIR     folder the file tools can read and write (default ./workspace; agent: .)\n"
+        "      --shell             also offer run_command and the process tools in the web UI\n"
         "      --mcp FILE          MCP servers to start, mcp.json format (default ./mcp.json if present)\n"
         "      --read-only         no write_file tool\n"
         "      --no-web            no web_search / fetch_url tools\n"
@@ -280,7 +268,13 @@ static int parse_args(int argc, char **argv, Args *a) {
         else if (!strcmp(s, "-v") || !strcmp(s, "--verbose")) a->verbose = 1;
         else if (!strcmp(s, "--server")) a->server = 1;
         else if (!strcmp(s, "--open")) a->open_browser = 1;
-        else if (!strcmp(s, "--workspace")) a->workspace = NEXT();
+        else if (!strcmp(s, "--workspace")) { a->workspace = NEXT(); a->workspace_set = 1; }
+        else if (!strcmp(s, "--agent")) a->agent = 1;
+        else if (!strcmp(s, "--auto")) { a->agent = 1; a->agent_auto = 1; }
+        else if (!strcmp(s, "--yolo")) a->yolo = 1;
+        else if (!strcmp(s, "--max-steps")) a->max_steps = atoi(NEXT());
+        else if (!strcmp(s, "--show-think")) a->agent_think = 1;
+        else if (!strcmp(s, "--shell")) a->shell = 1;
         else if (!strcmp(s, "--mcp")) a->mcp = NEXT();
         else if (!strcmp(s, "--read-only")) a->read_only = 1;
         else if (!strcmp(s, "--no-web")) a->web = 0;
@@ -315,7 +309,13 @@ static int parse_args(int argc, char **argv, Args *a) {
     if (a->n_batch < 1) a->n_batch = 1;
     if (a->n_batch > 512) a->n_batch = 512;
     if (a->n_predict < 0) a->n_predict = a->server ? 0 : 4096;
-    if (a->server && !a->ctx_set) a->n_ctx = 16384; /* room for tool results in agent mode */
+    if ((a->server || a->agent) && !a->ctx_set) a->n_ctx = 16384; /* room for tool results in agent mode */
+    if (a->agent) {
+        a->server = 0;
+        a->shell = 1;
+        if (!a->workspace_set) a->workspace = "."; /* the agent works in the folder it is started from */
+        if (a->max_steps <= 0) a->max_steps = 40;
+    }
     if (!a->prompt && !a->bench && !a->tokenize && !a->ppl && !a->server && !a->tools_list && !a->tool_name)
         a->interactive = 1;
     return 1;
@@ -525,6 +525,7 @@ static ToolsConfig tools_config(const Args *a) {
     tc.workspace = a->workspace;
     tc.web = a->web;
     tc.allow_write = !a->read_only;
+    tc.shell = a->shell;
     tc.mcp_config = a->mcp;
     if (!tc.mcp_config) {
         FILE *f = file_open("mcp.json", "rb");
@@ -602,7 +603,7 @@ static int real_main(int argc, char **argv) {
             si.brand[0] ? si.brand : "?", si.n_physical, si.n_logical, si.total_ram / 1073741824.0,
             si.avail_ram / 1073741824.0);
     fprintf(stderr, "kernel: %s%s%s | thread: %d\n", kn, si.has_avx512f ? " (AVX-512 present)" : "",
-            si.has_avxvnni ? " (AVX-VNNI presente)" : "", a.threads);
+            si.has_avxvnni ? " (AVX-VNNI present)" : "", a.threads);
 
     double t0 = time_sec();
     char err[256];
@@ -658,7 +659,7 @@ static int real_main(int argc, char **argv) {
     e.tok_think_end = tok_find(tk, "</think>");
     sampler_init(&e.smp, &a.sp, m.n_vocab);
 
-    if (a.server) {
+    if (a.server || a.agent) {
         char alias[256], cache_dir[1100], info[512];
         if (a.alias) snprintf(alias, sizeof(alias), "%s", a.alias);
         else {
@@ -692,7 +693,7 @@ static int real_main(int argc, char **argv) {
         sc.verbose = a.verbose || a.stats;
         sc.open_browser = a.open_browser;
         Tools *tools = NULL;
-        if (a.tools) {
+        if (a.tools || a.agent) {
             ToolsConfig tc = tools_config(&a);
             tools = tools_create(&tc);
             fprintf(stderr, "agent tools: %d built-in%s%s | workspace: %s\n", tools_count(tools),
@@ -700,7 +701,24 @@ static int real_main(int argc, char **argv) {
                     a.workspace);
         }
         sc.tools = tools;
-        int rc = server_run(&sc, &m, ctx, tk, pc);
+        int rc;
+        if (a.agent) {
+            server_attach(&sc, &m, ctx, tk, pc);
+            AgentConfig ac;
+            memset(&ac, 0, sizeof(ac));
+            ac.tools = tools;
+            ac.autonomous = a.agent_auto;
+            ac.yolo = a.yolo;
+            ac.task = a.prompt;
+            ac.system = a.system;
+            ac.max_steps = a.max_steps;
+            ac.max_tokens = a.n_predict;
+            ac.show_think = a.agent_think;
+            ac.color = g_color;
+            rc = agent_run(&ac);
+        } else {
+            rc = server_run(&sc, &m, ctx, tk, pc);
+        }
         tools_free(tools);
         pcache_free(pc);
         return rc;
@@ -820,7 +838,7 @@ static int real_main(int argc, char **argv) {
             color("\x1b[1;32m");
             out_str("\n> ");
             color("\x1b[0m");
-            if (!read_line(line, sizeof(line))) break;
+            if (!console_read_line(line, sizeof(line))) break;
             if (!line[0]) continue;
             if (!strcmp(line, "/exit") || !strcmp(line, "/quit")) break;
             if (!strcmp(line, "/reset")) {

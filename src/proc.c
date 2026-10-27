@@ -13,8 +13,9 @@
 #include <windows.h>
 
 struct Proc {
-    HANDLE h, in, out;
+    HANDLE h, in, out, err;
     HANDLE job; /* the child and everything it starts (npx -> node): killed together */
+    DWORD pid;
 };
 
 typedef struct { wchar_t *s; size_t n, cap; } WBuf;
@@ -71,7 +72,8 @@ static HANDLE kill_job(void) {
     return job;
 }
 
-Proc *proc_spawn(const char *const *argv, const char *const *env, int quiet, char *err, int errlen) {
+Proc *proc_start(const ProcOptions *o, char *err, int errlen) {
+    const char *const *argv = o->argv, *const *env = o->env;
     if (err && errlen) err[0] = 0;
     wchar_t *prog = widen(argv[0]);
     /* resolve the program: PATH search with .exe, then .cmd / .bat (npx, uvx shims) */
@@ -90,15 +92,22 @@ Proc *proc_spawn(const char *const *argv, const char *const *env, int quiet, cha
     int script = pl > 4 && (!_wcsicmp(path + pl - 4, L".cmd") || !_wcsicmp(path + pl - 4, L".bat"));
 
     WBuf cmd = { 0 };
-    if (script) wb_add(&cmd, L"cmd.exe /d /s /c \"", 18);
-    quote_arg(&cmd, path);
-    for (int i = 1; argv[i]; i++) {
-        wchar_t *w = widen(argv[i]);
-        wb_add(&cmd, L" ", 1);
-        quote_arg(&cmd, w);
+    if (o->win_cmdline) {
+        wchar_t *w = widen(o->win_cmdline);
+        wb_add(&cmd, w, wcslen(w));
         free(w);
+        script = 0;
+    } else {
+        if (script) wb_add(&cmd, L"cmd.exe /d /s /c \"", 18);
+        quote_arg(&cmd, path);
+        for (int i = 1; argv[i]; i++) {
+            wchar_t *w = widen(argv[i]);
+            wb_add(&cmd, L" ", 1);
+            quote_arg(&cmd, w);
+            free(w);
+        }
+        if (script) wb_add(&cmd, L"\"", 1);
     }
-    if (script) wb_add(&cmd, L"\"", 1);
 
     WBuf envb = { 0 };
     if (env && env[0]) {
@@ -116,7 +125,7 @@ Proc *proc_spawn(const char *const *argv, const char *const *env, int quiet, cha
     }
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
-    HANDLE in_r, in_w, out_r, out_w, errh = NULL;
+    HANDLE in_r, in_w, out_r, out_w, errh = NULL, err_r = NULL;
     if (!CreatePipe(&in_r, &in_w, &sa, 0)) { free(cmd.s); free(envb.s); return NULL; }
     if (!CreatePipe(&out_r, &out_w, &sa, 0)) {
         CloseHandle(in_r); CloseHandle(in_w); free(cmd.s); free(envb.s);
@@ -124,9 +133,16 @@ Proc *proc_spawn(const char *const *argv, const char *const *env, int quiet, cha
     }
     SetHandleInformation(in_w, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
-    if (quiet) errh = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
-    else DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE), GetCurrentProcess(), &errh, 0, TRUE,
-                         DUPLICATE_SAME_ACCESS);
+    if (o->err_mode == PROC_ERR_PIPE) {
+        if (!CreatePipe(&err_r, &errh, &sa, 0)) err_r = errh = NULL;
+        else SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0);
+    } else if (o->err_mode == PROC_ERR_NULL) {
+        errh = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    } else {
+        DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE), GetCurrentProcess(), &errh, 0, TRUE,
+                        DUPLICATE_SAME_ACCESS);
+    }
+    wchar_t *wcwd = o->cwd && *o->cwd ? widen(o->cwd) : NULL;
 
     STARTUPINFOW si;
     memset(&si, 0, sizeof(si));
@@ -138,16 +154,22 @@ Proc *proc_spawn(const char *const *argv, const char *const *env, int quiet, cha
     PROCESS_INFORMATION pi;
     BOOL ok = CreateProcessW(script ? NULL : path, cmd.s, NULL, NULL, TRUE,
                              CREATE_NO_WINDOW | CREATE_SUSPENDED | (envb.s ? CREATE_UNICODE_ENVIRONMENT : 0),
-                             envb.s, NULL, &si, &pi);
+                             envb.s, wcwd, &si, &pi);
+    DWORD gle = GetLastError();
     CloseHandle(in_r);
     CloseHandle(out_w);
     if (errh && errh != INVALID_HANDLE_VALUE) CloseHandle(errh);
     free(cmd.s);
     free(envb.s);
+    free(wcwd);
     if (!ok) {
-        snprintf(err, (size_t)errlen, "cannot start %s (error %lu)", argv[0], (unsigned long)GetLastError());
+        if (gle == ERROR_DIRECTORY || (o->cwd && gle == ERROR_PATH_NOT_FOUND))
+            snprintf(err, (size_t)errlen, "folder not found: %s", o->cwd);
+        else
+            snprintf(err, (size_t)errlen, "cannot start %s (error %lu)", argv[0], (unsigned long)gle);
         CloseHandle(in_w);
         CloseHandle(out_r);
+        if (err_r) CloseHandle(err_r);
         return NULL;
     }
     HANDLE job = kill_job();
@@ -158,8 +180,18 @@ Proc *proc_spawn(const char *const *argv, const char *const *env, int quiet, cha
     p->h = pi.hProcess;
     p->in = in_w;
     p->out = out_r;
+    p->err = err_r;
     p->job = job;
+    p->pid = pi.dwProcessId;
     return p;
+}
+
+int proc_pid(Proc *p) { return (int)p->pid; }
+
+int proc_read_err(Proc *p, char *buf, int cap) {
+    DWORD r = 0;
+    if (!p->err || !ReadFile(p->err, buf, (DWORD)cap, &r, NULL)) return 0;
+    return (int)r;
 }
 
 int proc_write(Proc *p, const char *s, int n) {
@@ -199,6 +231,7 @@ void proc_free(Proc *p) {
     proc_kill(p); /* also descendants that outlived the child */
     proc_close_stdin(p);
     CloseHandle(p->out);
+    if (p->err) CloseHandle(p->err);
     CloseHandle(p->h);
     if (p->job) CloseHandle(p->job);
     free(p);
@@ -214,13 +247,17 @@ void proc_free(Proc *p) {
 
 struct Proc {
     pid_t pid;
-    int in, out, done, code;
+    int in, out, err, done, code;
 };
 
-Proc *proc_spawn(const char *const *argv, const char *const *env, int quiet, char *err, int errlen) {
+Proc *proc_start(const ProcOptions *o, char *err, int errlen) {
+    const char *const *argv = o->argv, *const *env = o->env;
     if (err && errlen) err[0] = 0;
-    int pin[2], pout[2], pexec[2];
-    if (pipe(pin) || pipe(pout) || pipe(pexec)) { snprintf(err, (size_t)errlen, "pipe failed"); return NULL; }
+    int pin[2], pout[2], pexec[2], perr[2] = { -1, -1 };
+    if (pipe(pin) || pipe(pout) || pipe(pexec) || (o->err_mode == PROC_ERR_PIPE && pipe(perr))) {
+        snprintf(err, (size_t)errlen, "pipe failed");
+        return NULL;
+    }
     fcntl(pexec[1], F_SETFD, FD_CLOEXEC);
     pid_t pid = fork();
     if (pid < 0) { snprintf(err, (size_t)errlen, "fork failed"); return NULL; }
@@ -231,27 +268,38 @@ Proc *proc_spawn(const char *const *argv, const char *const *env, int quiet, cha
         setpgid(0, 0);
         dup2(pin[0], 0);
         dup2(pout[1], 1);
-        if (quiet) {
+        if (o->err_mode == PROC_ERR_PIPE) {
+            dup2(perr[1], 2);
+            close(perr[0]); close(perr[1]);
+        } else if (o->err_mode == PROC_ERR_NULL) {
             int nul = open("/dev/null", O_WRONLY);
             if (nul >= 0) dup2(nul, 2);
         }
         close(pin[0]); close(pin[1]); close(pout[0]); close(pout[1]); close(pexec[0]);
-        for (int i = 0; env && env[i]; i++) putenv((char *)env[i]);
-        execvp(argv[0], (char *const *)argv);
-        int e = errno;
-        if (write(pexec[1], &e, sizeof(e)) < 0) {}
+        int e = 0, stage = 0; /* stage 1: chdir failed */
+        if (o->cwd && *o->cwd && chdir(o->cwd) != 0) { e = errno; stage = 1; }
+        else {
+            for (int i = 0; env && env[i]; i++) putenv((char *)env[i]);
+            execvp(argv[0], (char *const *)argv);
+            e = errno;
+        }
+        int msg[2] = { stage, e };
+        if (write(pexec[1], msg, sizeof(msg)) < 0) {}
         _exit(127);
     }
     close(pin[0]);
     close(pout[1]);
     close(pexec[1]);
-    int e = 0;
-    if (read(pexec[0], &e, sizeof(e)) == (ssize_t)sizeof(e)) { /* exec failed */
+    if (perr[1] >= 0) close(perr[1]);
+    int msg[2];
+    if (read(pexec[0], msg, sizeof(msg)) == (ssize_t)sizeof(msg)) { /* chdir or exec failed */
         close(pexec[0]);
         close(pin[1]);
         close(pout[0]);
+        if (perr[0] >= 0) close(perr[0]);
         waitpid(pid, NULL, 0);
-        snprintf(err, (size_t)errlen, "cannot start %s: %s", argv[0], strerror(e));
+        if (msg[0] == 1) snprintf(err, (size_t)errlen, "folder not found: %s", o->cwd);
+        else snprintf(err, (size_t)errlen, "cannot start %s: %s", argv[0], strerror(msg[1]));
         return NULL;
     }
     close(pexec[0]);
@@ -259,7 +307,19 @@ Proc *proc_spawn(const char *const *argv, const char *const *env, int quiet, cha
     p->pid = pid;
     p->in = pin[1];
     p->out = pout[0];
+    p->err = perr[0];
     return p;
+}
+
+int proc_pid(Proc *p) { return (int)p->pid; }
+
+int proc_read_err(Proc *p, char *buf, int cap) {
+    if (p->err < 0) return 0;
+    for (;;) {
+        ssize_t r = read(p->err, buf, (size_t)cap);
+        if (r < 0 && errno == EINTR) continue;
+        return r > 0 ? (int)r : 0;
+    }
 }
 
 int proc_write(Proc *p, const char *s, int n) {
@@ -312,9 +372,19 @@ void proc_free(Proc *p) {
     if (!p->done) proc_wait(p, -1);
     proc_close_stdin(p);
     close(p->out);
+    if (p->err >= 0) close(p->err);
     free(p);
 }
 #endif
+
+Proc *proc_spawn(const char *const *argv, const char *const *env, int quiet, char *err, int errlen) {
+    ProcOptions o;
+    memset(&o, 0, sizeof(o));
+    o.argv = argv;
+    o.env = env;
+    o.err_mode = quiet ? PROC_ERR_NULL : PROC_ERR_SHARE;
+    return proc_start(&o, err, errlen);
+}
 
 /* ------------------------------------------------------------------ stop */
 

@@ -9,13 +9,30 @@
 #include "platform.h"
 #include "proc.h"
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <limits.h>
+#include <unistd.h>
+#endif
+
 #define MAX_RESULT 24000            /* hard cap of a tool result, in bytes */
 #define MAX_FILE (4 << 20)          /* largest file read by the file tools */
+#define MAX_JOBS 32                 /* background processes kept in the list */
+#define JOB_KEEP (1 << 20)          /* output kept per stream of a process (the oldest part is dropped) */
+#define MAX_COMMAND 6000            /* longest shell command, in bytes */
 #define USER_AGENT "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
 
 /* ------------------------------------------------------------------ registry */
 
 typedef struct Mcp Mcp;
+typedef struct Job Job;
 
 typedef struct {
     char name[136];
@@ -50,9 +67,18 @@ struct Tools {
     Mcp **srv;
     int nsrv;
     int has_curl;
+    /* shell */
+    Job *jobs[MAX_JOBS];
+    int njobs, next_job;
+    volatile int interrupt;
+    char *env_info;
 };
 
-enum { B_SEARCH, B_FETCH, B_CALC, B_TIME, B_LS, B_READ, B_FIND, B_GREP, B_WRITE };
+enum { B_SEARCH, B_FETCH, B_CALC, B_TIME, B_LS, B_READ, B_FIND, B_GREP, B_WRITE, B_EDIT,
+       B_RUN, B_START, B_READP, B_STOPP, B_LISTP };
+
+#define SHELL_PARAM "\"shell\": {\"type\": \"string\", \"description\": \"powershell or cmd on Windows, bash or sh elsewhere (default: the first)\"}"
+#define CWD_PARAM "\"cwd\": {\"type\": \"string\", \"description\": \"folder to run in, relative to the working folder or absolute (default: the working folder)\"}"
 
 static const struct { int id; const char *name, *desc, *params; int confirm; } BUILTINS[] = {
     { B_SEARCH, "web_search",
@@ -93,6 +119,32 @@ static const struct { int id; const char *name, *desc, *params; int confirm; } B
       "Create or overwrite a text file in the workspace folder (parent folders are created).",
       "{\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"content\": {\"type\": \"string\"}}, "
       "\"required\": [\"path\", \"content\"]}", 1 },
+    { B_EDIT, "edit_file",
+      "Replace an exact piece of text in a file of the workspace folder. old_text must match the file exactly "
+      "(spaces and indentation included) and appear only once, unless replace_all is true. Read the file first.",
+      "{\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"old_text\": {\"type\": \"string\"}, "
+      "\"new_text\": {\"type\": \"string\"}, \"replace_all\": {\"type\": \"boolean\", \"description\": \"replace every "
+      "occurrence (default false)\"}}, \"required\": [\"path\", \"old_text\", \"new_text\"]}", 1 },
+    { B_RUN, "run_command", NULL, /* description written at start-up: it names the OS and the shell */
+      "{\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, " CWD_PARAM ", "
+      "\"timeout\": {\"type\": \"integer\", \"description\": \"seconds before the command is stopped (default 120, max 3600)\"}, "
+      SHELL_PARAM "}, \"required\": [\"command\"]}", 1 },
+    { B_START, "start_process",
+      "Start a command in the background and return at once with a process id: for servers, watchers and anything "
+      "that runs for a long time or forever. Check it later with read_process, stop it with stop_process.",
+      "{\"type\": \"object\", \"properties\": {\"command\": {\"type\": \"string\"}, " CWD_PARAM ", "
+      "\"wait\": {\"type\": \"integer\", \"description\": \"seconds to wait for the first output (default 3)\"}, "
+      SHELL_PARAM "}, \"required\": [\"command\"]}", 1 },
+    { B_READP, "read_process",
+      "Status (running or exit code), elapsed time and the new output of a background process since the last read. "
+      "Can wait for it to finish or for a text to appear in its output.",
+      "{\"type\": \"object\", \"properties\": {\"id\": {\"type\": \"integer\"}, \"wait\": {\"type\": \"integer\", "
+      "\"description\": \"seconds to wait for the process to end (default 0, max 600)\"}, \"until\": {\"type\": \"string\", "
+      "\"description\": \"stop waiting as soon as this text appears in the output\"}}, \"required\": [\"id\"]}", 0 },
+    { B_STOPP, "stop_process", "Stop a background process (and everything it started) and return its last output.",
+      "{\"type\": \"object\", \"properties\": {\"id\": {\"type\": \"integer\"}}, \"required\": [\"id\"]}", 0 },
+    { B_LISTP, "list_processes", "List the background processes started with start_process, with status and run time.",
+      "{\"type\": \"object\", \"properties\": {}}", 0 },
 };
 #define N_BUILTINS ((int)(sizeof(BUILTINS) / sizeof(BUILTINS[0])))
 
@@ -583,13 +635,33 @@ static int tool_time(Buf *out) {
 
 /* ------------------------------------------------------------------ workspace file tools */
 
-/* Workspace-relative path -> full path. Rejects absolute paths and '..'. */
+static void absolute_path(const char *p, char *out, int cap);
+
+/* Workspace-relative path -> full path. Rejects '..' and absolute paths outside the workspace
+ * (an absolute path inside it is taken as the relative one). */
 static int ws_path(Tools *T, const char *rel, char *out, int cap, Buf *err) {
     if (!T->workspace[0]) { buf_add(err, "error: no workspace folder is configured", -1); return 0; }
     char r[1024];
     snprintf(r, sizeof(r), "%s", rel && *rel ? rel : ".");
     for (char *p = r; *p; p++) if (*p == '\\') *p = '/';
-    if (r[0] == '/' || strchr(r, ':')) { buf_add(err, "error: use a path relative to the workspace folder", -1); return 0; }
+    if (r[0] == '/' || strchr(r, ':')) {
+        char ws[1100];
+        absolute_path(T->workspace, ws, sizeof(ws));
+        for (char *p = ws; *p; p++) if (*p == '\\') *p = '/';
+        size_t l = strlen(ws);
+        while (l > 1 && ws[l - 1] == '/') ws[--l] = 0;
+#if defined(_WIN32)
+        int inside = !_strnicmp(r, ws, l);
+#else
+        int inside = !strncmp(r, ws, l);
+#endif
+        if (!inside || (r[l] && r[l] != '/')) {
+            buf_printf(err, "error: %s is outside the working folder %s: use a path relative to it (or run_command)", rel, ws);
+            return 0;
+        }
+        memmove(r, r + l + (r[l] == '/'), strlen(r + l + (r[l] == '/')) + 1);
+        if (!r[0]) snprintf(r, sizeof(r), ".");
+    }
     for (const char *p = r; *p; ) {
         const char *e = strchr(p, '/');
         size_t n = e ? (size_t)(e - p) : strlen(p);
@@ -808,6 +880,770 @@ static int tool_write(Tools *T, const Json *args, Buf *out) {
     buf_printf(out, "wrote %d bytes to %s", content->len, rel);
     return 1;
 }
+
+/* Exact text replacement. Files with CRLF line ends also match text written with \n. */
+static char *to_crlf(const char *s, int n, int *out_n) {
+    char *r = (char *)malloc((size_t)n * 2 + 1);
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+        if (s[i] == '\n' && (i == 0 || s[i - 1] != '\r')) r[k++] = '\r';
+        r[k++] = s[i];
+    }
+    r[k] = 0;
+    *out_n = k;
+    return r;
+}
+
+static int count_text(const char *s, int n, const char *q, int ql, int *first) {
+    int c = 0;
+    *first = -1;
+    for (int i = 0; i + ql <= n;) {
+        const char *p = (const char *)memchr(s + i, q[0], (size_t)(n - ql - i + 1));
+        if (!p) break;
+        i = (int)(p - s);
+        if (!memcmp(p, q, (size_t)ql)) {
+            if (*first < 0) *first = i;
+            c++;
+            i += ql;
+        } else {
+            i++;
+        }
+    }
+    return c;
+}
+
+static int tool_edit(Tools *T, const Json *args, Buf *out) {
+    char full[1100];
+    const char *rel = json_str(json_get(args, "path"), NULL);
+    const Json *o = json_get(args, "old_text"), *nw = json_get(args, "new_text");
+    if (!rel || !o || o->t != J_STR || !nw || nw->t != J_STR) {
+        buf_add(out, "error: 'path', 'old_text' and 'new_text' are required", -1);
+        return 0;
+    }
+    if (!o->len) { buf_add(out, "error: old_text is empty: use write_file to create a file", -1); return 0; }
+    if (!ws_path(T, rel, full, sizeof(full), out)) return 0;
+    int n;
+    char *s = read_all(full, &n, out, rel);
+    if (!s) return 0;
+    if (is_binary(s, n)) { free(s); buf_printf(out, "error: %s is a binary file", rel); return 0; }
+    const char *os = o->s, *ns = nw->s;
+    int ol = o->len, nl = nw->len, first;
+    char *oc = NULL, *nc = NULL;
+    int cnt = count_text(s, n, os, ol, &first);
+    if (!cnt && memchr(os, '\n', (size_t)ol) && strstr(s, "\r\n")) {
+        int ocl, ncl;
+        oc = to_crlf(os, ol, &ocl);
+        nc = to_crlf(ns, nl, &ncl);
+        cnt = count_text(s, n, oc, ocl, &first);
+        if (cnt) { os = oc; ol = ocl; ns = nc; nl = ncl; }
+    }
+    int all = json_bool(json_get(args, "replace_all"), 0), ok = 0;
+    if (!cnt) {
+        buf_printf(out, "error: old_text was not found in %s. Read the file again and copy the text exactly, "
+                        "including spaces and indentation.", rel);
+    } else if (cnt > 1 && !all) {
+        buf_printf(out, "error: old_text appears %d times in %s: include more of the surrounding lines to make it "
+                        "unique, or set replace_all to true.", cnt, rel);
+    } else {
+        Buf r = { 0 };
+        int i = 0, done = 0;
+        while (i < n) {
+            if ((all || !done) && i + ol <= n && !memcmp(s + i, os, (size_t)ol)) {
+                buf_add(&r, ns, nl);
+                i += ol;
+                done++;
+            } else {
+                const char *p = (all || !done) ? (const char *)memchr(s + i + 1, os[0], (size_t)(n - i - 1)) : NULL;
+                int stop = p ? (int)(p - s) : n;
+                buf_add(&r, s + i, stop - i);
+                i = stop;
+            }
+        }
+        FILE *f = file_open(full, "wb");
+        if (!f) buf_printf(out, "error: cannot write %s", rel);
+        else {
+            size_t w = r.n ? fwrite(r.s, 1, (size_t)r.n, f) : 0;
+            fclose(f);
+            if (w != (size_t)r.n) buf_printf(out, "error: write failed for %s", rel);
+            else {
+                int line = 1;
+                for (int k = 0; k < first; k++) line += s[k] == '\n';
+                buf_printf(out, "edited %s: %d replacement%s (first at line %d)", rel, done, done > 1 ? "s" : "", line);
+                ok = 1;
+            }
+        }
+        buf_free(&r);
+    }
+    free(oc);
+    free(nc);
+    free(s);
+    return ok;
+}
+
+/* ------------------------------------------------------------------ shell commands and background processes */
+
+struct Job {
+    int id, pid;
+    char *cmd;
+    char shell[16];
+    Proc *p;
+    PithosLock *lk;
+    double t0, t1;
+    int code, done, refs;           /* refs: the owner, two pipe readers and the exit waiter */
+    int out_eof, err_eof;
+    Buf out, err;                   /* output kept so far (the oldest part goes beyond JOB_KEEP) */
+    int out_seen, err_seen;         /* bytes of out / err already returned by read_process */
+    long long out_drop, err_drop;   /* bytes dropped from the start */
+    int ps, clixml;                 /* PowerShell; its stderr turned out to be CLIXML */
+    Buf pend;                       /* CLIXML not decoded yet */
+    char *script;                   /* temporary script file, removed at the end */
+};
+
+static const char *const SHELL_ENV[] = { "NO_COLOR=1", "TERM=dumb", "GIT_TERMINAL_PROMPT=0", "GIT_PAGER=cat", "PAGER=cat",
+                                         "PYTHONIOENCODING=utf-8", "PYTHONUNBUFFERED=1", "DEBIAN_FRONTEND=noninteractive",
+                                         NULL };
+
+static void job_release(Job *j) {
+    lock_acquire(j->lk);
+    int left = --j->refs;
+    lock_release(j->lk);
+    if (left) return;
+    proc_free(j->p);
+    buf_free(&j->out);
+    buf_free(&j->err);
+    buf_free(&j->pend);
+    if (j->script) { file_remove(j->script); free(j->script); }
+    free(j->cmd);
+    lock_destroy(j->lk);
+    free(j);
+}
+
+/* Text of a CLIXML string: XML entities and _xHHHH_ (UTF-16 code units) decoded. */
+static void clixml_decode(const char *s, const char *e, Buf *o) {
+    unsigned hi = 0;
+    while (s < e) {
+        if (*s == '_' && e - s >= 7 && s[1] == 'x' && s[6] == '_' && isxdigit((unsigned char)s[2]) &&
+            isxdigit((unsigned char)s[3]) && isxdigit((unsigned char)s[4]) && isxdigit((unsigned char)s[5])) {
+            char hex[5] = { s[2], s[3], s[4], s[5], 0 };
+            unsigned u = (unsigned)strtoul(hex, NULL, 16);
+            s += 7;
+            if (u >= 0xD800 && u < 0xDC00) { hi = u; continue; }
+            if (u >= 0xDC00 && u < 0xE000 && hi) u = 0x10000 + ((hi - 0xD800) << 10) + (u - 0xDC00);
+            hi = 0;
+            char c[4];
+            buf_add(o, c, utf8_put(c, u));
+            continue;
+        }
+        if (*s == '&') {
+            char c[4];
+            int cl, k = html_entity(s, e, c, &cl);
+            if (k > 0) { buf_add(o, c, cl); s += k; continue; }
+        }
+        buf_add(o, s, 1);
+        s++;
+    }
+}
+
+/* PowerShell writes its error stream as CLIXML when stderr is a pipe: keep the text of the
+ * <S S="Error">...</S> records (progress objects and the like are dropped). */
+static void clixml_take(Job *j) {
+    Buf *p = &j->pend;
+    int used = 0;
+    for (;;) {
+        char *s = strstr(p->s + used, "<S S=\"");
+        if (!s) { used = p->n > 8 ? p->n - 8 : used; break; } /* keep a possible partial tag */
+        char *gt = strchr(s, '>');
+        char *e = gt ? strstr(gt, "</S>") : NULL;
+        if (!e) { used = (int)(s - p->s); break; }
+        clixml_decode(gt + 1, e, &j->err);
+        used = (int)(e + 4 - p->s);
+    }
+    memmove(p->s, p->s + used, (size_t)(p->n - used + 1));
+    p->n -= used;
+}
+
+static void job_reader(Job *j, int is_err) {
+    char tmp[16384];
+    int k;
+    Buf *b = is_err ? &j->err : &j->out;
+    int *seen = is_err ? &j->err_seen : &j->out_seen;
+    long long *drop = is_err ? &j->err_drop : &j->out_drop;
+    while ((k = is_err ? proc_read_err(j->p, tmp, sizeof(tmp)) : proc_read(j->p, tmp, sizeof(tmp))) > 0) {
+        lock_acquire(j->lk);
+        if (is_err && j->ps && !j->clixml && b->n == 0 && j->pend.n + k >= 9) {
+            buf_add(&j->pend, tmp, k);
+            j->clixml = !strncmp(j->pend.s, "#< CLIXML", 9);
+            if (!j->clixml) { buf_add(b, j->pend.s, j->pend.n); j->pend.n = 0; }
+            else clixml_take(j);
+        } else if (is_err && j->ps && (j->clixml || b->n == 0)) {
+            buf_add(&j->pend, tmp, k);
+            if (j->clixml) clixml_take(j);
+        } else {
+            buf_add(b, tmp, k);
+        }
+        if (b->n > JOB_KEEP) {
+            int cut = b->n - JOB_KEEP / 2;
+            memmove(b->s, b->s + cut, (size_t)(b->n - cut + 1));
+            b->n -= cut;
+            *drop += cut;
+            *seen = *seen > cut ? *seen - cut : 0;
+        }
+        lock_notify_all(j->lk);
+        lock_release(j->lk);
+    }
+    lock_acquire(j->lk);
+    if (is_err && !j->clixml && j->pend.n) buf_add(b, j->pend.s, j->pend.n); /* short plain stderr */
+    if (is_err) j->err_eof = 1;
+    else j->out_eof = 1;
+    lock_notify_all(j->lk);
+    lock_release(j->lk);
+    job_release(j);
+}
+
+static void job_read_out(void *arg) { job_reader((Job *)arg, 0); }
+static void job_read_err(void *arg) { job_reader((Job *)arg, 1); }
+
+static void job_waiter(void *arg) {
+    Job *j = (Job *)arg;
+    int code = proc_wait(j->p, -1);
+    lock_acquire(j->lk);
+    j->code = code;
+    j->t1 = time_sec();
+    j->done = 1;
+    lock_notify_all(j->lk);
+    lock_release(j->lk);
+    job_release(j);
+}
+
+#if defined(_WIN32)
+/* PowerShell runs the command from a script file (-File): no quoting rule can break it, errors
+ * point at the failing line only and "exit N" sets the exit code. UTF-8 with BOM, as Windows
+ * PowerShell 5.1 expects. */
+static int ps_script(const char *script, char *path, int cap) {
+    static volatile long seq;
+    wchar_t tmp[MAX_PATH];
+    char dir[MAX_PATH * 3];
+    if (!GetTempPathW(MAX_PATH, tmp) || !WideCharToMultiByte(CP_UTF8, 0, tmp, -1, dir, sizeof(dir), NULL, NULL)) return 0;
+    snprintf(path, (size_t)cap, "%spithos-cmd-%lu-%ld.ps1", dir, (unsigned long)GetCurrentProcessId(),
+             InterlockedIncrement(&seq));
+    FILE *f = file_open(path, "wb");
+    if (!f) return 0;
+    fwrite("\xEF\xBB\xBF", 1, 3, f);
+    size_t n = strlen(script), w = fwrite(script, 1, n, f);
+    fclose(f);
+    return w == n;
+}
+#endif
+
+static int is_abs_path(const char *p) {
+    return p[0] == '/' || p[0] == '\\' || (isalpha((unsigned char)p[0]) && p[1] == ':');
+}
+
+/* Starts the command of a run_command / start_process call. */
+static Job *job_start(Tools *T, const Json *args, Buf *err) {
+    const char *cmd = json_str(json_get(args, "command"), NULL);
+    if (!cmd || !*cmd) { buf_add(err, "error: 'command' is required", -1); return NULL; }
+    if (strlen(cmd) > MAX_COMMAND) {
+        buf_add(err, "error: the command is too long: write a script file with write_file and run that", -1);
+        return NULL;
+    }
+    const char *shell = json_str(json_get(args, "shell"), "");
+    const char *rel = json_str(json_get(args, "cwd"), "");
+    char cwd[1100] = "";
+    if (*rel && is_abs_path(rel)) snprintf(cwd, sizeof(cwd), "%s", rel);
+    else if (*rel) snprintf(cwd, sizeof(cwd), "%s/%s", T->workspace[0] ? T->workspace : ".", rel);
+    else if (T->workspace[0]) snprintf(cwd, sizeof(cwd), "%s", T->workspace);
+    const char *argv[12];
+    int na = 0;
+    char *script = NULL, *cmdline = NULL;
+    char used[16], script_path[1100] = "";
+#if defined(_WIN32)
+    if (!strcmp(shell, "cmd")) {
+        snprintf(used, sizeof(used), "cmd");
+        size_t l = strlen(cmd) + 64;
+        cmdline = (char *)malloc(l);
+        snprintf(cmdline, l, "cmd.exe /d /s /c \"chcp 65001>nul & %s\"", cmd);
+        argv[na++] = "cmd.exe";
+    } else if (!*shell || !strcmp(shell, "powershell") || !strcmp(shell, "pwsh")) {
+        int pwsh = !strcmp(shell, "pwsh");
+        snprintf(used, sizeof(used), "%s", pwsh ? "pwsh" : "powershell");
+        /* one line, so that error positions are off by one line only */
+        static const char head[] = "$ProgressPreference='SilentlyContinue'; try { [Console]::OutputEncoding="
+                                   "[Text.Encoding]::UTF8 } catch {}; $OutputEncoding=[Text.Encoding]::UTF8\n";
+        static const char tail[] = "\nexit $(if ($?) { 0 } elseif ($LASTEXITCODE) { $LASTEXITCODE } else { 1 })\n";
+        size_t l = sizeof(head) + strlen(cmd) + sizeof(tail);
+        script = (char *)malloc(l);
+        snprintf(script, l, "%s%s%s", head, cmd, tail);
+        if (!ps_script(script, script_path, sizeof(script_path))) {
+            free(script);
+            buf_add(err, "error: cannot write the command to the temporary folder", -1);
+            return NULL;
+        }
+        argv[na++] = pwsh ? "pwsh" : "powershell";
+        argv[na++] = "-NoLogo";
+        argv[na++] = "-NoProfile";
+        argv[na++] = "-NonInteractive";
+        argv[na++] = "-ExecutionPolicy";
+        argv[na++] = "Bypass";
+        argv[na++] = "-File";
+        argv[na++] = script_path;
+    } else {
+        buf_add(err, "error: on Windows the shell is powershell (default), pwsh or cmd", -1);
+        return NULL;
+    }
+#else
+    FILE *bf = fopen("/bin/bash", "rb");
+    int has_bash = bf != NULL;
+    if (bf) fclose(bf);
+    if (!*shell) shell = has_bash ? "bash" : "sh";
+    if (strcmp(shell, "bash") && strcmp(shell, "sh")) { buf_add(err, "error: the shell is bash or sh", -1); return NULL; }
+    snprintf(used, sizeof(used), "%s", shell);
+    argv[na++] = !strcmp(shell, "bash") ? "/bin/bash" : "/bin/sh";
+    argv[na++] = "-c";
+    argv[na++] = cmd;
+#endif
+    argv[na] = NULL;
+    ProcOptions po;
+    memset(&po, 0, sizeof(po));
+    po.argv = argv;
+    po.env = SHELL_ENV;
+    po.cwd = cwd[0] ? cwd : NULL;
+    po.err_mode = PROC_ERR_PIPE;
+    po.win_cmdline = cmdline;
+    char e[300];
+    Proc *p = proc_start(&po, e, sizeof(e));
+    free(script);
+    free(cmdline);
+    if (!p) {
+        if (script_path[0]) file_remove(script_path);
+        buf_printf(err, "error: %s", e);
+        return NULL;
+    }
+    proc_close_stdin(p); /* no input: a command waiting for it sees the end at once */
+    Job *j = (Job *)calloc(1, sizeof(Job));
+    j->p = p;
+    j->pid = proc_pid(p);
+    j->cmd = dupstr(cmd);
+    snprintf(j->shell, sizeof(j->shell), "%s", used);
+    j->lk = lock_create();
+    j->t0 = time_sec();
+    j->refs = 4;
+    j->ps = !strcmp(used, "powershell") || !strcmp(used, "pwsh");
+    if (script_path[0]) j->script = dupstr(script_path);
+    if (!thread_spawn(job_read_out, j)) { j->out_eof = 1; j->refs--; }
+    if (!thread_spawn(job_read_err, j)) { j->err_eof = 1; j->refs--; }
+    if (!thread_spawn(job_waiter, j)) { proc_kill(p); j->done = 1; j->code = -1; j->refs--; }
+    return j;
+}
+
+/* Waits for the pipes to close (the readers have everything), at most ms. Holds j->lk. */
+static void job_drain(Job *j, int ms) {
+    double t0 = time_sec();
+    while (!(j->out_eof && j->err_eof) && (time_sec() - t0) * 1e3 < ms) lock_wait_ms(j->lk, 20);
+}
+
+/* Command output for the model: no terminal escapes, \r\n as \n, a lone \r overwrites the line
+ * (progress bars), invalid UTF-8 as '?'. */
+static void clean_output(const char *s, int n, Buf *o) {
+    for (int i = 0; i < n;) {
+        unsigned char c = (unsigned char)s[i];
+        if (c == 0x1b) { /* CSI ... final byte, OSC ... BEL / ST */
+            i++;
+            if (i < n && s[i] == '[') {
+                for (i++; i < n && !((unsigned char)s[i] >= 0x40 && (unsigned char)s[i] <= 0x7e); i++) {}
+                i++;
+            } else if (i < n && s[i] == ']') {
+                for (i++; i < n && s[i] != 7 && !(s[i] == 0x1b && i + 1 < n && s[i + 1] == '\\'); i++) {}
+                i += i < n && s[i] == 7 ? 1 : 2;
+            } else {
+                i++;
+            }
+            continue;
+        }
+        if (c == '\r') {
+            if (i + 1 < n && s[i + 1] == '\n') { i++; continue; }
+            if (i + 1 < n) { /* back to the start of the line */
+                int k = o->n;
+                while (k > 0 && o->s[k - 1] != '\n') k--;
+                o->n = k;
+                if (o->s) o->s[k] = 0;
+            }
+            i++;
+            continue;
+        }
+        if (c < 0x20 && c != '\n' && c != '\t') { i++; continue; }
+        if (c < 0x80) { buf_add(o, s + i, 1); i++; continue; }
+        int need = (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : (c >> 3) == 30 ? 4 : 0;
+        int ok = need && i + need <= n;
+        for (int k = 1; ok && k < need; k++) ok = ((unsigned char)s[i + k] & 0xC0) == 0x80;
+        if (ok) { buf_add(o, s + i, need); i += need; }
+        else { buf_add(o, "?", 1); i++; }
+    }
+}
+
+/* One stream for the model: head and tail when it is long (the end matters most: errors, results). */
+static void show_stream(Buf *out, const char *label, const char *s, int n, long long dropped, int max) {
+    Buf c = { 0 };
+    clean_output(s, n, &c);
+    while (c.n > 0 && (c.s[c.n - 1] == '\n' || c.s[c.n - 1] == ' ')) c.n--;
+    if (c.n == 0) { buf_free(&c); return; }
+    buf_printf(out, "\n--- %s ---\n", label);
+    if (dropped > 0) buf_printf(out, "[%lld earlier bytes not kept]\n", dropped);
+    if (c.n <= max) {
+        buf_add(out, c.s, c.n);
+    } else {
+        int head = max / 4, tail = max - head;
+        while (head > 0 && ((unsigned char)c.s[head] & 0xC0) == 0x80) head--;
+        int from = c.n - tail;
+        while (from < c.n && ((unsigned char)c.s[from] & 0xC0) == 0x80) from++;
+        int lines = 0;
+        for (int k = head; k < from; k++) lines += c.s[k] == '\n';
+        buf_add(out, c.s, head);
+        buf_printf(out, "\n[... %d lines, %d bytes omitted ...]\n", lines, from - head);
+        buf_add(out, c.s + from, c.n - from);
+    }
+    buf_free(&c);
+}
+
+static void show_cmd(Buf *out, const char *cmd) {
+    int l = (int)strlen(cmd);
+    const char *nl = strchr(cmd, '\n');
+    int show = nl ? (int)(nl - cmd) : l;
+    if (show > 120) show = 120;
+    buf_add(out, cmd, show);
+    if (show < l) buf_add(out, " ...", -1);
+}
+
+/* "process 3 (pid 1234) is running for 2.1 s" / "exited with code 1 after 0.4 s". Holds j->lk. */
+static void job_status(Job *j, Buf *out) {
+    if (!j->done) buf_printf(out, "process %d (pid %d) is running for %.1f s: ", j->id, j->pid, time_sec() - j->t0);
+    else buf_printf(out, "process %d (pid %d) exited with code %d after %.1f s: ", j->id, j->pid, j->code, j->t1 - j->t0);
+    show_cmd(out, j->cmd);
+}
+
+/* New output since the last read. Holds j->lk. */
+static void job_new_output(Job *j, Buf *out, int max) {
+    int before = out->n;
+    show_stream(out, "stdout", j->out.s ? j->out.s + j->out_seen : "", j->out.n - j->out_seen,
+                j->out_seen == 0 ? j->out_drop : 0, max * 2 / 3);
+    show_stream(out, "stderr", j->err.s ? j->err.s + j->err_seen : "", j->err.n - j->err_seen,
+                j->err_seen == 0 ? j->err_drop : 0, max / 3);
+    j->out_seen = j->out.n;
+    j->err_seen = j->err.n;
+    if (out->n == before) buf_add(out, "\n(no new output)", -1);
+}
+
+static int tool_run(Tools *T, const Json *args, Buf *out) {
+    long long timeout = arg_int(args, "timeout", 120);
+    if (timeout < 1) timeout = 1;
+    if (timeout > 3600) timeout = 3600;
+    Job *j = job_start(T, args, out);
+    if (!j) return 0;
+    lock_acquire(j->lk);
+    while (!j->done && !T->interrupt && time_sec() - j->t0 < (double)timeout) lock_wait_ms(j->lk, 100);
+    int finished = j->done;
+    double elapsed = time_sec() - j->t0;
+    if (finished) {
+        elapsed = j->t1 - j->t0;
+        job_drain(j, 300); /* the rest of the output, unless something the command started holds the pipe */
+    }
+    lock_release(j->lk);
+    proc_kill(j->p); /* the command, or what it left running: programs that must stay use start_process */
+    lock_acquire(j->lk);
+    double t0 = time_sec();
+    while (!j->done && time_sec() - t0 < 3) lock_wait_ms(j->lk, 20);
+    job_drain(j, 2000);
+    int code = j->code;
+    if (finished)
+        buf_printf(out, "exit code %d (%s) | %.2f s | %s", code, code ? "failed" : "success", elapsed, j->shell);
+    else if (T->interrupt)
+        buf_printf(out, "INTERRUPTED by the user after %.1f s: the command was stopped | %s", elapsed, j->shell);
+    else
+        buf_printf(out, "TIMED OUT after %lld s: the command was stopped. If it is a program that keeps running "
+                        "(server, watcher), use start_process; otherwise give it a larger timeout | %s", timeout, j->shell);
+    const char *cwd = json_str(json_get(args, "cwd"), "");
+    if (*cwd) buf_printf(out, " | cwd: %s", cwd);
+    int before = out->n;
+    show_stream(out, "stdout", j->out.s ? j->out.s : "", j->out.n, j->out_drop, 12000);
+    show_stream(out, "stderr", j->err.s ? j->err.s : "", j->err.n, j->err_drop, 6000);
+    if (out->n == before) buf_add(out, "\n(no output)", -1);
+    lock_release(j->lk);
+    job_release(j);
+    return finished && code == 0;
+}
+
+static Job *job_get(Tools *T, const Json *args, Buf *out) {
+    long long id = arg_int(args, "id", -1);
+    Job *j = NULL;
+    lock_acquire(T->lock);
+    for (int i = 0; i < T->njobs; i++)
+        if (T->jobs[i]->id == id) { j = T->jobs[i]; lock_acquire(j->lk); j->refs++; lock_release(j->lk); }
+    lock_release(T->lock);
+    if (!j) buf_printf(out, "error: no background process with id %lld (see list_processes)", id);
+    return j;
+}
+
+static int tool_start(Tools *T, const Json *args, Buf *out) {
+    lock_acquire(T->lock);
+    int room = T->njobs < MAX_JOBS;
+    for (int i = 0; i < T->njobs && !room; i++) room = T->jobs[i]->done;
+    lock_release(T->lock);
+    if (!room) { buf_add(out, "error: too many background processes: stop some with stop_process", -1); return 0; }
+    Job *j = job_start(T, args, out);
+    if (!j) return 0;
+    lock_acquire(T->lock);
+    if (T->njobs == MAX_JOBS) { /* forget the oldest finished one */
+        for (int i = 0; i < T->njobs; i++)
+            if (T->jobs[i]->done) {
+                Job *old = T->jobs[i];
+                memmove(T->jobs + i, T->jobs + i + 1, sizeof(Job *) * (size_t)(T->njobs - i - 1));
+                T->njobs--;
+                job_release(old);
+                break;
+            }
+    }
+    j->id = ++T->next_job;
+    T->jobs[T->njobs++] = j;
+    lock_acquire(j->lk); /* the list holds the owner reference, this call one more */
+    j->refs++;
+    lock_release(j->lk);
+    lock_release(T->lock);
+    long long wait = arg_int(args, "wait", 3);
+    if (wait < 0) wait = 0;
+    if (wait > 60) wait = 60;
+    lock_acquire(j->lk);
+    while (!j->done && !T->interrupt && time_sec() - j->t0 < (double)wait) lock_wait_ms(j->lk, 100);
+    if (j->done) job_drain(j, 300);
+    buf_add(out, "started: ", -1);
+    job_status(j, out);
+    job_new_output(j, out, 8000);
+    if (!j->done) buf_printf(out, "\nUse read_process with id=%d to follow it and stop_process to end it.", j->id);
+    int ok = !j->done || j->code == 0;
+    lock_release(j->lk);
+    job_release(j);
+    return ok;
+}
+
+static int tool_readp(Tools *T, const Json *args, Buf *out) {
+    Job *j = job_get(T, args, out);
+    if (!j) return 0;
+    long long wait = arg_int(args, "wait", 0);
+    if (wait < 0) wait = 0;
+    if (wait > 600) wait = 600;
+    const char *until = json_str(json_get(args, "until"), NULL);
+    if (until && !*until) until = NULL;
+    double t0 = time_sec();
+    lock_acquire(j->lk);
+    while (!j->done && !T->interrupt && time_sec() - t0 < (double)wait) {
+        /* anywhere in the kept output: it may have been shown by an earlier call already */
+        if (until && ((j->out.s && strstr(j->out.s, until)) || (j->err.s && strstr(j->err.s, until)))) break;
+        lock_wait_ms(j->lk, 100);
+    }
+    if (j->done) job_drain(j, 300);
+    job_status(j, out);
+    if (until && !j->done && time_sec() - t0 >= (double)wait && wait > 0)
+        buf_printf(out, "\n('%s' did not appear within %lld s)", until, wait);
+    job_new_output(j, out, 12000);
+    int ok = !j->done || j->code == 0;
+    lock_release(j->lk);
+    job_release(j);
+    return ok;
+}
+
+static int tool_stopp(Tools *T, const Json *args, Buf *out) {
+    Job *j = job_get(T, args, out);
+    if (!j) return 0;
+    lock_acquire(j->lk);
+    int was_running = !j->done;
+    lock_release(j->lk);
+    proc_kill(j->p);
+    lock_acquire(j->lk);
+    double t0 = time_sec();
+    while (!j->done && time_sec() - t0 < 3) lock_wait_ms(j->lk, 20);
+    job_drain(j, 1000);
+    if (was_running) buf_add(out, "stopped. ", -1);
+    else buf_add(out, "it had already ended. ", -1);
+    job_status(j, out);
+    job_new_output(j, out, 8000);
+    lock_release(j->lk);
+    job_release(j);
+    return 1;
+}
+
+static int tool_listp(Tools *T, Buf *out) {
+    lock_acquire(T->lock);
+    if (!T->njobs) buf_add(out, "no background processes", -1);
+    for (int i = 0; i < T->njobs; i++) {
+        Job *j = T->jobs[i];
+        lock_acquire(j->lk);
+        if (i) buf_add(out, "\n", 1);
+        job_status(j, out);
+        lock_release(j->lk);
+    }
+    lock_release(T->lock);
+    return 1;
+}
+
+/* Commands that need the user's word even in autonomous mode. */
+const char *tools_danger(const char *name, const Json *args) {
+    static const struct { const char *pat, *why; } D[] = {
+        { "rm -rf", "deletes files recursively" }, { "rm -fr", "deletes files recursively" },
+        { "rm -r ", "deletes files recursively" }, { "rm --recursive", "deletes files recursively" },
+        { "rmdir /s", "deletes folders recursively" }, { "rd /s", "deletes folders recursively" },
+        { "del /s", "deletes files recursively" }, { "del /q", "deletes files without asking" },
+        { "erase /s", "deletes files recursively" }, { "format-volume", "formats a disk" },
+        { "clear-disk", "erases a disk" }, { "initialize-disk", "erases a disk" }, { "remove-partition", "deletes a partition" },
+        { "diskpart", "changes disks and partitions" }, { "mkfs", "formats a disk" }, { "dd if=", "writes raw data" },
+        { "wipefs", "erases a disk" }, { "of=/dev/", "writes to a device" }, { "> /dev/sd", "writes to a disk" },
+        { "format c:", "formats a disk" }, { "shutdown", "shuts down the computer" }, { "reboot", "restarts the computer" },
+        { "restart-computer", "restarts the computer" }, { "stop-computer", "shuts down the computer" },
+        { "poweroff", "shuts down the computer" }, { "git push", "publishes to a remote repository" },
+        { "git reset --hard", "discards uncommitted changes" }, { "git clean -f", "deletes untracked files" },
+        { "git checkout -- .", "discards uncommitted changes" }, { "git restore .", "discards uncommitted changes" },
+        { "npm publish", "publishes a package" }, { "cargo publish", "publishes a package" },
+        { "twine upload", "publishes a package" }, { "docker push", "publishes an image" },
+        { "gh repo delete", "deletes a repository" }, { "gh release delete", "deletes a release" },
+        { "chmod -r", "changes permissions recursively" }, { "chown -r", "changes owners recursively" },
+        { "takeown", "takes ownership of files" }, { "icacls", "changes permissions" }, { "reg delete", "edits the registry" },
+        { "reg add", "edits the registry" }, { "bcdedit", "changes the boot configuration" }, { "cipher /w", "wipes free space" },
+        { "sudo ", "runs as administrator" }, { "runas ", "runs as another user" },
+        { "set-executionpolicy", "changes the script policy" }, { "netsh ", "changes network settings" },
+        { "| sh", "runs a downloaded script" }, { "| bash", "runs a downloaded script" }, { "|sh", "runs a downloaded script" },
+        { "|bash", "runs a downloaded script" }, { "iex ", "runs code from a string" }, { "iex(", "runs code from a string" },
+        { "invoke-expression", "runs code from a string" }, { "taskkill", "ends processes" }, { "stop-process", "ends processes" },
+        { "killall", "ends processes" }, { "pkill", "ends processes" }, { "drop database", "deletes a database" },
+        { "drop table", "deletes a table" }, { "truncate table", "empties a table" }, { ":(){", "fork bomb" },
+    };
+    if (strcmp(name, "run_command") && strcmp(name, "start_process")) return NULL;
+    const char *cmd = json_str(json_get(args, "command"), "");
+    size_t n = strlen(cmd);
+    char *low = (char *)malloc(n + 2);
+    for (size_t i = 0; i < n; i++) low[i] = (char)tolower((unsigned char)cmd[i]);
+    low[n] = ' '; /* "rm -r" at the end matches "rm -r " */
+    low[n + 1] = 0;
+    const char *why = NULL;
+    for (size_t i = 0; i < sizeof(D) / sizeof(D[0]) && !why; i++)
+        if (strstr(low, D[i].pat)) why = D[i].why;
+    if (!why && strstr(low, "remove-item") && (strstr(low, "-recurse") || strstr(low, " -r "))) why = "deletes files recursively";
+    free(low);
+    return why;
+}
+
+/* ------------------------------------------------------------------ environment for the agent */
+
+static int on_path(const char *name) {
+#if defined(_WIN32)
+    wchar_t w[64], found[MAX_PATH];
+    if (!MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 64)) return 0;
+    const wchar_t *exts[] = { L".exe", L".cmd", L".bat", L".com" };
+    for (int i = 0; i < 4; i++) {
+        DWORD r = SearchPathW(NULL, w, exts[i], MAX_PATH, found, NULL);
+        /* the python / python3 "App Execution Aliases" only open the Microsoft Store */
+        if (r && r < MAX_PATH && !(strstr(name, "python") && wcsstr(found, L"\\WindowsApps\\"))) return 1;
+    }
+    return 0;
+#else
+    const char *path = getenv("PATH");
+    if (!path) path = "/usr/local/bin:/usr/bin:/bin";
+    char f[1100];
+    for (const char *p = path; *p;) {
+        const char *e = strchr(p, ':');
+        int l = e ? (int)(e - p) : (int)strlen(p);
+        if (l > 0 && l < 1000) {
+            snprintf(f, sizeof(f), "%.*s/%s", l, p, name);
+            if (access(f, X_OK) == 0) return 1;
+        }
+        p += l + (e ? 1 : 0);
+        if (!e) break;
+    }
+    return 0;
+#endif
+}
+
+static void absolute_path(const char *p, char *out, int cap) {
+#if defined(_WIN32)
+    wchar_t w[1100], full[1100];
+    if (MultiByteToWideChar(CP_UTF8, 0, p, -1, w, 1100) && GetFullPathNameW(w, 1100, full, NULL) &&
+        WideCharToMultiByte(CP_UTF8, 0, full, -1, out, cap, NULL, NULL))
+        return;
+#else
+    char r[PATH_MAX];
+    if (realpath(p, r) && (int)strlen(r) < cap) { memcpy(out, r, strlen(r) + 1); return; }
+#endif
+    snprintf(out, (size_t)cap, "%s", p);
+}
+
+static void build_env_info(Tools *T) {
+    static const char *progs[] = { "git", "gh", "python", "python3", "py", "pip", "uv", "node", "npm", "npx", "deno", "bun",
+                                   "gcc", "g++", "clang", "cl", "make", "mingw32-make", "cmake", "ninja", "cargo", "rustc",
+                                   "go", "java", "javac", "mvn", "gradle", "dotnet", "docker", "podman", "kubectl", "curl",
+                                   "wget", "ssh", "tar", "zip", "unzip", "7z", "pwsh", "bash", "wsl", "winget", "choco",
+                                   "scoop", "apt", "dnf", "yum", "pacman", "zypper", "apk", "brew", "sudo", "systemctl",
+                                   "sqlite3", "psql", "mysql", "ffmpeg", "jq", "rg", "code" };
+    char os[256], wd[1100];
+    os_describe(os, sizeof(os));
+    absolute_path(T->workspace[0] ? T->workspace : ".", wd, sizeof(wd));
+    Buf b = { 0 }, found = { 0 };
+    int has_pwsh = 0;
+    for (size_t i = 0; i < sizeof(progs) / sizeof(progs[0]); i++)
+        if (on_path(progs[i])) {
+            if (found.n) buf_add(&found, ", ", 2);
+            buf_add(&found, progs[i], -1);
+            if (!strcmp(progs[i], "pwsh")) has_pwsh = 1;
+        }
+    (void)has_pwsh; /* only Windows offers it */
+    buf_printf(&b, "Operating system: %s\n", os);
+#if defined(_WIN32)
+    buf_printf(&b, "Shell for run_command / start_process: Windows PowerShell 5.1 (the default), or cmd.exe with "
+                   "shell=\"cmd\"%s.\n", has_pwsh ? ", or PowerShell 7 with shell=\"pwsh\"" : "");
+#else
+    FILE *bf = fopen("/bin/bash", "rb");
+    buf_printf(&b, "Shell for run_command / start_process: %s.\n", bf ? "bash (the default), or sh with shell=\"sh\"" : "sh");
+    if (bf) fclose(bf);
+#endif
+    buf_add(&b, "Working folder: ", -1);
+    buf_add(&b, wd, -1);
+    buf_add(&b, " (file tool paths are relative to it; commands run in it unless cwd is given)\n", -1);
+    buf_add(&b, "Programs found on the PATH: ", -1);
+    buf_add(&b, found.n ? found.s : "none of the common ones", -1);
+    buf_add(&b, " (others are probably not installed: check before relying on them)\n\nCommand rules for this system:\n", -1);
+#if defined(_WIN32)
+    buf_add(&b,
+            "- This is Windows: do not use Linux commands or paths (no ls -la, grep, cat | head, rm -rf, touch, which, export, /dev/null, ~/).\n"
+            "- PowerShell syntax: separate commands with ';'. Windows PowerShell 5.1 has no '&&' and '||': run the next command "
+            "only on success with 'if ($?) { ... }'. The exit code of the last program is $LASTEXITCODE.\n"
+            "- PowerShell equivalents: Get-ChildItem (ls), Get-ChildItem -Recurse -Filter *.c (find), Select-String -Pattern x -Path *.c (grep), "
+            "Get-Content f -TotalCount 20 / -Tail 20 (head / tail), Remove-Item -Recurse -Force (rm -rf), "
+            "New-Item -ItemType Directory -Force (mkdir -p), Get-Command (which), $env:NAME = 'v' (export), $null (/dev/null), "
+            "Copy-Item / Move-Item (cp / mv).\n"
+            "- Quote paths with spaces; run a program given by a quoted path as: & \"C:\\path\\app.exe\" args.\n"
+            "- Windows PowerShell 5.1 loses double quotes inside arguments passed to programs (python -c \"...\" with "
+            "quotes inside breaks): for code longer than a line, write a script file with write_file and run it.\n"
+            "- With shell=\"cmd\": cmd.exe syntax ('&&' and '||' work, variables are %NAME%, dir, type, del, copy).\n",
+            -1);
+#else
+    buf_add(&b,
+            "- POSIX shell syntax: '&&' runs the next command only on success; quote paths with spaces.\n"
+            "- sudo cannot ask for a password here: use 'sudo -n' and, if that fails, tell the user the command to run.\n",
+            -1);
+#endif
+    buf_add(&b,
+            "- Commands run without a terminal and without input: never start editors, pagers or interactive prompts; "
+            "pass flags such as -y, --yes, --no-input or -Force.\n"
+            "- run_command waits for the end (default timeout 120 s, then the command is stopped). Programs that keep "
+            "running (servers, watchers, 'npm run dev') must be started with start_process and followed with read_process.\n",
+            -1);
+    T->env_info = b.s;
+    buf_free(&found);
+}
+
+const char *tools_env_info(Tools *T) {
+    if (!T->env_info) build_env_info(T);
+    return T->env_info;
+}
+
+/* Only a flag (callable from a signal handler): the waits look at it every 100 ms. */
+void tools_set_interrupt(Tools *T, int on) { T->interrupt = on; }
 
 /* ------------------------------------------------------------------ MCP client (stdio, JSON-RPC 2.0) */
 
@@ -1101,11 +1937,26 @@ Tools *tools_create(const ToolsConfig *cfg) {
     for (int i = 0; i < N_BUILTINS; i++) {
         int id = BUILTINS[i].id;
         if ((id == B_SEARCH || id == B_FETCH) && !T->has_curl) continue;
-        if (id >= B_LS && !T->workspace[0]) continue;
-        if (id == B_WRITE && !cfg->allow_write) continue;
+        if (id >= B_LS && id <= B_EDIT && !T->workspace[0]) continue;
+        if ((id == B_WRITE || id == B_EDIT) && !cfg->allow_write) continue;
+        if (id >= B_RUN && !cfg->shell) continue;
         Tool *t = add_tool(T);
         snprintf(t->name, sizeof(t->name), "%s", BUILTINS[i].name);
-        t->desc = dupstr(BUILTINS[i].desc);
+        if (id == B_RUN) {
+            Buf d = { 0 };
+            buf_add(&d, "Run a shell command and wait for it to end (or for the timeout). Returns the exit code, the run "
+                        "time, and stdout and stderr separately. ", -1);
+#if defined(_WIN32)
+            buf_add(&d, "This computer runs Windows: commands use Windows PowerShell 5.1 syntax by default "
+                        "(shell=\"cmd\" for cmd.exe).", -1);
+#else
+            buf_add(&d, "Commands use bash syntax (sh if bash is missing).", -1);
+#endif
+            buf_add(&d, " Programs that keep running (servers, watchers) need start_process instead.", -1);
+            t->desc = d.s;
+        } else {
+            t->desc = dupstr(BUILTINS[i].desc);
+        }
         t->params = json_parse(BUILTINS[i].params, (int)strlen(BUILTINS[i].params), NULL, 0);
         t->confirm = BUILTINS[i].confirm;
         t->builtin = id;
@@ -1131,10 +1982,24 @@ void tools_free(Tools *T) {
         free(m);
     }
     free(T->srv);
+    for (int i = 0; i < T->njobs; i++) { /* background processes end with us */
+        proc_kill(T->jobs[i]->p);
+        job_release(T->jobs[i]);
+    }
     for (int i = 0; i < T->n; i++) { free(T->t[i].desc); free(T->t[i].remote); json_free(T->t[i].params); }
     free(T->t);
+    free(T->env_info);
     lock_destroy(T->lock);
     free(T);
+}
+
+int tools_confirm(Tools *T, const char *name) {
+    int c = 1; /* unknown tools ask */
+    lock_acquire(T->lock);
+    for (int i = 0; i < T->n; i++)
+        if (!strcmp(T->t[i].name, name)) { c = T->t[i].confirm; break; }
+    lock_release(T->lock);
+    return c;
 }
 
 int tools_count(Tools *T) {
@@ -1211,6 +2076,12 @@ int tools_call(Tools *T, const char *name, const Json *args, Buf *out) {
     case B_FIND: ok = tool_find(T, args, out, 0); break;
     case B_GREP: ok = tool_find(T, args, out, 1); break;
     case B_WRITE: ok = tool_write(T, args, out); break;
+    case B_EDIT: ok = tool_edit(T, args, out); break;
+    case B_RUN: ok = tool_run(T, args, out); break;
+    case B_START: ok = tool_start(T, args, out); break;
+    case B_READP: ok = tool_readp(T, args, out); break;
+    case B_STOPP: ok = tool_stopp(T, args, out); break;
+    case B_LISTP: ok = tool_listp(T, out); break;
     default: buf_add(out, "error: tool not available", -1); ok = 0;
     }
     if (!out->s) buf_add(out, "", 0);
