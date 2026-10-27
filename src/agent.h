@@ -16,7 +16,13 @@ typedef struct {
     int max_tokens;             /* per answer (<= 0: until the context is full) */
     int show_think;             /* stream the reasoning instead of a one-line counter */
     int color;                  /* ANSI colors on the terminal */
+    const char *version;        /* shown in the start-up banner */
+    int banner_shown;           /* agent_banner() already ran (before the model was loaded) */
 } AgentConfig;
+
+/* Logo, name, operating system, folder and mode: shown at start-up, while the model loads.
+ * Needs only color, version, autonomous and yolo. */
+void agent_banner(const AgentConfig *cfg);
 
 /* Needs server_attach() first: the agent talks to the model through server_local_chat().
  * Returns 0 when the (last) task ended normally. */

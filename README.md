@@ -213,6 +213,10 @@ pithos --auto                          autonomous mode: it works on its own unti
 pithos --auto -p "make the tests pass" one task, then exit
 ```
 
+At start-up, while the model loads, it shows the Pandora mark and the Pithos name in 24-bit color.
+It also shows the operating system, the folder and the mode. Under 80 columns only the name is
+shown, and plain text is printed when the output is not a terminal.
+
 **Modes.**
 - **Safe** (default): each tool call is shown before it runs. You answer **y** (run it), **n**
   (skip it), **a** (always allow this tool for the session), or type what to do instead. Your
@@ -487,6 +491,7 @@ for each of the 30 convolution layers.
 ## Diagnostic environment variables
 | Variable | Effect |
 |---|---|
+| `PITHOS_COLOR=1` / `0` | colors even when the output is a pipe (e.g. `less -R`) / never |
 | `PITHOS_PF=N` | rows of software prefetch (default 4) |
 | `PITHOS_GPU_PROFILE=1` | GPU kernel timings |
 | `PITHOS_GPU_SYNC=1` | sync after every kernel (debug) |

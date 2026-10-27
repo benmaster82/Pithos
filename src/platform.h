@@ -96,9 +96,14 @@ int   dir_entries(const char *dir, void (*cb)(const char *name, int is_dir, uint
 /* Read one line of UTF-8 input (newline removed). Returns 0 on end of input or when Ctrl+C
  * interrupts the read. */
 int  console_read_line(char *buf, int cap);
+/* Width of the terminal in columns (80 when unknown). */
+int  console_columns(void);
 /* Ctrl+C calls fn (from a signal handler or a system thread: it should only set flags)
  * instead of ending the process. */
 void console_on_interrupt(void (*fn)(void));
+
+/* Current folder as an absolute UTF-8 path. Returns 0 on failure. */
+int  dir_current(char *out, int cap);
 
 /* ---- dynamic libraries ---- */
 void *lib_open(const char *name);

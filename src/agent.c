@@ -659,6 +659,190 @@ static void build_tools(void) {
     g_tools = o.s;
 }
 
+/* ------------------------------------------------------------------ start-up banner */
+
+/* The Pandora mark (web/brand) at 32 x 28 pixels: two pixel rows per text row with half blocks. */
+static const char *const LOGO[] = {
+    "...............#######..........", ".............############.......",
+    "...........###############......", "..........#################.....",
+    ".........###################....", "........#####################...",
+    "........######################..", ".......#######################..",
+    "......#########################.", "......#######################.#.",
+    "......#######################.#.", ".....########################..#",
+    ".....########################..#", ".....###############....#####..#",
+    "....###############......####..#", "....###############.......####.#",
+    "....###############.......######", "...################.......######",
+    "...################......######.", "..##################.....######.",
+    ".##############################.", ".#############################..",
+    "##############################..", "#############################...",
+    "..##########################....", "..........#################.....",
+    ".............############.......", "................#######.........",
+};
+#define LOGO_W 32
+#define LOGO_H 28
+
+/* The wordmark as readable source: '#' full block, other characters are box drawing (the shadow). */
+static const char *const WORD_SRC[] = {
+    "######b ##b########b##b  ##b ######b #######b",
+    "##rqq##b##|aqq##rqqd##|  ##|##rqqq##b##rqqqqd",
+    "######rd##|   ##|   #######|##|   ##|#######b",
+    "##rqqqd ##|   ##|   ##rqq##|##|   ##|aqqqq##|",
+    "##|     ##|   ##|   ##|  ##|a######rd#######|",
+    "aqd     aqd   aqd   aqd  aqd aqqqqqd aqqqqqqd",
+};
+#define WORD_W 45
+
+/* b ╗  r ╔  d ╝  a ╚  q ═  | ║ */
+static const char *word_glyph(char c, int *shadow) {
+    *shadow = 1;
+    switch (c) {
+    case '#': *shadow = 0; return "\xe2\x96\x88"; /* █ */
+    case 'b': return "\xe2\x95\x97";              /* ╗ */
+    case 'r': return "\xe2\x95\x94";              /* ╔ */
+    case 'd': return "\xe2\x95\x9d";              /* ╝ */
+    case 'a': return "\xe2\x95\x9a";              /* ╚ */
+    case 'q': return "\xe2\x95\x90";              /* ═ */
+    case '|': return "\xe2\x95\x91";              /* ║ */
+    default: *shadow = 0; return " ";
+    }
+}
+
+/* violet -> rose -> amber */
+static void gradient(double t, int rgb[3]) {
+    static const double st[3][4] = { { 0.0, 124, 92, 246 }, { 0.45, 236, 92, 140 }, { 1.0, 255, 196, 96 } };
+    if (t < 0) t = 0;
+    if (t > 1) t = 1;
+    int k = t <= st[1][0] ? 0 : 1;
+    double u = (t - st[k][0]) / (st[k + 1][0] - st[k][0]);
+    for (int i = 0; i < 3; i++) rgb[i] = (int)(st[k][i + 1] + (st[k + 1][i + 1] - st[k][i + 1]) * u);
+}
+
+static void put_fg(const int c[3], double scale) {
+    char e[40];
+    snprintf(e, sizeof(e), "\x1b[38;2;%d;%d;%dm", (int)(c[0] * scale), (int)(c[1] * scale), (int)(c[2] * scale));
+    out(e);
+}
+
+/* One text column of the logo (two pixel rows). */
+static void logo_cell(int row, int x, int total) {
+    int top = LOGO[2 * row][x] == '#', bot = LOGO[2 * row + 1][x] == '#';
+    if (!top && !bot) { out(" "); return; }
+    int ct[3], cb[3];
+    gradient((double)x / total * 0.85 + (2.0 * row) / LOGO_H * 0.15, ct);
+    gradient((double)x / total * 0.85 + (2.0 * row + 1) / LOGO_H * 0.15, cb);
+    if (top && bot) {
+        char e[40];
+        put_fg(ct, 1.0);
+        snprintf(e, sizeof(e), "\x1b[48;2;%d;%d;%dm", cb[0], cb[1], cb[2]);
+        out(e);
+        out("\xe2\x96\x80\x1b[49m"); /* ▀ */
+    } else {
+        put_fg(top ? ct : cb, 1.0);
+        out(top ? "\xe2\x96\x80" : "\xe2\x96\x84"); /* ▀ ▄ */
+    }
+}
+
+static void word_row(int i, int x0, int total) {
+    for (int j = 0; j < WORD_W; j++) {
+        int shadow;
+        const char *g = word_glyph(WORD_SRC[i][j], &shadow);
+        if (*g != ' ') {
+            int c[3];
+            gradient((double)(x0 + j) / total * 0.85 + i / 6.0 * 0.15, c);
+            put_fg(c, shadow ? 0.55 : 1.0);
+        }
+        out(g);
+    }
+}
+
+/* Text cut to fit max columns (counting UTF-8 characters); keep_end: drop the start instead
+ * (the informative part of a path is its end). */
+static void out_fit(const char *s, int max, int keep_end) {
+    int cols = 0;
+    const char *p = s;
+    while (*p && cols < max) {
+        p++;
+        while ((*p & 0xC0) == 0x80) p++;
+        cols++;
+    }
+    if (*p && max > 3 && !keep_end) {
+        const char *q = s;
+        for (int k = 0; k < max - 3; k++) {
+            q++;
+            while ((*q & 0xC0) == 0x80) q++;
+        }
+        outn(s, (int)(q - s));
+        out("...");
+        return;
+    }
+    if (*p && max > 3) {
+        int n = 0;
+        for (const char *q = s; *q; q++) n += (*q & 0xC0) != 0x80;
+        const char *q = s;
+        for (int skip = n - (max - 3); skip > 0 && *q; skip--) {
+            q++;
+            while ((*q & 0xC0) == 0x80) q++;
+        }
+        out("...");
+        out(q);
+        return;
+    }
+    outn(s, (int)(p - s));
+}
+
+static void banner(const char *os, const char *folder) {
+    const char *mode = g_auto ? (C->yolo ? "autonomous mode, without the safety checks"
+                                         : "autonomous mode: destructive commands still ask")
+                              : "safe mode: every action needs your approval";
+    char title[64];
+    snprintf(title, sizeof(title), "local AI agent  v%s", C->version ? C->version : "");
+    if (!C->color) {
+        printf("\nPithos agent v%s\n%s\n%s\n%s\n", C->version ? C->version : "", os, folder, mode);
+        fflush(stdout);
+        return;
+    }
+    const char *info[4] = { title, os, folder, mode };
+    int cols = console_columns(), with_logo = cols >= LOGO_W + 2 + WORD_W + 1; /* 80 columns are enough */
+    if (cols < WORD_W + 2) { /* too narrow for any art */
+        printf("\n" BOLD "Pithos agent" RESET " v%s\n" DIM "%s\n%s\n" RESET "%s\n", C->version, os, folder, mode);
+        fflush(stdout);
+        return;
+    }
+    int x0 = with_logo ? LOGO_W + 2 : 0, total = x0 + WORD_W, text_rows = 6 + 1 + 4;
+    int rows = with_logo ? LOGO_H / 2 : text_rows, top = with_logo ? (rows - text_rows) / 2 : 0;
+    out("\n");
+    for (int r = 0; r < rows; r++) {
+        if (with_logo) {
+            for (int x = 0; x < LOGO_W; x++) logo_cell(r, x, total);
+            out(RESET "  ");
+        }
+        int t = r - top;
+        if (t >= 0 && t < 6) word_row(t, x0, total);
+        else if (t >= 7 && t < text_rows) {
+            int k = t - 7;
+            out(k == 0 ? BOLD : k == 3 ? (g_auto ? YELLOW : GREEN) : DIM);
+            out_fit(info[k], cols - x0 - 1, k == 2);
+        }
+        out(RESET "\n");
+    }
+}
+
+void agent_banner(const AgentConfig *cfg) {
+    const AgentConfig *keep = C;
+    int keep_auto = g_auto;
+    C = cfg;
+    g_auto = cfg->autonomous;
+    char os[256], folder[1100];
+    os_describe(os, sizeof(os));
+    char *v = strstr(os, "(version "); /* shorter for the banner: "(version 10.0, build N)" -> "(build N)" */
+    char *b = v ? strstr(v, "build ") : NULL;
+    if (b) memmove(v + 1, b, strlen(b) + 1);
+    if (!dir_current(folder, sizeof(folder))) snprintf(folder, sizeof(folder), ".");
+    banner(os, folder);
+    C = keep;
+    g_auto = keep_auto;
+}
+
 static void show_mode(void) {
     col(BOLD);
     out(g_auto ? "mode: autonomous" : "mode: safe");
@@ -692,22 +876,8 @@ int agent_run(const AgentConfig *cfg) {
     build_tools();
     build_system();
 
-    col(BOLD);
-    out("\nPithos agent");
-    col(RESET);
-    out("\n");
-    col(DIM);
-    const char *env = tools_env_info(cfg->tools);
-    const char *e1 = strchr(env, '\n');
-    outn(env, e1 ? (int)(e1 - env) + 1 : (int)strlen(env)); /* the operating system line */
-    const char *wf = strstr(env, "Working folder: ");
-    if (wf) {
-        const char *e2 = strstr(wf, " (");
-        outn(wf, e2 ? (int)(e2 - wf) : (int)strlen(wf));
-        out("\n");
-    }
-    col(RESET);
-    show_mode();
+    if (!cfg->banner_shown) agent_banner(cfg);
+    C = cfg;
 
     int rc = 0;
     if (cfg->task) {

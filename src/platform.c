@@ -249,6 +249,18 @@ int console_read_line(char *buf, int cap) {
     return 1;
 }
 
+int dir_current(char *out, int cap) {
+    wchar_t w[2048];
+    DWORD n = GetCurrentDirectoryW(2048, w);
+    return n > 0 && n < 2048 && WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL) > 0;
+}
+
+int console_columns(void) {
+    CONSOLE_SCREEN_BUFFER_INFO ci;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &ci)) return ci.srWindow.Right - ci.srWindow.Left + 1;
+    return 80;
+}
+
 static BOOL WINAPI ctrl_handler(DWORD type) {
     if ((type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT) && g_on_interrupt) {
         g_on_interrupt();
@@ -263,6 +275,16 @@ void console_on_interrupt(void (*fn)(void)) {
 }
 #else
 #include <signal.h>
+#include <sys/ioctl.h>
+int dir_current(char *out, int cap) { return getcwd(out, (size_t)cap) != NULL; }
+
+int console_columns(void) {
+    struct winsize ws;
+    if (ioctl(1, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) return ws.ws_col;
+    const char *c = getenv("COLUMNS");
+    return c && atoi(c) > 0 ? atoi(c) : 80;
+}
+
 int console_read_line(char *buf, int cap) {
     if (!fgets(buf, cap, stdin)) { clearerr(stdin); return 0; }
     size_t l = strlen(buf);

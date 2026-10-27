@@ -57,6 +57,8 @@ static void console_init(void) {
 #else
     g_color = isatty(1);
 #endif
+    const char *force = getenv("PITHOS_COLOR"); /* 1: colors even through a pipe, 0: never */
+    if (force && *force) g_color = *force != '0';
 }
 
 /* Streams token bytes to stdout, holding back incomplete UTF-8 sequences. */
@@ -590,6 +592,15 @@ static int real_main(int argc, char **argv) {
     Args a;
     if (!parse_args(argc, argv, &a)) return 1;
     console_init();
+    if (a.agent) { /* the banner first: something to look at while the model loads */
+        AgentConfig bc;
+        memset(&bc, 0, sizeof(bc));
+        bc.color = g_color;
+        bc.version = VERSION;
+        bc.autonomous = a.agent_auto;
+        bc.yolo = a.yolo;
+        agent_banner(&bc);
+    }
 
     SysInfo si;
     sys_info(&si);
@@ -715,6 +726,8 @@ static int real_main(int argc, char **argv) {
             ac.max_tokens = a.n_predict;
             ac.show_think = a.agent_think;
             ac.color = g_color;
+            ac.version = VERSION;
+            ac.banner_shown = 1;
             rc = agent_run(&ac);
         } else {
             rc = server_run(&sc, &m, ctx, tk, pc);
