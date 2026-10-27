@@ -1,0 +1,15 @@
+# build output
+build/
+*.o
+*.obj
+*.exe
+
+# local runtime data
+workspace/
+mcp.json
+
+# models and files derived from them
+models/
+*.gguf
+*.pithos-cache/
+*.pithos-experts
