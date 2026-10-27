@@ -400,6 +400,10 @@ Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
 - Web interface conversations live in the browser's `localStorage`.
 - Text only: the vision and audio LFM models are not supported.
 
+## License
+Pithos is released under the [MIT License](LICENSE). The license covers the engine's code only; the
+model weights keep their own license.
+
 ## Credits
 The quantized block formats and the perplexity method are compatible with ggml/llama.cpp (MIT). The
 vectorized `exp` approximation follows `ggml_v_expf`. The model architecture and weights are by

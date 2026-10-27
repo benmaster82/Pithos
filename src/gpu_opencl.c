@@ -208,7 +208,7 @@ static void state_store(volatile int *p, int v) {
 
 static void check(Gpu *g, cl_int e, const char *what) {
     if (e && !g->reported) {
-        fprintf(stderr, "GPU: errore OpenCL %d in %s\n", e, what);
+        fprintf(stderr, "GPU: OpenCL error %d in %s\n", e, what);
         g->reported = 1;
     }
 }
@@ -246,12 +246,12 @@ static int list_devices(CLApi *cl, DevInfo *out, int cap) {
 
 void gpu_list_devices(void) {
     CLApi cl;
-    if (!cl_load(&cl)) { printf("OpenCL non disponibile\n"); return; }
+    if (!cl_load(&cl)) { printf("OpenCL not available\n"); return; }
     DevInfo d[32];
     int n = list_devices(&cl, d, 32);
     for (int i = 0; i < n; i++)
         printf("  [%d] %s | %llu MB | %s%s\n", i, d[i].name, (unsigned long long)(d[i].mem >> 20),
-               d[i].gpu ? "GPU" : "altro", d[i].unified ? " integrata (memoria condivisa)" : " dedicata");
+               d[i].gpu ? "GPU" : "other", d[i].unified ? " integrated (shared memory)" : " dedicated");
 }
 
 /* NVIDIA compute capability >= 6.1 has dp4a; reachable from OpenCL through inline PTX */
@@ -337,11 +337,11 @@ static void dense_free(Gpu *g);
 Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int dense_ctx, const char *profile_path,
                 char *info, int infolen) {
     info[0] = 0;
-    if (m->n_layer > 64 || m->n_expert > 64 || !m->n_expert) { snprintf(info, infolen, "modello senza MoE compatibile"); return NULL; }
-    if (m->dim > 4096 || m->ff_exp > 2048) { snprintf(info, infolen, "dimensioni non supportate dal kernel GPU"); return NULL; }
+    if (m->n_layer > 64 || m->n_expert > 64 || !m->n_expert) { snprintf(info, infolen, "no compatible MoE in the model"); return NULL; }
+    if (m->dim > 4096 || m->ff_exp > 2048) { snprintf(info, infolen, "sizes not supported by the GPU kernels"); return NULL; }
     Gpu *g = (Gpu *)calloc(1, sizeof(Gpu));
     g->m = m;
-    if (!cl_load(&g->cl)) { snprintf(info, infolen, "OpenCL non disponibile"); free(g); return NULL; }
+    if (!cl_load(&g->cl)) { snprintf(info, infolen, "OpenCL not available"); free(g); return NULL; }
     CLApi *cl = &g->cl;
     DevInfo devs[32];
     int nd = list_devices(cl, devs, 32);
@@ -350,16 +350,16 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     else
         for (int i = 0; i < nd; i++)
             if (devs[i].gpu && !devs[i].unified && (pick < 0 || devs[i].mem > devs[pick].mem)) pick = i;
-    if (pick < 0) { snprintf(info, infolen, "nessuna GPU dedicata OpenCL (usa --gpu-device per una integrata)"); free(g); return NULL; }
+    if (pick < 0) { snprintf(info, infolen, "no dedicated OpenCL GPU (use --gpu-device for an integrated one)"); free(g); return NULL; }
     DevInfo *dv = &devs[pick];
     g->dev = dv->id;
     cl_int err = 0;
     g->ctx = cl->CreateContext(NULL, 1, &g->dev, NULL, NULL, &err);
-    if (!g->ctx) { snprintf(info, infolen, "clCreateContext fallita (%d)", err); free(g); return NULL; }
+    if (!g->ctx) { snprintf(info, infolen, "clCreateContext failed (%d)", err); free(g); return NULL; }
     g->profiling = getenv("PITHOS_GPU_PROFILE") != NULL;
     g->q = cl->CreateCommandQueue(g->ctx, g->dev, g->profiling ? CL_QUEUE_PROFILING_ENABLE : 0, &err);
     g->qup = cl->CreateCommandQueue(g->ctx, g->dev, 0, &err);
-    if (!g->q || !g->qup) { snprintf(info, infolen, "creazione code OpenCL fallita (%d)", err); gpu_destroy(g); return NULL; }
+    if (!g->q || !g->qup) { snprintf(info, infolen, "creating the OpenCL queues failed (%d)", err); gpu_destroy(g); return NULL; }
 
     /* kernels */
     g->dp4a = device_has_dp4a(cl, g->dev) && !getenv("PITHOS_GPU_NODP4A");
@@ -373,14 +373,14 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     if (cl->BuildProgram(g->prog, 1, &g->dev, opts, NULL, NULL) != 0) {
         char log[2048] = { 0 };
         cl->GetProgramBuildInfo(g->prog, g->dev, CL_PROGRAM_BUILD_LOG, sizeof(log) - 1, log, NULL);
-        snprintf(info, infolen, "compilazione kernel OpenCL fallita: %.300s", log);
+        snprintf(info, infolen, "OpenCL kernel build failed: %.300s", log);
         gpu_destroy(g);
         return NULL;
     }
     g->k_gu = cl->CreateKernel(g->prog, "moe_gate_up", &err);
     g->k_down = cl->CreateKernel(g->prog, "moe_down", &err);
     if (!g->k_gu || !g->k_down) {
-        snprintf(info, infolen, "creazione kernel fallita (%d)", err);
+        snprintf(info, infolen, "creating the kernels failed (%d)", err);
         gpu_destroy(g);
         return NULL;
     }
@@ -405,7 +405,7 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
         size_t total = g->down_off[l] + ceil256(L->down_exps.expert_stride);
         if (total > slot) slot = total;
     }
-    if (!ok_layers) { snprintf(info, infolen, "formati esperti non supportati dalla GPU"); gpu_destroy(g); return NULL; }
+    if (!ok_layers) { snprintf(info, infolen, "expert formats not supported by the GPU"); gpu_destroy(g); return NULL; }
     g->slot_bytes = slot;
 
     /* VRAM budget: leave room for the display, the driver and the small buffers */
@@ -417,8 +417,8 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     if (dense_ctx > 0) {
         cl_ulong big_used[5] = { 0 }, small_used = 0;
         cl_ulong need = dense_plan(g, dense_ctx, per_arena, big_used, &small_used);
-        if (!need || g->dz_fail) snprintf(dense_note, sizeof(dense_note), " | layer densi su CPU (formato non supportato)");
-        else if (need + (cl_ulong)(512u << 20) > budget) snprintf(dense_note, sizeof(dense_note), " | layer densi su CPU (VRAM insufficiente)");
+        if (!need || g->dz_fail) snprintf(dense_note, sizeof(dense_note), " | dense layers on CPU (unsupported format)");
+        else if (need + (cl_ulong)(512u << 20) > budget) snprintf(dense_note, sizeof(dense_note), " | dense layers on CPU (not enough VRAM)");
         else {
             char derr[128];
             if (dense_alloc(g, dense_ctx, big_used, small_used, derr, sizeof(derr))) {
@@ -426,18 +426,18 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
                 g->lookahead = getenv("PITHOS_GPU_LOOKAHEAD") && atoi(getenv("PITHOS_GPU_LOOKAHEAD")) > 0;
                 g->eager = !getenv("PITHOS_GPU_EAGER") || atoi(getenv("PITHOS_GPU_EAGER")) > 0;
                 budget -= need;
-                snprintf(dense_note, sizeof(dense_note), " | layer densi in VRAM (%.2f GB)", need / 1073741824.0);
+                snprintf(dense_note, sizeof(dense_note), " | dense layers in VRAM (%.2f GB)", need / 1073741824.0);
             } else {
                 dense_free(g);
                 memset(g->dz, 0, sizeof(g->dz));
                 g->n_dz = 0;
                 g->dl = NULL;
-                snprintf(dense_note, sizeof(dense_note), " | layer densi su CPU (%s)", derr);
+                snprintf(dense_note, sizeof(dense_note), " | dense layers on CPU (%s)", derr);
             }
         }
     }
     g->spa = (int)(per_arena / slot);
-    if (g->spa < 1) { snprintf(info, infolen, "VRAM insufficiente"); gpu_destroy(g); return NULL; }
+    if (g->spa < 1) { snprintf(info, infolen, "not enough VRAM"); gpu_destroy(g); return NULL; }
     int want = (int)(budget / slot);
     if (want > m->n_layer * m->n_expert) want = m->n_layer * m->n_expert;
     for (int a = 0; a < MAX_ARENAS && g->n_slots < want; a++) {
@@ -455,7 +455,7 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
         g->n_slots += ns;
         if (ns < g->spa) break;
     }
-    if (!g->n_slots) { snprintf(info, infolen, "allocazione VRAM fallita"); gpu_destroy(g); return NULL; }
+    if (!g->n_slots) { snprintf(info, infolen, "VRAM allocation failed"); gpu_destroy(g); return NULL; }
     for (int a = g->n_arenas; a < MAX_ARENAS; a++) g->arena[a] = g->arena[0]; /* unused kernel args */
 
     /* work buffers sized for the largest batch */
@@ -478,7 +478,7 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
         }
     }
     if (!ok || !g->h_meta || !g->h_y) {
-        snprintf(info, infolen, "allocazione buffer GPU fallita");
+        snprintf(info, infolen, "GPU buffer allocation failed");
         gpu_destroy(g);
         return NULL;
     }
@@ -512,7 +512,7 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     /* with a profile, queue the hottest experts right away: VRAM fills in the background */
     gpu_rebalance(g, g->n_slots);
     double gb = (double)g->n_slots * slot / 1073741824.0;
-    snprintf(info, infolen, "%s | %s | %d slot esperti (%.2f GB VRAM, %.0f%% degli esperti)%s", dv->name,
+    snprintf(info, infolen, "%s | %s | %d expert slots (%.2f GB VRAM, %.0f%% of the experts)%s", dv->name,
              g->dp4a ? "int8/dp4a" : "f32", g->n_slots, gb, 100.0 * g->n_slots / (ok_layers * m->n_expert), dense_note);
     g->st.slots = g->n_slots;
     return g;
@@ -522,7 +522,7 @@ void gpu_destroy(Gpu *g) {
     if (!g) return;
     if (g->profiling && g->pcount) {
         static const char *names[N_EV] = { "gate_up", "down", "read" };
-        fprintf(stderr, "GPU tempo device (us/lancio):");
+        fprintf(stderr, "GPU device time (us/launch):");
         for (int i = 0; i < N_EV; i++) fprintf(stderr, " %s %.1f", names[i], 1e6 * g->ptime[i] / g->pcount);
         fprintf(stderr, "\n");
     }

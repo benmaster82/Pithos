@@ -23,7 +23,7 @@ if exist C:\msys64\ucrt64\bin\gcc.exe (
 goto msvc
 
 :gcc
-echo [pithos] compilatore: gcc
+echo [pithos] compiler: gcc
 set CFLAGS=-O3 -std=c11 -Wall -Wextra -Wno-unused-parameter
 gcc %CFLAGS% -mavx2 -mfma -mf16c -c src\quant_avx2.c -o build\quant_avx2.o || goto fail
 gcc %CFLAGS% -municode %SRC% build\quant_avx2.o -o build\pithos.exe -lm -lws2_32 || goto fail
@@ -41,7 +41,7 @@ for /f "delims=" %%i in ('"%VSINST%\vswhere.exe" -latest -products * -requires M
 if not defined VSDIR goto nocompiler
 call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>nul || goto nocompiler
 :msvc_ready
-echo [pithos] compilatore: MSVC
+echo [pithos] compiler: MSVC
 set CLFLAGS=/nologo /O2 /Oi /GL /std:c11 /W3 /D_CRT_SECURE_NO_WARNINGS
 cl %CLFLAGS% /arch:AVX2 /c src\quant_avx2.c /Fobuild\quant_avx2.obj || goto fail
 cl %CLFLAGS% %SRC% build\quant_avx2.obj /Fobuild\ /Febuild\pithos.exe /link /LTCG || goto fail
@@ -51,10 +51,10 @@ if /i "%2"=="test" (
 goto ok
 
 :nocompiler
-echo [pithos] nessun compilatore C trovato: installa MSYS2 (pacman -S mingw-w64-x86_64-gcc) o Visual Studio Build Tools.
+echo [pithos] no C compiler found: install MSYS2 (pacman -S mingw-w64-x86_64-gcc) or Visual Studio Build Tools.
 exit /b 1
 :fail
-echo [pithos] compilazione fallita
+echo [pithos] build failed
 exit /b 1
 :ok
 echo [pithos] ok: build\pithos.exe

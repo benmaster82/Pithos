@@ -359,7 +359,7 @@ static char *generate(Engine *e, int in_think, int *last) {
     float *logits = ctx_forward(e->ctx, NULL, 0);
     int thinking = in_think;
     if (thinking && e->a->show_think) color("\x1b[90m");
-    if (thinking && !e->a->show_think) { color("\x1b[90m"); out_str("[ragionamento..."); color("\x1b[0m"); }
+    if (thinking && !e->a->show_think) { color("\x1b[90m"); out_str("[thinking..."); color("\x1b[0m"); }
     *last = -1;
     double t0 = time_sec();
     int n = 0, skip_ws = 0;
@@ -374,7 +374,7 @@ static char *generate(Engine *e, int in_think, int *last) {
             thinking = 0;
             skip_ws = 1;
             if (e->a->show_think) { out_bytes(&uo, piece, pl); color("\x1b[0m"); out_str("\n\n"); }
-            else { color("\x1b[90m"); out_str(" fatto]\n\n"); color("\x1b[0m"); }
+            else { color("\x1b[90m"); out_str(" done]\n\n"); color("\x1b[0m"); }
         } else if (!thinking || e->a->show_think) {
             if (skip_ws) {
                 /* the answer usually starts with blank lines after </think>: drop them */
@@ -385,7 +385,7 @@ static char *generate(Engine *e, int in_think, int *last) {
         }
         sampler_accept(&e->smp, tok);
         if (ctx_pos(e->ctx) + 1 >= ctx_n_ctx(e->ctx)) {
-            fprintf(stderr, "\n[contesto pieno: %d token]\n", ctx_n_ctx(e->ctx));
+            fprintf(stderr, "\n[context full: %d tokens]\n", ctx_n_ctx(e->ctx));
             break;
         }
         logits = ctx_forward(e->ctx, &tok, 1);
@@ -402,13 +402,13 @@ static void print_expert_coverage(const Model *m, const Stats *st);
 
 static void print_stats(Engine *e, double t_prompt, int n_prompt, double t_gen, int n_gen) {
     color("\x1b[90m");
-    printf("\n[prompt: %d tok in %.2f s = %.1f tok/s | generazione: %d tok in %.2f s = %.2f tok/s | contesto %d/%d]\n",
+    printf("\n[prompt: %d tok in %.2f s = %.1f tok/s | generation: %d tok in %.2f s = %.2f tok/s | context %d/%d]\n",
            n_prompt, t_prompt, n_prompt / (t_prompt > 0 ? t_prompt : 1e-9), n_gen, t_gen,
            n_gen / (t_gen > 0 ? t_gen : 1e-9), ctx_pos(e->ctx), ctx_n_ctx(e->ctx));
     if (e->a->stats) {
         Stats *st = ctx_stats(e->ctx);
         print_expert_coverage(e->m, st);
-        printf("[matmul %.2f s | attention %.2f s | routing %.2f s | esperti su GPU %llu, attesa GPU %.2f s]\n", st->t_matmul,
+        printf("[matmul %.2f s | attention %.2f s | routing %.2f s | experts on GPU %llu, GPU wait %.2f s]\n", st->t_matmul,
                st->t_attn, st->t_moe_route, (unsigned long long)st->gpu_experts, st->t_gpu_wait);
     }
     color("\x1b[0m");
@@ -416,19 +416,19 @@ static void print_stats(Engine *e, double t_prompt, int n_prompt, double t_gen, 
 }
 
 static void print_profile(const Stats *st, int ntok, const char *title) {
-    static const char *cn[N_CAT] = { "attn proj", "conv proj", "ffn densa", "router", "esperti g/u", "esperti down", "logits" };
+    static const char *cn[N_CAT] = { "attn proj", "conv proj", "dense ffn", "router", "experts g/u", "experts down", "logits" };
     if (ntok < 1) ntok = 1;
-    printf("profilo %s (per token):\n", title);
+    printf("profile %s (per token):\n", title);
     for (int k = 0; k < N_CAT; k++)
-        printf("  %-13s %7.2f ms  %6.1f MB  %5.1f GB/s  %5.1f chiamate\n", cn[k], 1e3 * st->t_cat[k] / ntok,
+        printf("  %-13s %7.2f ms  %6.1f MB  %5.1f GB/s  %5.1f calls\n", cn[k], 1e3 * st->t_cat[k] / ntok,
                st->bytes_cat[k] / ntok / 1048576.0, st->bytes_cat[k] / (st->t_cat[k] + 1e-12) / 1e9,
                (double)st->calls_cat[k] / ntok);
     printf("  %-13s %7.2f ms\n  %-13s %7.2f ms\n  %-13s %7.2f ms\n", "attention", 1e3 * st->t_attn / ntok, "routing",
            1e3 * st->t_moe_route / ntok, "resto", 1e3 * (st->t_forward - st->t_matmul - st->t_attn - st->t_moe_route) / ntok);
     if (st->pred_total)
-        printf("  previsione esperti layer successivo: %.1f%% corretta\n", 100.0 * st->pred_hits / st->pred_total);
+        printf("  next-layer expert prediction: %.1f%% correct\n", 100.0 * st->pred_hits / st->pred_total);
     if (st->gpu_experts)
-        printf("  esperti calcolati su GPU: %.1f per token | attesa GPU %.2f ms/token\n", (double)st->gpu_experts / ntok,
+        printf("  experts computed on GPU: %.1f per token | GPU wait %.2f ms/token\n", (double)st->gpu_experts / ntok,
                1e3 * st->t_gpu_wait / ntok);
 }
 
@@ -446,7 +446,7 @@ static void print_expert_coverage(const Model *m, const Stats *st) {
                     if (h[j] > h[i]) { uint64_t t = h[i]; h[i] = h[j]; h[j] = t; }
             for (int i = 0; i < m->n_expert; i++) { tot += h[i]; if (i < fr[fi]) cov += h[i]; }
         }
-        printf("  top %2d/%d esperti per layer coprono %.1f%% delle attivazioni\n", fr[fi], m->n_expert, 100 * cov / (tot + 1e-9));
+        printf("  top %2d/%d experts per layer cover %.1f%% of the activations\n", fr[fi], m->n_expert, 100 * cov / (tot + 1e-9));
     }
 }
 
@@ -598,19 +598,19 @@ static int real_main(int argc, char **argv) {
     if (!a.model) a.model = default_model_path();
     if (!a.model) { fprintf(stderr, "model not found: use -m PATH\n"); return 1; }
 
-    fprintf(stderr, "Pithos %s | CPU: %s | %d core / %d thread | RAM %.1f GB (libera %.1f GB)\n", VERSION,
+    fprintf(stderr, "Pithos %s | CPU: %s | %d core / %d thread | RAM %.1f GB (%.1f GB free)\n", VERSION,
             si.brand[0] ? si.brand : "?", si.n_physical, si.n_logical, si.total_ram / 1073741824.0,
             si.avail_ram / 1073741824.0);
-    fprintf(stderr, "kernel: %s%s%s | thread: %d\n", kn, si.has_avx512f ? " (AVX-512 presente)" : "",
+    fprintf(stderr, "kernel: %s%s%s | thread: %d\n", kn, si.has_avx512f ? " (AVX-512 present)" : "",
             si.has_avxvnni ? " (AVX-VNNI presente)" : "", a.threads);
 
     double t0 = time_sec();
     char err[256];
     Model m;
-    if (!model_load(&m, a.model, err, sizeof(err))) { fprintf(stderr, "errore: %s\n", err); return 1; }
+    if (!model_load(&m, a.model, err, sizeof(err))) { fprintf(stderr, "error: %s\n", err); return 1; }
     Tokenizer *tk = tok_load(&m.gguf, err, sizeof(err));
-    if (!tk) { fprintf(stderr, "errore: %s\n", err); return 1; }
-    fprintf(stderr, "modello: %s | %d layer (%d attn, %d conv) | dim %d | %d esperti top-%d | vocab %d | %.2f GB | ~%.0f MB/token | %.2f s\n",
+    if (!tk) { fprintf(stderr, "error: %s\n", err); return 1; }
+    fprintf(stderr, "model: %s | %d layers (%d attn, %d conv) | dim %d | %d experts top-%d | vocab %d | %.2f GB | ~%.0f MB/token | %.2f s\n",
             m.arch, m.n_layer, m.n_attn, m.n_conv, m.dim, m.n_expert, m.n_expert_used, m.n_vocab,
             m.gguf.mf.size / 1073741824.0, m.bytes_per_token / 1048576.0, time_sec() - t0);
 
@@ -624,25 +624,25 @@ static int real_main(int argc, char **argv) {
 
     if (a.n_ctx > m.n_ctx_train) a.n_ctx = m.n_ctx_train;
     if (si.avail_ram && m.gguf.mf.size > si.avail_ram)
-        fprintf(stderr, "nota: il modello (%.1f GB) supera la RAM libera (%.1f GB): i pesi verranno letti dal disco su richiesta.\n",
+        fprintf(stderr, "note: the model (%.1f GB) exceeds the free RAM (%.1f GB): weights will be read from disk on demand.\n",
                 m.gguf.mf.size / 1073741824.0, si.avail_ram / 1073741824.0);
     if (a.mlock) {
         int ok = lock_memory(m.gguf.mf.data, (size_t)m.gguf.mf.size);
-        fprintf(stderr, "mlock: %s\n", ok ? "ok" : "non riuscito (continuo senza)");
+        fprintf(stderr, "mlock: %s\n", ok ? "ok" : "failed (continuing without it)");
     }
 
     ThreadPool *pool = pool_create(a.threads);
     Context *ctx = ctx_create(&m, pool, a.n_ctx, a.n_batch);
-    if (!ctx) { fprintf(stderr, "errore: memoria insufficiente per il contesto\n"); return 1; }
+    if (!ctx) { fprintf(stderr, "error: not enough memory for the context\n"); return 1; }
     if (a.prefetch < 0) a.prefetch = si.avail_ram && m.gguf.mf.size > si.avail_ram * 9 / 10;
     ctx_set_prefetch(ctx, a.prefetch);
-    if (a.prefetch) fprintf(stderr, "read-ahead esperti in background: attivo\n");
+    if (a.prefetch) fprintf(stderr, "background expert read-ahead: on\n");
     Gpu *gpu = NULL;
     if (a.gpu) {
         char ginfo[512], prof[1100];
         snprintf(prof, sizeof(prof), "%s.pithos-experts", a.model);
         gpu = gpu_create(&m, a.gpu_device, a.gpu_mem, a.n_batch, a.gpu_dense ? a.n_ctx : 0, prof, ginfo, sizeof(ginfo));
-        fprintf(stderr, "GPU: %s\n", gpu ? ginfo : "non usata");
+        fprintf(stderr, "GPU: %s\n", gpu ? ginfo : "not used");
         if (!gpu && ginfo[0]) fprintf(stderr, "     (%s)\n", ginfo);
         ctx_set_gpu(ctx, gpu);
     }
@@ -724,7 +724,7 @@ static int real_main(int argc, char **argv) {
         double nll = 0;
         int count = 0;
         double tp = time_sec();
-        fprintf(stderr, "%d token, %d chunk da %d\n", nt, nchunks, nc);
+        fprintf(stderr, "%d tokens, %d chunks of %d\n", nt, nchunks, nc);
         for (int ch = 0; ch < nchunks; ch++) {
             int *tk0 = ids + (size_t)ch * nc;
             int save = tk0[0];
@@ -744,7 +744,7 @@ static int real_main(int argc, char **argv) {
             printf("[%d]%.4f ", ch + 1, exp(nll / count));
             fflush(stdout);
         }
-        printf("\nPPL = %.4f (%d token valutati, %.1f s)\n", exp(nll / (count ? count : 1)), count, time_sec() - tp);
+        printf("\nPPL = %.4f (%d tokens evaluated, %.1f s)\n", exp(nll / (count ? count : 1)), count, time_sec() - tp);
         free(lg); free(ids); free(txt);
     } else if (a.bench) {
         int npp = a.bench_pp, ntg = a.bench_tg;
@@ -758,7 +758,7 @@ static int real_main(int argc, char **argv) {
                 Sleep(50);
 #endif
             }
-            printf("riempimento cache VRAM: %.1f s\n", time_sec() - tw);
+            printf("VRAM cache fill: %.1f s\n", time_sec() - tw);
         }
         /* warm-up: touch weights once */
         ctx_forward(ctx, ids, 1);
@@ -774,9 +774,9 @@ static int real_main(int argc, char **argv) {
             double tpp = time_sec() - tb;
             proc_mem_stats(&pf1, &rss1);
             printf("pp%d %s: %.2f tok/s (%.2f s) | page fault %.0f (%.2f GB) | working set %.2f GB\n", npp,
-                   pass ? "(caldo)" : "(primo)", npp / tpp, tpp, (double)(pf1 - pf0), (pf1 - pf0) * 4096.0 / 1073741824.0,
+                   pass ? "(warm)" : "(first)", npp / tpp, tpp, (double)(pf1 - pf0), (pf1 - pf0) * 4096.0 / 1073741824.0,
                    rss1 / 1073741824.0);
-            if (pass) print_profile(ctx_stats(ctx), npp, "prompt a caldo");
+            if (pass) print_profile(ctx_stats(ctx), npp, "warm prompt");
         }
         /* two identical generation passes: the second one runs with the touched experts resident */
         for (int pass = 0; pass < 2; pass++) {
@@ -794,26 +794,26 @@ static int real_main(int argc, char **argv) {
                 tok = best;
             }
             double ttg = time_sec() - tb;
-            printf("tg%d %s: %.2f tok/s (%.2f s) | banda pesi effettiva ~%.1f GB/s\n", ntg, pass ? "(caldo)" : "(primo)",
+            printf("tg%d %s: %.2f tok/s (%.2f s) | effective weight bandwidth ~%.1f GB/s\n", ntg, pass ? "(warm)" : "(first)",
                    ntg / ttg, ttg, m.bytes_per_token * (ntg / ttg) / 1e9);
             proc_mem_stats(&pf1, &rss1);
             printf("   page fault/token: %.0f | working set %.2f GB\n", (double)(pf1 - pf0) / (ntg ? ntg : 1),
                    rss1 / 1073741824.0);
         }
-        print_profile(ctx_stats(ctx), ntg, "generazione a caldo");
+        print_profile(ctx_stats(ctx), ntg, "warm generation");
         if (a.verbose) print_expert_coverage(&m, ctx_stats(ctx));
         free(ids);
     } else if (a.raw) {
-        if (!feed_text(&e, a.prompt)) { fprintf(stderr, "prompt troppo lungo per il contesto\n"); return 1; }
+        if (!feed_text(&e, a.prompt)) { fprintf(stderr, "prompt too long for the context\n"); return 1; }
         out_str(a.prompt);
         int last;
         char *g = generate(&e, 0, &last);
         print_stats(&e, e.t_prompt, e.n_prompt, e.t_gen, e.n_gen);
         free(g);
     } else if (!a.interactive) {
-        if (!chat_turn(&e, a.prompt, 1)) fprintf(stderr, "contesto esaurito\n");
+        if (!chat_turn(&e, a.prompt, 1)) fprintf(stderr, "context full\n");
     } else {
-        fprintf(stderr, "chat pronta. Comandi: /reset nuova conversazione, /exit esci.\n");
+        fprintf(stderr, "chat ready. Commands: /reset new conversation, /exit quit.\n");
         int first = 1;
         static char line[65536];
         for (;;) {
@@ -827,11 +827,11 @@ static int real_main(int argc, char **argv) {
                 ctx_reset(ctx);
                 sampler_reset_history(&e.smp);
                 first = 1;
-                out_str("[conversazione azzerata]\n");
+                out_str("[conversation reset]\n");
                 continue;
             }
             if (!chat_turn(&e, line, first)) {
-                out_str("\n[contesto esaurito: conversazione azzerata]\n");
+                out_str("\n[context full: conversation reset]\n");
                 ctx_reset(ctx);
                 sampler_reset_history(&e.smp);
                 first = 1;
