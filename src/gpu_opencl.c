@@ -35,6 +35,7 @@ typedef void *cl_platform_id, *cl_device_id, *cl_context, *cl_command_queue, *cl
 #define CL_DEVICE_VENDOR_ID 0x1001
 #define CL_DEVICE_MAX_MEM_ALLOC_SIZE 0x1010
 #define CL_DEVICE_GLOBAL_MEM_SIZE 0x101F
+#define CL_DEVICE_LOCAL_MEM_SIZE 0x1023
 #define CL_DEVICE_NAME 0x102B
 #define CL_DEVICE_HOST_UNIFIED_MEMORY 0x1035
 #define CL_DEVICE_COMPUTE_CAPABILITY_MAJOR_NV 0x4000
@@ -132,6 +133,7 @@ struct Gpu {
     cl_program prog;
     cl_kernel k_gu, k_down;
     int dp4a, rpw;          /* rows per 32-lane group (passed to kernels.cl as RPW) */
+    cl_ulong local_mem;     /* local memory per work-group (32 KB on AMD GCN) */
     cl_mem arena[MAX_ARENAS];
     int n_arenas, spa, n_slots;
     size_t slot_bytes;
@@ -390,6 +392,8 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     if (pick < 0) { snprintf(info, infolen, "no dedicated OpenCL GPU (use --gpu-device for an integrated one)"); free(g); return NULL; }
     DevInfo *dv = &devs[pick];
     g->dev = dv->id;
+    cl->GetDeviceInfo(g->dev, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(g->local_mem), &g->local_mem, NULL);
+    if (g->local_mem < 16384) g->local_mem = 16384; /* the OpenCL 1.2 minimum, if the query fails */
     cl_int err = 0;
     g->ctx = cl->CreateContext(NULL, 1, &g->dev, NULL, NULL, &err);
     if (!g->ctx) { snprintf(info, infolen, "clCreateContext failed (%d)", err); free(g); return NULL; }
@@ -1028,8 +1032,13 @@ static void run1(Gpu *g, cl_kernel k, size_t gws, size_t lws, const char *what) 
 static void dense_mv(Gpu *g, int n, const DT *const *w, const int *y_off, cl_mem x, const DT *norm, cl_mem y, int accumulate) {
     cl_kernel k = g->k_mv;
     const int K = w[0]->cols, per = 8 * g->rpw;
-    /* the f32 build keeps x in local memory: split very long rows (never normalized ones) */
-    const int kmax = g->dp4a || norm ? K : 8192;
+    const size_t red = sizeof(float) * WG * g->rpw;
+    /* the f32 build keeps x in local memory: split long rows (never normalized ones) into
+     * chunks that fit next to the reduction buffer, in whole super-blocks; 1 KB stays free
+     * for the driver (NVIDIA rejects a launch that takes all 48 KB) */
+    int fit = (int)((g->local_mem - red - 1024) / sizeof(float)) & ~255;
+    if (fit > 8192) fit = 8192;
+    const int kmax = g->dp4a || norm || fit >= K ? K : fit;
     cl_int wt[4] = { 0 }, rows[4] = { 0 }, yo[4] = { 0 };
     size_t wgs = 0;
     for (int i = 0; i < 3; i++) {
@@ -1058,7 +1067,6 @@ static void dense_mv(Gpu *g, int n, const DT *const *w, const int *y_off, cl_mem
         ARGI(k, 10, k0);
         ARGI(k, 11, klen);
         ARGI(k, 18, accumulate || k0 > 0);
-        const size_t red = sizeof(float) * WG * g->rpw;
         if (g->dp4a) {
             arg(g, k, 19, (size_t)((klen + 15) & ~15), NULL);
             arg(g, k, 20, sizeof(float) * (size_t)(klen / 32 + 1), NULL);
