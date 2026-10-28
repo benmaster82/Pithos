@@ -151,6 +151,8 @@ struct Gpu {
     PithosLock *lk;
     UploadReq *req;
     int req_head, req_count, req_cap, stop;
+    cl_event *fresh;            /* completed uploads the compute queue has not waited for yet */
+    int n_fresh, cap_fresh;
     /* pinned (page-locked) host staging: transfers become asynchronous DMA */
     cl_mem p_meta, p_y;
     int *h_meta;                /* same layout as d_meta */
@@ -284,15 +286,30 @@ static void upload_loop(void *arg) {
         const uint8_t *gs = L->gate_exps.data + (size_t)r.expert * gb;
         const uint8_t *us = L->up_exps.data + (size_t)r.expert * ub;
         const uint8_t *ds = L->down_exps.data + (size_t)r.expert * db;
+        cl_event ev = NULL;
         cl_int e1 = g->cl.EnqueueWriteBuffer(g->qup, g->arena[a], 1, base, gb, gs, 0, NULL, NULL);
         cl_int e2 = g->cl.EnqueueWriteBuffer(g->qup, g->arena[a], 1, base + g->up_off[r.layer], ub, us, 0, NULL, NULL);
-        cl_int e3 = g->cl.EnqueueWriteBuffer(g->qup, g->arena[a], 1, base + g->down_off[r.layer], db, ds, 0, NULL, NULL);
+        cl_int e3 = g->cl.EnqueueWriteBuffer(g->qup, g->arena[a], 1, base + g->down_off[r.layer], db, ds, 0, NULL, &ev);
         /* the CPU will not touch this expert while it lives in VRAM: drop it from the working set */
         release_memory(gs, gb);
         release_memory(us, ub);
         release_memory(ds, db);
+        const int ok = e1 == 0 && e2 == 0 && e3 == 0;
+        /* the event is queued before the slot turns READY, so whoever sees READY also finds it
+         * in take_uploads (the queue is in order: the last write covers the other two) */
+        if (ev) {
+            lock_acquire(g->lk);
+            if (ok && g->n_fresh == g->cap_fresh) {
+                const int cap = g->cap_fresh ? 2 * g->cap_fresh : 64;
+                cl_event *p = (cl_event *)realloc(g->fresh, sizeof(cl_event) * (size_t)cap);
+                if (p) { g->fresh = p; g->cap_fresh = cap; }
+            }
+            if (ok && g->n_fresh < g->cap_fresh) g->fresh[g->n_fresh++] = ev;
+            else g->cl.ReleaseEvent(ev);
+            lock_release(g->lk);
+        }
         /* on failure the slot goes back to FREE; the main thread reclaims it in gpu_rebalance */
-        state_store(&g->slot_state[r.slot], (e1 == 0 && e2 == 0 && e3 == 0) ? SLOT_READY : SLOT_FREE);
+        state_store(&g->slot_state[r.slot], ok ? SLOT_READY : SLOT_FREE);
     }
 }
 
@@ -308,6 +325,26 @@ static int request_upload(Gpu *g, int slot, int layer, int expert) {
     lock_release(g->lk);
     g->st.uploads++;
     return 1;
+}
+
+/* Uploads run on their own queue, so nothing orders them before the kernels of the compute
+ * queue: a driver may then serve a reused slot from a GPU cache that still holds the previous
+ * expert (garbled text on AMD). The first command that may read newly READY slots waits on
+ * these events. Returns the count; the caller passes *evs as a wait list, then calls
+ * drop_uploads. */
+static cl_uint take_uploads(Gpu *g, cl_event **evs) {
+    lock_acquire(g->lk);
+    *evs = g->fresh;
+    const cl_uint n = (cl_uint)g->n_fresh;
+    g->fresh = NULL;
+    g->n_fresh = g->cap_fresh = 0;
+    lock_release(g->lk);
+    return n;
+}
+
+static void drop_uploads(Gpu *g, cl_event *evs, cl_uint n) {
+    for (cl_uint i = 0; i < n; i++) g->cl.ReleaseEvent(evs[i]);
+    free(evs);
 }
 
 static int pending_uploads(Gpu *g) {
@@ -552,6 +589,8 @@ void gpu_destroy(Gpu *g) {
     }
     CLApi *cl = &g->cl;
     if (g->q) cl->Finish(g->q);
+    for (int i = 0; i < g->n_fresh; i++) cl->ReleaseEvent(g->fresh[i]);
+    free(g->fresh);
     if (g->dl) dense_free(g);
     cl_mem bufs[] = { g->d_meta, g->d_gu, g->d_y, g->p_meta, g->p_y };
     for (size_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) if (bufs[i]) cl->ReleaseMemObject(bufs[i]);
@@ -595,7 +634,10 @@ static void submit_job(Gpu *g) {
     const int D = m->dim, F = m->ff_exp, layer = g->job_layer, n_assign = g->cur_assign;
     /* one copy: slots, token indices and hidden states (prefix of the meta layout) */
     const size_t meta_used = sizeof(int) * 2 * g->max_assign + sizeof(float) * D * g->job_ntok;
-    check(g, cl->EnqueueWriteBuffer(g->q, g->d_meta, 0, 0, meta_used, g->h_meta, 0, NULL, NULL), "write meta");
+    cl_event *up;
+    const cl_uint n_up = take_uploads(g, &up);
+    check(g, cl->EnqueueWriteBuffer(g->q, g->d_meta, 0, 0, meta_used, g->h_meta, n_up, up, NULL), "write meta");
+    drop_uploads(g, up, n_up);
 
     const cl_ulong sb = g->slot_bytes, upo = g->up_off[layer], dno = g->down_off[layer];
     const int gt = g->gate_type[layer], dt = g->down_type[layer];
@@ -1064,7 +1106,10 @@ void gpu_dense_begin(Gpu *g, const float *x, const float *rope_cs, int pos) {
         res[i] = s >= 0 && state_load(&g->slot_state[s]) == SLOT_READY ? s : -1;
     }
     CLApi *cl = &g->cl;
-    check(g, cl->EnqueueWriteBuffer(g->q, g->dx, 0, 0, sizeof(float) * D, g->h_in, 0, NULL, NULL), "write x");
+    cl_event *up;
+    const cl_uint n_up = take_uploads(g, &up);
+    check(g, cl->EnqueueWriteBuffer(g->q, g->dx, 0, 0, sizeof(float) * D, g->h_in, n_up, up, NULL), "write x");
+    drop_uploads(g, up, n_up);
     check(g, cl->EnqueueWriteBuffer(g->q, g->drope, 0, 0, sizeof(float) * hd, g->h_in + D, 0, NULL, NULL), "write rope");
     check(g, cl->EnqueueWriteBuffer(g->q, g->dres, 0, 0, sizeof(int) * 64 * 64, res, 0, NULL, NULL), "write res");
     g->cur_pos = pos;
