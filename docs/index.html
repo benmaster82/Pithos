@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#0c0c10">
-  <title>Pithos — Your AI. On your computer.</title>
-  <meta name="description" content="Meet Pithos: an open-source AI engine with a built-in web chat. A clear guide to getting started on Windows or Linux.">
+  <title>Pithos — C11 inference engine for local AI.</title>
+  <meta name="description" content="Pithos is a dependency-free C11 inference engine for Liquid AI LFM2 and LFM2.5 models. Explore its architecture, technical specifications, and setup guide.">
   <link rel="canonical" href="https://benmaster82.github.io/Pithos/">
   <meta property="og:type" content="website">
   <meta property="og:locale" content="en_US">
-  <meta property="og:title" content="Pithos — Your AI. On your computer.">
-  <meta property="og:description" content="An open-source engine. A chat in your browser. Your computer at the center.">
+  <meta property="og:title" content="Pithos — C11 inference engine for local AI.">
+  <meta property="og:description" content="C11. Direct GGUF execution. SIMD CPU kernels and optional OpenCL acceleration. One engine, multiple interfaces.">
   <meta property="og:url" content="https://benmaster82.github.io/Pithos/">
   <meta property="og:image" content="https://benmaster82.github.io/Pithos/assets/pandora-dark.png">
   <link rel="icon" href="assets/pandora-mark.svg" type="image/svg+xml">
@@ -18,6 +18,7 @@
   <link rel="preload" href="assets/fonts/space-grotesk-bold.ttf" as="font" type="font/ttf" crossorigin>
   <link rel="stylesheet" href="styles.css">
   <link rel="stylesheet" href="theme-hack.css">
+  <link rel="stylesheet" href="engine.css">
   <script src="app.js" defer></script>
 </head>
 <body>
@@ -41,7 +42,7 @@
       <a class="brand" href="#" aria-label="Pithos, back to top"><img src="assets/pandora-mark.svg" width="32" height="32" alt=""><span>pithos<span class="brand-dot">.</span></span></a>
       <button class="menu-button" aria-label="Open navigation" aria-expanded="false" aria-controls="navigation"><span></span><span></span></button>
       <nav id="navigation" aria-label="Main navigation">
-        <a href="#project">The project</a><a href="#features">What you can do</a><a href="#get-started">Getting started</a><a href="#faq">FAQ</a>
+        <a href="#project">Engine</a><a href="#architecture">How it works</a><a href="#specifications">Specs</a><a href="#get-started">Get started</a><a href="#faq">FAQ</a>
       </nav>
       <a class="header-github" href="https://github.com/benmaster82/Pithos" target="_blank" rel="noopener noreferrer"><svg aria-hidden="true" class="icon"><use href="#i-github"/></svg> GitHub <svg aria-hidden="true" class="icon small"><use href="#i-external"/></svg></a>
     </div>
@@ -49,10 +50,10 @@
   <main id="main">
     <section class="hero wrap" aria-labelledby="hero-title">
       <div class="hero-copy">
-        <div class="eyebrow"><span class="status-dot"></span> ARTIFICIAL INTELLIGENCE. RUN LOCALLY.</div>
-        <h1 id="hero-title">Your AI.<br><em>On your<br class="desktop-break"> computer.</em></h1>
-        <p class="hero-description">An assistant to talk to and work with. Pithos runs AI on your own PC, with a built-in chat you can open in your browser.</p>
-        <div class="hero-actions"><a class="button button-dark" href="#get-started">Get started <svg aria-hidden="true" class="icon"><use href="#i-arrow"/></svg></a><a class="text-link" href="#project">Explore the project <span>↗</span></a></div>
+        <div class="eyebrow"><span class="status-dot"></span> C11 INFERENCE ENGINE / LFM2 + LFM2.5</div>
+        <h1 id="hero-title">The engine.<br><em>Behind your<br class="desktop-break"> local AI.</em></h1>
+        <p class="hero-description">Pithos runs LFM2 and LFM2.5 GGUF models locally. Written in C11, with SIMD CPU kernels and optional OpenCL acceleration. Chat, tools, and APIs share the same engine.</p>
+        <div class="hero-actions"><a class="button button-dark" href="#get-started">Get started <svg aria-hidden="true" class="icon"><use href="#i-arrow"/></svg></a><a class="text-link" href="#architecture">See the architecture <span>↗</span></a></div>
         <p class="hero-note"><svg aria-hidden="true" class="icon"><use href="#i-check"/></svg> Open source <span>·</span> Windows and Linux <span>·</span> No GPU required</p>
       </div>
       <div class="hero-visual terminal-hero" aria-label="Original Pithos terminal banner and example startup command">
@@ -63,30 +64,84 @@
           <div class="terminal-launch"><div class="terminal-launch-label"><span>START COMMAND</span><span id="hero-context">WINDOWS / NATIVE</span></div><div class="terminal-command"><span id="hero-prompt" aria-hidden="true">PS&gt;</span><code id="hero-code">.\build\pithos.exe --server --no-gpu</code><button class="copy-button icon-only" data-copy-target="hero-code" aria-label="Copy the example startup command"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg></button></div></div>
           <div class="terminal-stage-footer"><span class="terminal-cursor" aria-hidden="true">▊</span><span>Actual project banner · Example startup command</span></div>
         </div>
-        <div class="local-stamp"><svg class="icon" aria-hidden="true"><use href="#i-computer"/></svg><div><strong>Your PC is the engine.</strong><span>A GPU is optional. Start with your CPU.</span></div><span class="stamp-dot"></span></div>
+        <div class="local-stamp"><svg class="icon" aria-hidden="true"><use href="#i-computer"/></svg><div><strong>Pithos is the engine.</strong><span>CPU execution. Optional OpenCL offload.</span></div><span class="stamp-dot"></span></div>
         <div class="visual-label"><span>01 / LOCAL AI</span><span>BUILT FOR LFM2 / LFM2.5</span></div>
       </div>
     </section>
-    <div class="fact-strip wrap" aria-label="Pithos at a glance"><div><strong>One engine.</strong><span>Chat, tools, and a server included.</span></div><div><strong>Open-source code.</strong><span>Read it, build it, contribute to it.</span></div><div><strong>Your own computer.</strong><span>AI inference happens locally.</span></div></div>
+    <div class="fact-strip wrap" aria-label="Pithos at a glance"><div><strong>Written in C11.</strong><span>Standard OS APIs. No external ML runtime.</span></div><div><strong>GGUF, directly.</strong><span>Memory-mapped weights. Quantized compute.</span></div><div><strong>CPU-first execution.</strong><span>SIMD kernels. Optional OpenCL acceleration.</span></div></div>
 
     <section class="project-section section-space wrap" id="project" aria-labelledby="project-title">
-      <div class="section-heading"><span class="eyebrow">01 — THE PROJECT</span><h2 id="project-title">One small program.<br><em>Room for big ideas.</em></h2></div>
-      <div class="project-grid"><div class="project-intro"><p class="large-copy">Pithos is the engine.<br>Pandora is the chat.<br><span>The model powers the answers.</span></p><p>There is no app to build from scratch. Pithos includes the inference engine, a web chat, and tools for working with text files and projects.</p><p>The project is designed for Liquid AI LFM2 and LFM2.5 models. This guide uses the reference 24B model, already tested with the engine.</p><a class="text-link" href="https://github.com/benmaster82/Pithos#readme" target="_blank" rel="noopener noreferrer">Inside the project <svg aria-hidden="true" class="icon"><use href="#i-external"/></svg></a></div><div class="principles"><article><span class="principle-icon"><svg aria-hidden="true" class="icon"><use href="#i-computer"/></svg></span><div><h3>Answers, on your computer</h3><p>The model generates answers locally. Web tools and external services use the Internet when you enable them.</p></div></article><article><span class="principle-icon"><svg aria-hidden="true" class="icon"><use href="#i-chat"/></svg></span><div><h3>A familiar place to chat</h3><p>Ask a question and read the answer in your browser. You use the terminal to set up and start the program.</p></div></article><article><span class="principle-icon"><svg aria-hidden="true" class="icon"><use href="#i-shield"/></svg></span><div><h3>Choose what to hand over</h3><p>Safe agent mode asks you to approve actions. Autonomous mode is a separate choice.</p></div></article></div></div>
+      <div class="section-heading"><span class="eyebrow">01 — THE INFERENCE ENGINE</span><h2 id="project-title">Inference is the core.<br><em>Interfaces sit on top.</em></h2></div>
+      <div class="project-grid"><div class="project-intro"><p class="large-copy">Pithos executes the model.<br>Pandora provides the chat.<br><span>Your applications use the same runtime.</span></p><p>The engine loads GGUF weights, processes prompts, schedules CPU and optional GPU work, and generates the next tokens. The browser chat and agents are included ways to access that runtime.</p><p>The project is designed for Liquid AI LFM2 and LFM2.5 models. This guide uses the reference 24B model, already tested with the engine.</p><a class="text-link" href="https://github.com/benmaster82/Pithos#readme" target="_blank" rel="noopener noreferrer">Inside the project <svg aria-hidden="true" class="icon"><use href="#i-external"/></svg></a></div><div class="principles"><article><span class="principle-icon"><svg aria-hidden="true" class="icon"><use href="#i-computer"/></svg></span><div><h3>Direct quantized execution</h3><p>Supported quantized weights are read from the mapped GGUF file. CPU quantized matrix operations use Q8_K activations instead of expanding the full model to floating point.</p></div></article><article><span class="principle-icon"><svg aria-hidden="true" class="icon"><use href="#i-chat"/></svg></span><div><h3>Memory-aware scheduling</h3><p>Asynchronous read-ahead, expert prediction, and an optional VRAM expert cache help the engine work with weights larger than free RAM. Performance still depends on memory and storage.</p></div></article><article><span class="principle-icon"><svg aria-hidden="true" class="icon"><use href="#i-shield"/></svg></span><div><h3>One runtime, multiple entry points</h3><p>Use the CLI, Pandora, or OpenAI-compatible HTTP endpoints. Agent tools extend those interfaces; they are not the inference engine itself.</p></div></article></div></div>
+    </section>
+
+
+    <section class="architecture-section section-space" id="architecture" aria-labelledby="architecture-title">
+      <div class="wrap">
+        <div class="section-heading split-heading"><div><span class="eyebrow">02 — ENGINE ARCHITECTURE</span><h2 id="architecture-title">From model weights<br><em>to the next token.</em></h2></div><p>The engine is the execution layer.<br>The interfaces send prompts and receive generated tokens.</p></div>
+        <div class="execution-toolbar"><p>Explore the execution path</p><div class="execution-tabs" role="tablist" aria-label="Architecture execution path"><button id="execution-cpu" data-execution="cpu" role="tab" aria-selected="true" aria-controls="execution-panel">CPU only</button><button id="execution-hybrid" data-execution="hybrid" role="tab" aria-selected="false" aria-controls="execution-panel" tabindex="-1">Hybrid CPU + GPU</button></div></div>
+        <div id="execution-panel" role="tabpanel" aria-labelledby="execution-cpu">
+          <figure class="engine-flow" aria-describedby="flow-caption">
+            <div class="flow-clients"><span>Terminal / CLI</span><span>Pandora web chat</span><span>HTTP API / applications</span></div>
+            <div class="flow-entry"><span>Prompt and generation request</span><svg class="icon" aria-hidden="true"><use href="#i-arrow"/></svg></div>
+            <div class="flow-pipeline">
+              <article class="flow-node model-node"><span class="flow-label">MODEL / DATA</span><h3>GGUF weights</h3><p>Memory-mapped file.<br>Supported quantized formats stay in their stored representation.</p><span class="flow-node-foot">Disk → system memory</span></article>
+              <div class="flow-connector" aria-hidden="true"><svg class="icon"><use href="#i-arrow"/></svg></div>
+              <div class="engine-core"><div class="engine-core-heading"><span>PITHOS</span><span>C11 INFERENCE ENGINE</span></div><div class="flow-runtime"><article class="runtime-node cpu-runtime"><span class="flow-label">CPU WORKER POOL</span><h3 id="runtime-cpu-title">Model execution</h3><p id="runtime-cpu-text">Tokenization, routing, attention/convolution, and selected experts run through the CPU path.</p><span class="kernel-label">SCALAR / AVX2 / NEON*</span></article><article class="runtime-node gpu-runtime" id="runtime-gpu" hidden><span class="flow-label">OPTIONAL OPENCL DEVICE</span><h3>VRAM-resident compute</h3><p>Cached experts can run on GPU. Dense decode weights and state can remain in VRAM for single-token generation.</p><span class="kernel-label">HOT EXPERTS + DENSE DECODE</span></article></div><div class="engine-core-state">KV cache · convolution state · sampling · prompt reuse</div></div>
+              <div class="flow-connector" aria-hidden="true"><svg class="icon"><use href="#i-arrow"/></svg></div>
+              <article class="flow-node output-node"><span class="flow-label">GENERATED OUTPUT</span><h3>Next token</h3><p>Logits are sampled into the next token. Repeating the forward pass produces the response.</p><span class="flow-node-foot">Tokens → interface</span></article>
+            </div>
+            <figcaption id="flow-caption"><strong id="execution-summary">CPU-only execution.</strong><span id="execution-detail">All model compute stays on the CPU. OS-backed paging, read-ahead, and expert prediction help with cold weights.</span></figcaption>
+          </figure>
+          <div class="architecture-notes"><p><strong>The model is data.</strong> The GGUF file contains the weights. Pithos is the program that executes them.</p><p><strong>GPU offload is optional.</strong> Hybrid execution requires compatible OpenCL hardware and drivers. This diagram describes the engine, not your current hardware.</p><p><strong>Implementation and validation differ.</strong> ARM64 NEON is implemented; the published CPU validation here is x86-64. GPU acceleration was not validated in our WSL2 environment.</p></div>
+        </div>
+      </div>
+    </section>
+    <section class="specifications-section section-space wrap" id="specifications" aria-labelledby="specifications-title">
+      <div class="section-heading split-heading"><div><span class="eyebrow">03 — TECHNICAL SPECIFICATION</span><h2 id="specifications-title">Engine facts.<br><em>Without the guesswork.</em></h2></div><a class="text-link" href="https://github.com/benmaster82/Pithos#readme" target="_blank" rel="noopener noreferrer">Read the source documentation <svg class="icon" aria-hidden="true"><use href="#i-external"/></svg></a></div>
+      <div class="spec-grid">
+        <div class="spec-card"><div class="spec-card-heading"><span>01</span><h3>Engine capabilities</h3></div><table><caption>Implementation and runtime</caption><tbody>
+          <tr><th scope="row">Implementation</th><td>C11. Standard Win32 / POSIX APIs. No external ML runtime or build-time libraries.</td></tr>
+          <tr><th scope="row">Model architectures</th><td><code>lfm2</code> dense and <code>lfm2moe</code>, loaded from GGUF.</td></tr>
+          <tr><th scope="row">CPU weight formats</th><td>Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16, F32.</td></tr>
+          <tr><th scope="row">CPU kernels</th><td>Scalar fallback; runtime-selected AVX2 / FMA / F16C on x86-64. NEON implemented for ARM64.</td></tr>
+          <tr><th scope="row">GPU backend</th><td>Optional, runtime-loaded OpenCL. MoE offload supports Q4_K and Q6_K weights.</td></tr>
+          <tr><th scope="row">Prompt processing</th><td>CPU batch path with expert grouping. VRAM-resident experts may still be offloaded to GPU.</td></tr>
+          <tr><th scope="row">Hybrid generation</th><td>GPU-resident dense decode and cached experts; CPU workers compute non-resident experts in parallel. Expert-only offload is also available.</td></tr>
+          <tr><th scope="row">Memory and reuse</th><td>Mapped weights, Q8_K activations for CPU quantized matmuls, asynchronous read-ahead, expert prediction, and KV/convolution checkpoints. Prompt reuse can persist to disk.</td></tr>
+          <tr><th scope="row">Threads / batches</th><td>Configurable worker pool. Defaults: physical-core count; 64-token prompt batch.</td></tr>
+          <tr><th scope="row">Context</th><td>8,192 tokens for CLI by default; 16,384 for server/agent. Configurable up to the model limit; reference documentation lists 131,072. Actual capacity depends on memory.</td></tr>
+          <tr><th scope="row">Interfaces</th><td>CLI, embedded Pandora UI, terminal/web agents, MCP client, and OpenAI-compatible HTTP endpoints. Inference requests share one context and are serialized.</td></tr>
+          <tr><th scope="row">Platforms / license</th><td>Windows native and Linux. macOS / ARM64 paths remain unverified here. Engine code: MIT.</td></tr>
+        </tbody></table></div>
+        <div class="spec-card"><div class="spec-card-heading"><span>02</span><h3>Reference model</h3></div><table><caption>The validated 24B MoE configuration</caption><tbody>
+          <tr><th scope="row">GGUF file</th><td><code>LFM2.5-24B-A2B-Q4_K_M.gguf</code></td></tr>
+          <tr><th scope="row">Parameters</th><td>Approximately 24 billion total; approximately 2 billion active per token.</td></tr>
+          <tr><th scope="row">Hybrid layers</th><td>40 layers: 10 attention and 30 short-convolution layers.</td></tr>
+          <tr><th scope="row">MoE feed-forward</th><td>38 MoE layers. Each selects 4 of 64 experts.</td></tr>
+          <tr><th scope="row">Quantization recipe</th><td>Q4_K_M GGUF, containing supported block types such as Q4_K and Q6_K.</td></tr>
+          <tr><th scope="row">Download size</th><td>14,526,258,464 bytes — about 14.5 GB / 13.5 GiB. Reserve at least 15 GB for the model alone.</td></tr>
+          <tr><th scope="row">RAM reference</th><td>16 GB is a reference configuration, not a universal minimum or a performance guarantee. Consider memory assigned to WSL separately.</td></tr>
+          <tr><th scope="row">Model license</th><td>LFM Open License v1.0. Separate from the engine MIT license; see the <a href="https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF" target="_blank" rel="noopener noreferrer">Liquid AI repository ↗</a>.</td></tr>
+        </tbody></table><div class="validation-card"><span class="flow-label">VALIDATION SCOPE</span><h4>CPU path verified on Ubuntu / WSL2.</h4><p>Scalar/AVX2 kernel checks, reference-model inference, and server tests passed on x86-64. OpenCL GPU acceleration was not validated in that WSL2 environment.</p><p>A documented context limit is not a completed full-context validation. Other model files are not interchangeable with the validated reference.</p></div></div>
+      </div>
+      <p class="spec-source">Specifications follow the <a href="https://github.com/benmaster82/Pithos#readme" target="_blank" rel="noopener noreferrer">project README</a> and the <a href="https://github.com/benmaster82/Pithos/blob/main/src/model.c" target="_blank" rel="noopener noreferrer">model runtime</a>. The engine and model have separate capabilities and licenses.</p>
     </section>
 
     <section class="possibilities section-space" id="features" aria-labelledby="possibilities-title"><div class="wrap">
-      <div class="section-heading split-heading"><div><span class="eyebrow">02 — FIND YOUR WAY</span><h2 id="possibilities-title">One AI.<br><em>More ways to use it.</em></h2></div><p>Start with the browser chat.<br>The other tools are there when you need them.</p></div>
+      <div class="section-heading split-heading"><div><span class="eyebrow">04 — ACCESS THE ENGINE</span><h2 id="possibilities-title">Choose an interface.<br><em>Keep the same engine.</em></h2></div><p>Start with Pandora, or connect an application.<br>Every interface uses the Pithos runtime.</p></div>
       <div class="mode-tabs" role="tablist" aria-label="Choose a Pithos mode">
         <button class="mode-card is-selected" role="tab" id="mode-browser" aria-selected="true" aria-controls="mode-panel" data-mode="browser"><span class="mode-card-top"><svg aria-hidden="true" class="icon"><use href="#i-chat"/></svg><span class="tiny-label">START HERE</span></span><strong>Browser chat</strong><span>One window. Your conversations.</span><span class="mode-card-bottom">Pandora <span>↗</span></span></button>
         <button class="mode-card" role="tab" id="mode-terminal" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="terminal"><span class="mode-card-top"><svg aria-hidden="true" class="icon"><use href="#i-terminal"/></svg><span class="tiny-label">KEEP IT SIMPLE</span></span><strong>Terminal chat</strong><span>Ask and answer. Right in the terminal.</span><span class="mode-card-bottom">Text interface <span>↗</span></span></button>
         <button class="mode-card" role="tab" id="mode-agent" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="agent"><span class="mode-card-top"><svg aria-hidden="true" class="icon"><use href="#i-folder"/></svg><span class="tiny-label">FOR YOUR PROJECTS</span></span><strong>An agent by your side</strong><span>Files and commands, with your approval.</span><span class="mode-card-bottom">Safe agent mode <span>↗</span></span></button>
+        <button class="mode-card" role="tab" id="mode-api" aria-selected="false" aria-controls="mode-panel" tabindex="-1" data-mode="api"><span class="mode-card-top"><svg class="icon" aria-hidden="true"><use href="#i-computer"/></svg><span class="tiny-label">FOR APPLICATIONS</span></span><strong>HTTP API</strong><span>Connect your software to local inference.</span><span class="mode-card-bottom">OpenAI-compatible <span>↗</span></span></button>
       </div>
       <div class="mode-panel" id="mode-panel" role="tabpanel" aria-labelledby="mode-browser"><div><span class="eyebrow">YOUR FIRST SESSION</span><h3 id="mode-title">Your browser becomes your chat.</h3><p id="mode-description">After setup, start the server and open the local address. Keep the terminal open while you chat.</p></div><div class="mode-command"><span class="command-context" id="mode-context">From the Pithos folder · Linux</span><div class="inline-command"><code id="mode-code">./build/pithos --server --no-gpu</code><button class="copy-button icon-only" data-copy-target="mode-code" aria-label="Copy the command for this mode"><svg aria-hidden="true" class="icon"><use href="#i-copy"/></svg></button></div><p id="mode-followup">Then open <span class="mono">http://127.0.0.1:8080</span> in your browser.</p></div></div>
       <div class="real-product"><div class="screenshot-card"><div class="screenshot-bar"><span class="status-dot"></span> PANDORA / ACTUAL INTERFACE <a href="assets/pandora-dark.png" target="_blank" rel="noopener noreferrer" aria-label="Open the full Pandora screenshot"><svg aria-hidden="true" class="icon"><use href="#i-external"/></svg></a></div><img src="assets/pandora-dark.png" width="1280" height="1075" alt="Actual Pandora interface: a conversation with tools for running commands and viewing their results." loading="eager"></div><div class="real-product-copy"><span class="eyebrow">ALREADY INCLUDED</span><h3>An engine.<br><em>And a place to work.</em></h3><p>Pandora is the web interface included with Pithos. Open your conversations in the browser, and see the tools and their results when using agent mode.</p><a class="text-link" href="#get-started">Open it on your computer <svg aria-hidden="true" class="icon"><use href="#i-arrow"/></svg></a><p class="small-print">For developers, Pithos also offers an OpenAI-compatible API. <a href="https://github.com/benmaster82/Pithos#server-and-web-chat" target="_blank" rel="noopener noreferrer">Read the documentation ↗</a></p></div></div>
     </div></section>
 
     <section class="setup-section section-space" id="get-started" aria-labelledby="setup-title"><div class="wrap setup-layout">
-      <div class="setup-intro"><span class="eyebrow light">03 — FROM PROJECT TO FIRST CHAT</span><h2 id="setup-title">Start<br><em>right here.</em></h2><p>You do not need to be a developer. Set aside some disk space and download time, open the right terminal, and follow one step at a time.</p><div class="requirements"><h3>Before you begin</h3><div><svg aria-hidden="true" class="icon"><use href="#i-computer"/></svg><p><strong>A 64-bit computer</strong><span>Native Windows and Linux guides. WSL2 is an optional Windows alternative.</span></p></div><div><span class="requirement-number">16<span>GB</span></span><p><strong>RAM as a reference</strong><span>Not a guaranteed minimum. With WSL, also check how much memory Ubuntu receives.</span></p></div><div><svg aria-hidden="true" class="icon"><use href="#i-download"/></svg><p><strong>At least 15 GB free for the model</strong><span>About 14.5 GB to download. Allow extra room for the compiler and, if used, Ubuntu.</span></p></div></div><div class="setup-reassurance"><svg aria-hidden="true" class="icon"><use href="#i-check"/></svg><span>Start with your CPU.<br>A dedicated graphics card is optional.</span></div></div>
+      <div class="setup-intro"><span class="eyebrow light">05 — BUILD AND RUN</span><h2 id="setup-title">Start<br><em>right here.</em></h2><p>You do not need to be a developer. Set aside some disk space and download time, open the right terminal, and follow one step at a time.</p><div class="requirements"><h3>Before you begin</h3><div><svg aria-hidden="true" class="icon"><use href="#i-computer"/></svg><p><strong>A 64-bit computer</strong><span>Native Windows and Linux guides. WSL2 is an optional Windows alternative.</span></p></div><div><span class="requirement-number">16<span>GB</span></span><p><strong>RAM as a reference</strong><span>Not a guaranteed minimum. With WSL, also check how much memory Ubuntu receives.</span></p></div><div><svg aria-hidden="true" class="icon"><use href="#i-download"/></svg><p><strong>At least 15 GB free for the model</strong><span>About 14.5 GB to download. Allow extra room for the compiler and, if used, Ubuntu.</span></p></div></div><div class="setup-reassurance"><svg aria-hidden="true" class="icon"><use href="#i-check"/></svg><span>Start with your CPU.<br>A dedicated graphics card is optional.</span></div></div>
       <div class="setup-wizard">
         <div class="wizard-heading"><span class="tiny-label">YOUR SETUP GUIDE</span><span id="guide-progress">Step 1 of 3</span></div>
         <div class="os-tabs" role="tablist" aria-label="Operating system"><button id="os-windows" role="tab" data-os="windows" aria-selected="false" aria-controls="guide-panel" tabindex="-1"><span>▦</span> Windows</button><button id="os-linux" role="tab" data-os="linux" aria-selected="true" aria-controls="guide-panel"><svg aria-hidden="true" class="icon"><use href="#i-terminal"/></svg> Linux</button><button id="os-wsl" role="tab" data-os="wsl" aria-selected="false" aria-controls="guide-panel" tabindex="-1">Windows · WSL2</button></div>
@@ -98,7 +153,7 @@
       </div>
     </div></section>
 
-    <section class="faq-section section-space wrap" id="faq" aria-labelledby="faq-title"><div class="faq-intro"><span class="eyebrow">04 — A FEW THINGS TO KNOW</span><h2 id="faq-title">Good questions.<br><em>Clear answers.</em></h2><p>A technical project, explained without assuming you know the jargon.</p><a class="text-link" href="https://github.com/benmaster82/Pithos/issues" target="_blank" rel="noopener noreferrer">Ask the community <svg aria-hidden="true" class="icon"><use href="#i-external"/></svg></a></div><div class="faq-list">
+    <section class="faq-section section-space wrap" id="faq" aria-labelledby="faq-title"><div class="faq-intro"><span class="eyebrow">06 — A FEW THINGS TO KNOW</span><h2 id="faq-title">Good questions.<br><em>Clear answers.</em></h2><p>A technical project, explained without assuming you know the jargon.</p><a class="text-link" href="https://github.com/benmaster82/Pithos/issues" target="_blank" rel="noopener noreferrer">Ask the community <svg aria-hidden="true" class="icon"><use href="#i-external"/></svg></a></div><div class="faq-list">
       <details open><summary>What is the difference between Pithos and the model?<span>+</span></summary><p>Pithos is the program that runs the AI. The model contains the data and weights needed to generate answers. Pandora is the built-in web chat. On Linux, <code>build.sh --download-model</code> can build the program and download the reference model.</p></details>
       <details><summary>Do I need WSL2 on Windows?<span>+</span></summary><p>No. Pithos builds and runs natively on Windows with <code>build.cmd</code>. You need a compiler: GCC from MSYS2 or MSVC from Visual Studio/Build Tools. The Windows guide uses MSYS2. Ubuntu through WSL2 is an alternative, not a requirement.</p></details>
       <details><summary>Do I need a dedicated graphics card?<span>+</span></summary><p>No. You can start with the CPU. A compatible GPU can speed things up, but needs suitable OpenCL hardware and drivers. Our Ubuntu/WSL2 testing covered CPU inference; GPU acceleration was not verified in that environment.</p></details>

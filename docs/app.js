@@ -110,7 +110,8 @@ function renderMode() {
   const config={
     browser:{title:'Your browser becomes your chat.',description:'After setup, start the server and open the local address. Keep the terminal open while you chat.',command:`${binary} --server --no-gpu`,followup:'Then open http://127.0.0.1:8080 in your browser.'},
     terminal:{title:'Ask and answer, right in your terminal.',description:'Start a text conversation in the terminal. For a single answer, use -p followed by your question.',command:`${binary} --no-gpu`,followup:'Press Ctrl+C to end the session.'},
-    agent:{title:'Practical help for your projects.',description:'The agent can work with files and commands. In safe mode, you approve actions. For another project, set the model path with -m. The README has examples.',command:`${binary} --agent --no-gpu`,followup:'The agent works in the folder where you start it.'}
+    agent:{title:'Practical help for your projects.',description:'The agent can work with files and commands. In safe mode, you approve actions. For another project, set the model path with -m. The README has examples.',command:`${binary} --agent --no-gpu`,followup:'The agent works in the folder where you start it.'},
+    api:{title:'Connect an application to the engine.',description:'Use /v1/chat/completions or /v1/completions through the local HTTP server. These are OpenAI-compatible inference endpoints; the engine processes one inference request at a time.',command:`${binary} --server --no-gpu`,followup:'API base URL: http://127.0.0.1:8080/v1'}
   }[activeMode];
   document.querySelectorAll('[data-mode]').forEach(button=>{const selected=button.dataset.mode===activeMode;button.classList.toggle('is-selected',selected);button.setAttribute('aria-selected',String(selected));button.tabIndex=selected?0:-1;});
   document.querySelector('#mode-panel').setAttribute('aria-labelledby',`mode-${activeMode}`);
@@ -159,5 +160,26 @@ function closeMenu(){menuButton.setAttribute('aria-expanded','false');navigation
 menuButton.addEventListener('click',()=>{const open=menuButton.getAttribute('aria-expanded')!=='true';menuButton.setAttribute('aria-expanded',String(open));navigation.classList.toggle('is-open',open);});
 navigation.querySelectorAll('a').forEach(link=>link.addEventListener('click',closeMenu));
 document.addEventListener('keydown',event=>{if(event.key==='Escape'&&navigation.classList.contains('is-open')){closeMenu();menuButton.focus();}});
-if('IntersectionObserver' in window){const observer=new IntersectionObserver(entries=>{entries.forEach(entry=>{if(entry.isIntersecting){navigation.querySelectorAll('a').forEach(link=>{if(link.getAttribute('href')===`#${entry.target.id}`)link.setAttribute('aria-current','location');else link.removeAttribute('aria-current');});}});},{rootMargin:'-20% 0px -55% 0px'});document.querySelectorAll('#project,#features,#get-started,#faq').forEach(section=>observer.observe(section));}
+if('IntersectionObserver' in window){const observer=new IntersectionObserver(entries=>{entries.forEach(entry=>{if(entry.isIntersecting){navigation.querySelectorAll('a').forEach(link=>{if(link.getAttribute('href')===`#${entry.target.id}`)link.setAttribute('aria-current','location');else link.removeAttribute('aria-current');});}});},{rootMargin:'-20% 0px -55% 0px'});document.querySelectorAll('#project,#architecture,#specifications,#get-started,#faq').forEach(section=>observer.observe(section));}
 renderGuide();
+
+
+// Explanatory architecture controls; they do not configure a local engine.
+const executionPaths={
+  cpu:{title:'Model execution',cpu:'Tokenization, routing, attention/convolution, and selected experts run through the CPU path.',summary:'CPU-only execution.',detail:'All model compute stays on the CPU. OS-backed paging, read-ahead, and expert prediction help with cold weights.'},
+  hybrid:{title:'Schedule and combine',cpu:'CPU batch processing and routing. During hybrid decode, CPU workers compute selected experts that are not resident in VRAM.',summary:'Hybrid execution for the reference MoE model.',detail:'The prompt uses the CPU batch path, with optional cached-expert GPU offload. In single-token generation, the GPU can run dense decode and resident experts while CPU workers process non-resident experts. Contributions are combined before sampling.'}
+};
+function renderExecution(mode){
+  const path=executionPaths[mode];
+  document.querySelectorAll('[data-execution]').forEach(button=>{const selected=button.dataset.execution===mode;button.setAttribute('aria-selected',String(selected));button.tabIndex=selected?0:-1;});
+  document.querySelector('#execution-panel').setAttribute('aria-labelledby',`execution-${mode}`);
+  document.querySelector('#runtime-cpu-title').textContent=path.title;
+  document.querySelector('#runtime-cpu-text').textContent=path.cpu;
+  document.querySelector('#runtime-gpu').hidden=mode!=='hybrid';
+  document.querySelector('.engine-core').classList.toggle('is-hybrid',mode==='hybrid');
+  document.querySelector('#execution-summary').textContent=path.summary;
+  document.querySelector('#execution-detail').textContent=path.detail;
+}
+document.querySelectorAll('[data-execution]').forEach(button=>button.addEventListener('click',()=>renderExecution(button.dataset.execution)));
+bindTabKeyboard(document.querySelector('.execution-tabs'),'[data-execution]');
+renderExecution('cpu');

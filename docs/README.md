@@ -7,7 +7,8 @@ The English landing page is published automatically by GitHub Pages from
 - `index.html`: content and metadata.
 - `styles.css`: shared responsive layout.
 - `theme-hack.css`: terminal-inspired colors taken from the Pithos banner.
-- `app.js`: installation guide, tabs, clipboard, and local progress storage.
+- `engine.css`: ice-white typography, architecture diagram, and technical tables.
+- `app.js`: installation guide, CPU/GPU diagram, tabs, clipboard, and local progress storage.
 - `assets/`: original project graphics and self-hosted fonts with license files.
 
 Keep asset URLs relative so the site works at `/Pithos/`. When changing the public
