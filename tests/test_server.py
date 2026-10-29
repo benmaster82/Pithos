@@ -112,6 +112,15 @@ TEMPLATE_CASES = {
     "preserve_thinking": dict(kw={"preserve_thinking": True}, messages=[
         {"role": "user", "content": "x"}, {"role": "assistant", "content": "y", "reasoning_content": "r"},
         {"role": "user", "content": "z"}]),
+    "two tool calls + two results": dict(tools=[TOOL], messages=[
+        {"role": "user", "content": "RE-42 e RE-43?"},
+        {"role": "assistant", "content": "Controllo.", "tool_calls": [CALL, dict(CALL, id="call_2")]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "spedito"},
+        {"role": "tool", "tool_call_id": "call_2", "content": [{"type": "text", "text": "in preparazione"}]},
+        {"role": "assistant", "content": "Uno spedito, uno in preparazione."},
+        {"role": "user", "content": "Grazie"}]),
+    "empty reasoning, last turn": dict(messages=[
+        {"role": "user", "content": "a"}, {"role": "assistant", "content": "b", "reasoning_content": ""}]),
 }
 
 
@@ -184,7 +193,10 @@ def test_api():
                   {"role": "tool", "tool_call_id": calls[0]["id"], "content": json.dumps({"order_id": "RE-42", "status": "spedito"})}]
         s = stream({"messages": tmsgs, "tools": [TOOL], "max_tokens": 1024})
         check("answer uses the tool result", "sped" in s["content"].lower(), s["content"])
-        check("tool turn reused from cache", s["timings"]["prompt_n"] < 40, "prompt_n=%d" % s["timings"]["prompt_n"])
+        # the client sends the call back without its reasoning, so the assistant turn is read again:
+        # only it and the tool result (LFM3's XML call is ~25 tokens, LFM2's pythonic one ~12)
+        check("tool turn reused from cache", s["timings"]["cache_n"] > 0 and s["timings"]["prompt_n"] < 80,
+              "cache_n=%d prompt_n=%d" % (s["timings"]["cache_n"], s["timings"]["prompt_n"]))
 
     print("completions:")
     r = call("/v1/completions", {"prompt": "<|startoftext|>La capitale d'Italia è", "max_tokens": 8, "temperature": 0})

@@ -5,7 +5,7 @@
 <h1 align="center">Pithos</h1>
 
 <p align="center">
-  <b>A dependency-free C inference engine for Liquid AI's LFM2 / LFM2.5 models.</b><br>
+  <b>A dependency-free C inference engine for Liquid AI's LFM2 / LFM2.5 / LFM3 models.</b><br>
   Terminal chat, an OpenAI-compatible server, a web agent and a terminal agent, all in one executable.
 </p>
 
@@ -34,8 +34,9 @@
 
 Pithos is an inference engine written from scratch in C11 with **no dependencies**: no external
 libraries at build time, only the operating system API (Win32 or POSIX). It runs GGUF models of
-Liquid AI's LFM2 / LFM2-MoE architecture and is tuned for `LFM2.5-24B-A2B-Q4_K_M.gguf`
-(24 billion parameters, about 2 billion active per token) on an ordinary laptop.
+Liquid AI's LFM2 / LFM2-MoE / LFM3 architectures and is tuned for `LFM2.5-24B-A2B-Q4_K_M.gguf`
+(24 billion parameters, about 2 billion active per token) on an ordinary laptop. The small
+[LFM3-1.7B](#lfm3-17b-small-and-fast) runs too, on the CPU, at about 20 tokens per second.
 
 **Pithos** is the engine and the server (in the myth, the *pithos* is Pandora's jar: it holds the
 model). **Pandora** is the agent in the web interface.
@@ -143,6 +144,26 @@ hf download LiquidAI/LFM2.5-24B-A2B-GGUF LFM2.5-24B-A2B-Q4_K_M.gguf --local-dir 
 To check that the file is found and complete, run `build\pithos.exe -p "Hello"` (Linux:
 `build/pithos -p "Hello"`). The first lines report the model (`model: lfm2moe | 40 layers ...`).
 Pithos also rejects a truncated file and names the tensor that is missing.
+
+### LFM3-1.7B: small and fast
+[LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B) is a 1.7-billion-parameter model
+that fits in 1.1 GB. It runs on the CPU (the GPU path covers MoE models), at about 20 tokens per
+second on the reference laptop, with the same chat, server, Pandora and terminal agent.
+
+| | |
+|---|---|
+| File | `LFM3-1.7B-Q4_K_M.gguf` from [LiquidAI/LFM3-1.7B-GGUF](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF) |
+| Size | 1,099,627,808 bytes (1.0 GiB) |
+| SHA-256 | `3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4` |
+| Direct link | https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-Q4_K_M.gguf |
+
+Download it with the same commands as above (replace the file name and the URL), then pass it
+with `-m`:
+
+```
+build/pithos -m models/LFM3-1.7B-Q4_K_M.gguf -i
+build/pithos -m models/LFM3-1.7B-Q4_K_M.gguf --server --open
+```
 
 ## Results
 
@@ -339,8 +360,10 @@ call arguments in the `f(arg='v')` format, and reasoning removed from past turns
 compares it with Jinja2 character by character and token by token.
 
 ### Agent mode
-LFM2.5-24B-A2B is trained to use tools. It writes calls as
-`<|tool_call_start|>[f(arg='v')]<|tool_call_end|>`, and can make more than one call per answer.
+LFM2.5-24B-A2B and LFM3 are trained to use tools, and can make more than one call per answer.
+LFM2.5 writes calls as `<|tool_call_start|>[f(arg='v')]<|tool_call_end|>`, LFM3 as
+`<tool_call><function=f><parameter=arg>v</parameter></function></tool_call>`; the server turns
+both into OpenAI `tool_calls`, so clients see no difference.
 
 - **Turning it on:** the **Agent** button under the text box enables tools. The model calls them,
   each call shows up as a card (arguments, result, time), and the loop goes on until the model answers.
@@ -547,10 +570,15 @@ each turn the state is rolled back to before the answer (KV cache + convolution 
 without its reasoning is processed again.
 
 ### Other models
-Any GGUF of the `lfm2` (dense) or `lfm2moe` architecture loads, as long as its tensors use the
-supported formats: Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16, F32. BF16, Q2_K, Q3_K and IQ formats are not
-supported. GPU acceleration covers MoE models with Q4_K / Q6_K weights; dense models run on the CPU.
-Only LFM2.5-24B-A2B has been validated so far.
+Any GGUF of the `lfm2` (dense), `lfm2moe` or `lfm3` architecture loads, as long as its tensors use
+the supported formats: Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16, F32. BF16, Q2_K, Q3_K and IQ formats are
+not supported. GPU acceleration covers MoE models with Q4_K / Q6_K weights; dense models run on the
+CPU. Validated so far: LFM2.5-24B-A2B and LFM3-1.7B.
+
+`lfm3` adds to LFM2: an RMSNorm on the output of every block before the residual sum (sandwich
+norm), a sigmoid gate per head on the attention output, sliding-window attention (256 tokens) on 5
+of the 11 attention layers, partial RoPE on the others, a convolution window of 7, and its own chat
+template (generation starts inside `<think>`, past turns keep an empty `<think></think>`).
 
 ## How it works
 
@@ -635,8 +663,12 @@ for each of the 30 convolution layers.
 ## Validation
 - `build\test_kernels.exe MODEL`: every kernel (scalar and AVX2) against the reference dequantization on real model rows (relative error ~1e-8).
 - `build\test_gpu.exe MODEL`: experts computed in VRAM against an f32 reference (f32: 3e-7; int8: ~9e-3, like the activation quantization on the CPU).
-- Tokenizer identical to `llama-tokenize` on texts with accents, numbers, spaces, CJK, emoji and special tokens.
+- Tokenizer identical to Hugging Face `tokenizers` (each model's `tokenizer.json`) and to
+  `llama-tokenize`, on texts with accents, numbers, spaces, code, CJK, emoji and special tokens.
 - Perplexity compared with `llama-perplexity` (table above).
+- LFM3-1.7B: perplexity against an independent PyTorch implementation written from the model's
+  `modeling_lfm3.py`, on the same dequantized weights: 4.45 vs 4.39 with 256-token windows, 3.65
+  vs 3.62 with 1024 (sliding window active). The gap is the int8 activations and the f16 KV cache.
 - `python tests/test_server.py` (with the server running): template against Jinja2, answers,
   streaming, prompt reuse across turns, tool calls, completions, stop strings, errors.
 - `python tests/versus.py [ROUNDS] [llama.cpp|llama.cpp-cuda]`: head-to-head with llama-server
@@ -663,8 +695,10 @@ for each of the 30 convolution layers.
 ## Limitations
 Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
 
-- Only the `lfm2` / `lfm2moe` architectures. Formats Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16 and F32;
-  on the GPU only Q4_K and Q6_K.
+- Only the `lfm2` / `lfm2moe` / `lfm3` architectures. Formats Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16
+  and F32; on the GPU only Q4_K and Q6_K, and only for MoE models (LFM3 runs on the CPU).
+- LFM3's sliding-window layers keep the whole KV cache like the others (simpler; a ring buffer
+  would save almost half of it at long contexts).
 - The NEON kernels and the GPU f32 path are written for ARM64/AMD/Intel, but have only been tested
   on x86-64 and NVIDIA. The POSIX shell/process tools have also passed tests on x86-64
   Ubuntu 26.04 under WSL2; the macOS path remains unverified.

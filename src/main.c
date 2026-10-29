@@ -504,6 +504,7 @@ static int chat_turn(Engine *e, const char *user, int first) {
         ctx_restore(e->ctx, &snap);
         Str a = { 0 };
         str_add(&a, "<|im_start|>assistant\n", -1);
+        if (!strcmp(e->m->arch, "lfm3")) str_add(&a, "<think></think>", -1); /* its template marks the dropped thinking */
         str_add(&a, content, -1);
         str_add(&a, "<|im_end|>\n", -1);
         double t0 = e->t_prompt;
@@ -622,8 +623,13 @@ static int real_main(int argc, char **argv) {
     if (!model_load(&m, a.model, err, sizeof(err))) { fprintf(stderr, "error: %s\n", err); return 1; }
     Tokenizer *tk = tok_load(&m.gguf, err, sizeof(err));
     if (!tk) { fprintf(stderr, "error: %s\n", err); return 1; }
-    fprintf(stderr, "model: %s | %d layers (%d attn, %d conv) | dim %d | %d experts top-%d | vocab %d | %.2f GB | ~%.0f MB/token | %.2f s\n",
-            m.arch, m.n_layer, m.n_attn, m.n_conv, m.dim, m.n_expert, m.n_expert_used, m.n_vocab,
+    char moe[48] = "", swa[48] = "";
+    int n_swa = 0;
+    for (int l = 0; l < m.n_layer; l++) n_swa += m.layers[l].is_swa;
+    if (m.n_expert) snprintf(moe, sizeof(moe), " | %d experts top-%d", m.n_expert, m.n_expert_used);
+    if (n_swa) snprintf(swa, sizeof(swa), ", %d of them sliding-window %d", n_swa, m.swa_window);
+    fprintf(stderr, "model: %s | %d layers (%d attn%s, %d conv) | dim %d%s | vocab %d | %.2f GB | ~%.0f MB/token | %.2f s\n",
+            m.arch, m.n_layer, m.n_attn, swa, m.n_conv, m.dim, moe, m.n_vocab,
             m.gguf.mf.size / 1073741824.0, m.bytes_per_token / 1048576.0, time_sec() - t0);
 
     if (a.tokenize) {
@@ -646,7 +652,7 @@ static int real_main(int argc, char **argv) {
     ThreadPool *pool = pool_create(a.threads);
     Context *ctx = ctx_create(&m, pool, a.n_ctx, a.n_batch);
     if (!ctx) { fprintf(stderr, "error: not enough memory for the context\n"); return 1; }
-    if (a.prefetch < 0) a.prefetch = si.avail_ram && m.gguf.mf.size > si.avail_ram * 9 / 10;
+    if (a.prefetch < 0) a.prefetch = m.n_expert && si.avail_ram && m.gguf.mf.size > si.avail_ram * 9 / 10;
     ctx_set_prefetch(ctx, a.prefetch);
     if (a.prefetch) fprintf(stderr, "background expert read-ahead: on\n");
     Gpu *gpu = NULL;
@@ -748,8 +754,10 @@ static int real_main(int argc, char **argv) {
         txt[fl] = 0;
         fclose(f);
         int *ids = (int *)malloc(sizeof(int) * ((size_t)fl + 2));
+        /* like llama-perplexity: a BOS only where the model asks for one (LFM3 does not) */
+        const int bos = m.add_bos;
         ids[0] = tok_bos(tk);
-        int nt = 1 + tok_encode(tk, txt, (int)fl, 0, ids + 1, (int)fl + 1);
+        int nt = bos + tok_encode(tk, txt, (int)fl, 0, ids + bos, (int)fl + 1);
         const int nc = a.n_ctx, nchunks = nt / nc, first = nc / 2;
         float *lg = (float *)malloc(sizeof(float) * (size_t)nc * m.n_vocab);
         double nll = 0;
@@ -759,7 +767,7 @@ static int real_main(int argc, char **argv) {
         for (int ch = 0; ch < nchunks; ch++) {
             int *tk0 = ids + (size_t)ch * nc;
             int save = tk0[0];
-            tk0[0] = tok_bos(tk);
+            if (bos) tk0[0] = tok_bos(tk);
             ctx_reset(ctx);
             ctx_forward_all(ctx, tk0, nc, lg);
             tk0[0] = save;

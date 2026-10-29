@@ -1,4 +1,4 @@
-/* model.c - LFM2 / LFM2-MoE inference on CPU.
+/* model.c - LFM2 / LFM2-MoE / LFM3 inference on CPU.
  *
  * Layer l:  h = rmsnorm(x);  x += is_attn ? attention(h) : shortconv(h)
  *           h = rmsnorm(x);  x += is_moe ? moe(h) : swiglu_ffn(h)
@@ -6,7 +6,12 @@
  *
  * shortconv: [B,C,xx] = in_proj(h); bx = B*xx; y = C * causal_depthwise_conv(bx); out_proj(y)
  * attention: GQA with per-head RMSNorm on q and k, NEOX RoPE.
- * moe:       sigmoid router (+ selection bias), top-k, normalized weights, SwiGLU experts. */
+ * moe:       sigmoid router (+ selection bias), top-k, normalized weights, SwiGLU experts.
+ *
+ * LFM3 adds, each one only where the model has it: an RMSNorm on both block outputs before
+ * they enter the residual stream (sandwich norm), a sigmoid gate per head on the attention
+ * output (computed from h), sliding-window attention on some layers with their own RoPE base,
+ * and partial rotation on the full-attention layers (rope_freqs divisors). */
 #include "model.h"
 #include "gpu.h"
 #include <math.h>
@@ -76,8 +81,8 @@ int model_load(Model *m, const char *path, char *err, int errlen) {
     if (!arch || al >= sizeof(m->arch)) { snprintf(err, errlen, "no architecture"); goto fail; }
     memcpy(m->arch, arch, al);
     m->arch[al] = 0;
-    if (strcmp(m->arch, "lfm2") && strcmp(m->arch, "lfm2moe")) {
-        snprintf(err, errlen, "unsupported architecture '%s' (need lfm2 / lfm2moe)", m->arch);
+    if (strcmp(m->arch, "lfm2") && strcmp(m->arch, "lfm2moe") && strcmp(m->arch, "lfm3")) {
+        snprintf(err, errlen, "unsupported architecture '%s' (need lfm2 / lfm2moe / lfm3)", m->arch);
         goto fail;
     }
     char key[128];
@@ -95,17 +100,26 @@ int model_load(Model *m, const char *path, char *err, int errlen) {
     m->norm_topk = 1;
     m->eps = (float)gguf_get_float(g, KEY("attention.layer_norm_rms_epsilon"), 1e-5);
     m->rope_base = (float)gguf_get_float(g, KEY("rope.freq_base"), 1e6);
+    m->rope_base_swa = (float)gguf_get_float(g, KEY("rope.freq_base_swa"), m->rope_base);
+    m->swa_window = (int)gguf_get_int(g, KEY("attention.sliding_window"), 0);
     const GGUFKV *kvh = gguf_find(g, KEY("attention.head_count_kv"));
+    const GGUFKV *swa = gguf_find(g, KEY("attention.sliding_window_pattern"));
+    const int key_len = (int)gguf_get_int(g, KEY("attention.key_length"), 0);
 #undef KEY
+    m->add_bos = (int)gguf_get_int(g, "tokenizer.ggml.add_bos_token", 1);
     if (m->n_layer <= 0 || m->dim <= 0 || m->n_head <= 0 || !kvh) { snprintf(err, errlen, "bad hyperparameters"); goto fail; }
-    m->head_dim = m->dim / m->n_head;
+    m->head_dim = key_len > 0 ? key_len : m->dim / m->n_head;
+    if (m->head_dim > 256 || m->head_dim % 2) { snprintf(err, errlen, "head size %d not supported", m->head_dim); goto fail; }
     if (m->n_expert > 64) { snprintf(err, errlen, "too many experts (%d)", m->n_expert); goto fail; }
 
     REQ(load_mat(m, &m->embed, "token_embd.weight", 1, err, errlen));
     m->n_vocab = m->embed.rows;
     if (load_mat(m, &m->output, "output.weight", 0, err, errlen) < 0) goto fail;
     if (!m->output.data) m->output = m->embed;
-    REQP(m->final_norm = load_f32(m, "token_embd_norm.weight", m->dim, 1, err, errlen));
+    m->final_norm = load_f32(m, "token_embd_norm.weight", m->dim, 0, err, errlen);
+    if (!m->final_norm) REQP(m->final_norm = load_f32(m, "output_norm.weight", m->dim, 1, err, errlen));
+    if (gguf_tensor(g, "rope_freqs.weight"))
+        REQP(m->rope_freqs = load_f32(m, "rope_freqs.weight", m->head_dim / 2, 1, err, errlen));
 
     m->layers = (Layer *)calloc((size_t)m->n_layer, sizeof(Layer));
     char nm[128];
@@ -114,8 +128,14 @@ int model_load(Model *m, const char *path, char *err, int errlen) {
         Layer *L = &m->layers[l];
         int nkv = kvh->type == GGUF_T_ARRAY ? (int)gguf_arr_int(kvh, (uint64_t)l) : (int)gguf_get_int(g, "x", 0);
         L->is_attn = nkv > 0;
+        L->is_swa = L->is_attn && swa && swa->type == GGUF_T_ARRAY && gguf_arr_int(swa, (uint64_t)l) != 0;
+        if (L->is_swa && m->swa_window <= 0) { snprintf(err, errlen, "sliding-window layer without a window size"); goto fail; }
         REQP(L->attn_norm = load_f32(m, T("attn_norm.weight"), m->dim, 1, err, errlen));
         REQP(L->ffn_norm = load_f32(m, T("ffn_norm.weight"), m->dim, 1, err, errlen));
+        /* sandwich norms: both or neither */
+        L->post_op_norm = load_f32(m, T("post_attention_norm.weight"), m->dim, 0, err, errlen);
+        L->post_ffn_norm = load_f32(m, T("post_ffw_norm.weight"), m->dim, 0, err, errlen);
+        if (!L->post_op_norm != !L->post_ffn_norm) { snprintf(err, errlen, "layer %d: only one post norm", l); goto fail; }
         if (L->is_attn) {
             m->n_kv_head = nkv;
             L->attn_idx = m->n_attn++;
@@ -125,6 +145,11 @@ int model_load(Model *m, const char *path, char *err, int errlen) {
             REQ(load_mat(m, &L->wo, T("attn_output.weight"), 1, err, errlen));
             REQP(L->q_norm = load_f32(m, T("attn_q_norm.weight"), m->head_dim, 1, err, errlen));
             REQP(L->k_norm = load_f32(m, T("attn_k_norm.weight"), m->head_dim, 1, err, errlen));
+            if (load_mat(m, &L->attn_gate, T("attn_gate.weight"), 0, err, errlen) < 0) goto fail;
+            if (L->attn_gate.data && (L->attn_gate.rows != m->n_head || L->attn_gate.cols != m->dim)) {
+                snprintf(err, errlen, "layer %d: attn_gate must be [%d][%d]", l, m->n_head, m->dim);
+                goto fail;
+            }
         } else {
             L->conv_idx = m->n_conv++;
             REQ(load_mat(m, &L->in_proj, T("shortconv.in_proj.weight"), 1, err, errlen));
@@ -151,7 +176,8 @@ int model_load(Model *m, const char *path, char *err, int errlen) {
     uint64_t b = (uint64_t)m->output.row_bytes * m->n_vocab;
     for (int l = 0; l < m->n_layer; l++) {
         Layer *L = &m->layers[l];
-        if (L->is_attn) b += (uint64_t)L->wq.expert_stride + L->wk.expert_stride + L->wv.expert_stride + L->wo.expert_stride;
+        if (L->is_attn) b += (uint64_t)L->wq.expert_stride + L->wk.expert_stride + L->wv.expert_stride + L->wo.expert_stride +
+                             L->attn_gate.expert_stride;
         else b += (uint64_t)L->in_proj.expert_stride + L->out_proj.expert_stride;
         if (L->is_moe) b += (uint64_t)m->n_expert_used * (L->gate_exps.expert_stride + L->up_exps.expert_stride + L->down_exps.expert_stride);
         else b += (uint64_t)L->w_gate.expert_stride + L->w_up.expert_stride + L->w_down.expert_stride;
@@ -199,7 +225,8 @@ struct Context {
     uint32_t last_used[64 * 64];/* [layer][expert] -> tok_counter at last use */
     f16_t *kc, *vc;
     float *conv;
-    float inv_freq[256];
+    float inv_freq[256], inv_freq_swa[256];
+    float *gate;                /* [n_batch][n_head] attention output gates (LFM3) */
     /* scratch (sized for n_batch tokens) */
     float *x, *h, *big, *tmp, *out, *logits;
     block_q8_K *hq, *tq;
@@ -236,8 +263,11 @@ Context *ctx_create(Model *m, ThreadPool *pool, int n_ctx, int n_batch) {
     c->kc = (f16_t *)aligned_malloc(kvn * sizeof(f16_t) + 64, 64);
     c->vc = (f16_t *)aligned_malloc(kvn * sizeof(f16_t) + 64, 64);
     c->conv = (float *)amalloc(sizeof(float) * (size_t)(m->n_conv ? m->n_conv : 1) * (m->l_cache - 1) * D);
-    for (int i = 0; i < m->head_dim / 2; i++)
+    for (int i = 0; i < m->head_dim / 2; i++) {
         c->inv_freq[i] = (float)pow((double)m->rope_base, -2.0 * i / m->head_dim);
+        if (m->rope_freqs) c->inv_freq[i] /= m->rope_freqs[i]; /* a huge divisor leaves the pair unrotated */
+        c->inv_freq_swa[i] = (float)pow((double)m->rope_base_swa, -2.0 * i / m->head_dim);
+    }
     int bigw = 3 * D;
     if (D + 2 * kvd > bigw) bigw = D + 2 * kvd;
     c->x = (float *)amalloc(sizeof(float) * B * D);
@@ -245,6 +275,7 @@ Context *ctx_create(Model *m, ThreadPool *pool, int n_ctx, int n_batch) {
     c->big = (float *)amalloc(sizeof(float) * B * bigw);
     c->tmp = (float *)amalloc(sizeof(float) * B * D);
     c->out = (float *)amalloc(sizeof(float) * B * D);
+    c->gate = (float *)amalloc(sizeof(float) * B * m->n_head);
     c->logits = (float *)amalloc(sizeof(float) * m->n_vocab);
     c->hq = (block_q8_K *)amalloc(sizeof(block_q8_K) * B * nbd);
     c->tq = (block_q8_K *)amalloc(sizeof(block_q8_K) * B * nbd);
@@ -280,7 +311,7 @@ Context *ctx_create(Model *m, ThreadPool *pool, int n_ctx, int n_batch) {
 void ctx_free(Context *c) {
     if (!c) return;
     if (c->pfq) prefetcher_destroy(c->pfq);
-    void *a[] = { c->kc, c->vc, c->conv, c->x, c->h, c->big, c->tmp, c->out, c->logits, c->hq, c->tq,
+    void *a[] = { c->kc, c->vc, c->conv, c->x, c->h, c->big, c->tmp, c->out, c->gate, c->logits, c->hq, c->tq,
                   c->fg, c->fu, c->fq, c->rlog, c->selw, c->sel, c->a_tok, c->a_slot, c->tok_a, c->xg,
                   c->eg, c->eu, c->eq, c->eo, c->scores, c->gy, c->on_gpu, c->ga_e, c->ga_t };
     for (size_t i = 0; i < sizeof(a) / sizeof(a[0]); i++) aligned_free(a[i]);
@@ -516,23 +547,26 @@ static void attn_task(void *ctx, int task, int tid) {
     const int qkvw = m->dim + 2 * kvd;
     const float *q = c->big + (size_t)t * qkvw + h * hd;
     const int npos = a->pos0 + t + 1;
+    /* sliding-window layers see the last swa_window positions, the current one included */
+    const int j0 = a->L->is_swa && npos > m->swa_window ? npos - m->swa_window : 0;
     const size_t lbase = (size_t)a->L->attn_idx * c->n_ctx * kvd;
     const f16_t *kc = c->kc + lbase + kvh * hd;
     const f16_t *vc = c->vc + lbase + kvh * hd;
     float *s = c->scores + (size_t)tid * c->n_ctx;
     const float scale = 1.f / sqrtf((float)hd);
     float mx = -1e30f;
-    for (int j = 0; j < npos; j++) {
+    for (int j = j0; j < npos; j++) {
         const float v = KS.dot_f16_f32(kc + (size_t)j * kvd, q, hd) * scale;
-        s[j] = v;
+        s[j - j0] = v;
         if (v > mx) mx = v;
     }
-    const float sum = KS.exp_sum(s, npos, mx);
-    const float inv = 1.f / sum;
+    const float sum = KS.exp_sum(s, npos - j0, mx);
+    float inv = 1.f / sum;
+    if (a->L->attn_gate.data) inv *= c->gate[(size_t)t * nh + h]; /* LFM3 output gate */
     float *o = c->tmp + (size_t)t * m->dim + h * hd;
     float acc[512];
     memset(acc, 0, sizeof(float) * hd);
-    for (int j = 0; j < npos; j++) KS.axpy_f16(s[j] * inv, vc + (size_t)j * kvd, acc, hd);
+    for (int j = j0; j < npos; j++) KS.axpy_f16(s[j - j0] * inv, vc + (size_t)j * kvd, acc, hd);
     memcpy(o, acc, sizeof(float) * hd);
 }
 
@@ -545,9 +579,13 @@ static void attention_block(Context *c, const Layer *L, int n) {
     job_add_q(c, &L->wq, NULL, c->hq, nbd, n, c->big, qkvw);
     job_add_q(c, &L->wk, NULL, c->hq, nbd, n, c->big + D, qkvw);
     job_add_q(c, &L->wv, NULL, c->hq, nbd, n, c->big + D + kvd, qkvw);
+    if (L->attn_gate.data) job_add_q(c, &L->attn_gate, NULL, c->hq, nbd, n, c->gate, m->n_head);
     job_run(c, CAT_ATTN);
 
     double t0 = time_sec();
+    if (L->attn_gate.data)
+        for (int i = 0; i < n * m->n_head; i++) c->gate[i] = 1.f / (1.f + expf(-c->gate[i]));
+    const float *inv_freq = L->is_swa ? c->inv_freq_swa : c->inv_freq;
     const size_t lbase = (size_t)L->attn_idx * c->n_ctx * kvd;
     for (int t = 0; t < n; t++) {
         float *q = c->big + (size_t)t * qkvw;
@@ -555,11 +593,11 @@ static void attention_block(Context *c, const Layer *L, int n) {
         const int pos = c->pos + t;
         for (int h = 0; h < m->n_head; h++) {
             rmsnorm(q + h * hd, q + h * hd, L->q_norm, hd, m->eps);
-            rope_neox(q + h * hd, hd, pos, c->inv_freq);
+            rope_neox(q + h * hd, hd, pos, inv_freq);
         }
         for (int h = 0; h < m->n_kv_head; h++) {
             rmsnorm(k + h * hd, k + h * hd, L->k_norm, hd, m->eps);
-            rope_neox(k + h * hd, hd, pos, c->inv_freq);
+            rope_neox(k + h * hd, hd, pos, inv_freq);
         }
         KS.f32_to_f16_row(k, c->kc + lbase + (size_t)pos * kvd, kvd);
         KS.f32_to_f16_row(v, c->vc + lbase + (size_t)pos * kvd, kvd);
@@ -944,10 +982,14 @@ static void forward_chunk(Context *c, const int *tokens, int n, int want_logits,
         for (int t = 0; t < n; t++) rmsnorm(c->h + (size_t)t * D, c->x + (size_t)t * D, L->attn_norm, D, m->eps);
         if (L->is_attn) attention_block(c, L, n);
         else shortconv_block(c, L, n);
+        if (L->post_op_norm)
+            for (int t = 0; t < n; t++) rmsnorm(c->out + (size_t)t * D, c->out + (size_t)t * D, L->post_op_norm, D, m->eps);
         for (size_t i = 0; i < (size_t)n * D; i++) c->x[i] += c->out[i];
         for (int t = 0; t < n; t++) rmsnorm(c->h + (size_t)t * D, c->x + (size_t)t * D, L->ffn_norm, D, m->eps);
         if (L->is_moe) moe_ffn(c, L, l, n);
         else dense_ffn(c, L, n);
+        if (L->post_ffn_norm)
+            for (int t = 0; t < n; t++) rmsnorm(c->out + (size_t)t * D, c->out + (size_t)t * D, L->post_ffn_norm, D, m->eps);
         for (size_t i = 0; i < (size_t)n * D; i++) c->x[i] += c->out[i];
     }
     c->pos += n;

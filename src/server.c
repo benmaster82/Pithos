@@ -59,6 +59,7 @@ typedef struct {
     PCache *pc;
     PithosLock *lock;
     int t_im_end, t_eot, t_eos, t_think_end, t_tc_start, t_tc_end;
+    int lfm3;                   /* LFM3 template: XML tool calls, <tools> block, <think></think> on past turns */
     uint64_t rng;
     volatile int busy;
     char *ui;
@@ -305,7 +306,7 @@ static void render_content(Buf *b, const Json *c) {
         for (const Json *it = c->child; it; it = it->next) {
             if (it->t == J_STR) { buf_add(b, it->s, it->len); continue; }
             const char *type = json_str(json_get(it, "type"), NULL);
-            if (type && !strcmp(type, "image")) buf_add(b, "<image>", -1);
+            if (type && !strcmp(type, "image")) buf_add(b, S.lfm3 ? "<|vision_start|><|image|><|vision_end|>" : "<image>", -1);
             else if (type && !strcmp(type, "text")) buf_add(b, json_str(json_get(it, "text"), ""), -1);
             else json_write(b, it);
         }
@@ -404,6 +405,164 @@ static int render_assistant(Buf *b, const char *reasoning, int rlen, const char 
     return 1;
 }
 
+/* ------------------------------------------------------------------ chat template (LFM3) */
+
+static const char *find_in(const char *s, int n, const char *needle) {
+    const int k = (int)strlen(needle);
+    for (int i = 0; i + k <= n; i++)
+        if (s[i] == needle[0] && !memcmp(s + i, needle, (size_t)k)) return s + i;
+    return NULL;
+}
+
+/* render_value macro: strings verbatim, the rest as JSON (true / false / null in lower case) */
+static void render_value_lfm3(Buf *b, const Json *v) {
+    if (v->t == J_STR) buf_add(b, v->s, v->len);
+    else json_write(b, v);
+}
+
+/* <tool_call>\n<function=name>\n<parameter=k>\nvalue\n</parameter>\n</function>\n</tool_call>, "\n\n" between */
+static int render_tool_calls_lfm3(Buf *b, const Json *calls, char *err, int errlen) {
+    for (const Json *tc = calls->child; tc; tc = tc->next) {
+        const Json *fn = json_get(tc, "function");
+        if (!fn) fn = tc;
+        const char *name = json_str(json_get(fn, "name"), NULL);
+        if (!name) { snprintf(err, (size_t)errlen, "tool call without a function name"); return 0; }
+        if (tc != calls->child) buf_add(b, "\n\n", 2);
+        buf_add(b, "<tool_call>\n<function=", -1);
+        buf_add(b, name, -1);
+        buf_add(b, ">\n", 2);
+        const Json *args = json_get(fn, "arguments");
+        Json *parsed = NULL;
+        if (args && args->t == J_STR) {
+            /* OpenAI clients send arguments as a JSON-encoded string */
+            parsed = json_parse(args->s, args->len, err, errlen);
+            if (!parsed && args->len > 0) {
+                const char *t = args->s;
+                while (*t == ' ') t++;
+                if (*t) { snprintf(err, (size_t)errlen, "tool call arguments are not valid JSON"); return 0; }
+            }
+            args = parsed;
+        }
+        if (args && args->t == J_OBJ)
+            for (const Json *a = args->child; a; a = a->next) {
+                buf_add(b, "<parameter=", -1);
+                buf_add(b, a->key, -1);
+                buf_add(b, ">\n", 2);
+                render_value_lfm3(b, a);
+                buf_add(b, "\n</parameter>\n", -1);
+            }
+        json_free(parsed);
+        buf_add(b, "</function>\n</tool_call>", -1);
+    }
+    if (err) err[0] = 0;
+    return 1;
+}
+
+/* tool_to_json macro: the function object without its defer_loading key */
+static void tool_to_json_lfm3(Buf *b, const Json *fn) {
+    int first = 1;
+    buf_add(b, "{", 1);
+    for (const Json *c = fn->child; c; c = c->next) {
+        if (!strcmp(c->key, "defer_loading")) continue;
+        if (!first) buf_add(b, ", ", 2);
+        first = 0;
+        buf_json_str(b, c->key, -1);
+        buf_add(b, ": ", 2);
+        json_write(b, c);
+    }
+    buf_add(b, "}", 1);
+}
+
+/* the <tools> block appended to the system prompt; tools with defer_loading are left out */
+static void render_tools_lfm3(Buf *sys, const Json *tools) {
+    Buf lines = { 0 };
+    for (const Json *t = tools->child; t; t = t->next) {
+        const Json *fn = json_get(t, "function");
+        if (!fn) fn = t;
+        if (fn->t != J_OBJ) continue;
+        if (truthy(json_get(fn, "defer_loading")) || truthy(json_get(t, "defer_loading"))) continue;
+        if (lines.n) buf_add(&lines, "\n", 1);
+        tool_to_json_lfm3(&lines, fn);
+    }
+    if (lines.n) {
+        if (sys->n) buf_add(sys, "\n\n", 2);
+        buf_add(sys, "<tools>\n", -1);
+        buf_add(sys, lines.s, lines.n);
+        buf_add(sys, "\n</tools>", -1);
+    }
+    buf_free(&lines);
+}
+
+/* render_tool_response macro, for plain results (additional_tools is not supported) */
+static void render_tool_response_lfm3(Buf *b, const Json *c) {
+    if (c && c->t == J_STR && find_in(c->s, c->len, "<tool_response>")) { buf_add(b, c->s, c->len); return; }
+    buf_add(b, "<tool_response>\n", -1);
+    if (c && c->t == J_ARR) {
+        for (const Json *it = c->child; it; it = it->next) {
+            if (it != c->child) buf_add(b, "\n", 1);
+            const char *type = it->t == J_OBJ ? json_str(json_get(it, "type"), NULL) : NULL;
+            if (it->t == J_STR) buf_add(b, it->s, it->len);
+            else if (type && !strcmp(type, "text")) buf_add(b, json_str(json_get(it, "text"), ""), -1);
+            else json_write(b, it);
+        }
+    } else if (c && c->t == J_OBJ) {
+        const char *type = json_str(json_get(c, "type"), NULL);
+        if (type && !strcmp(type, "text")) buf_add(b, json_str(json_get(c, "text"), ""), -1);
+        else json_write(b, c);
+    } else if (c && c->t == J_STR) {
+        buf_add(b, c->s, c->len);
+    } else if (c && c->t != J_NULL) {
+        json_write(b, c);
+    }
+    buf_add(b, "\n</tool_response>", -1);
+}
+
+/* One assistant message. keep: its thinking is kept (turns after the last user message, or
+ * preserve_thinking); a turn without thinking gets an empty <think></think>. */
+static int render_assistant_lfm3(Buf *b, const Json *m, int keep, char *err, int errlen) {
+    static const char cfm[] = "CONTINUE_FINAL_MESSAGE_TAG ";
+    const int ncfm = (int)sizeof(cfm) - 1;
+    const Json *content = json_get(m, "content");
+    const Json *th = json_get(m, "thinking");
+    if (!th) th = json_get(m, "reasoning");
+    if (!th) th = json_get(m, "reasoning_content");
+    Buf cb = { 0 };
+    if (truthy(content)) render_content(&cb, content);
+    if (!cb.s) buf_add(&cb, "", 0);
+    buf_add(b, "<|im_start|>assistant\n", -1);
+    if (th && keep) {
+        buf_add(b, "<think>", -1);
+        if (th->t == J_STR) buf_add(b, th->s, th->len);
+        else if (truthy(th)) json_write(b, th);
+        buf_add(b, "</think>", -1);
+    } else if (keep && !(content && content->t == J_STR && find_in(content->s, content->len, "</think>"))) {
+        buf_add(b, "<think></think>", -1);
+    }
+    const char *cs = cb.s;
+    int cn = cb.n;
+    if (!keep) {
+        /* content.split("</think>")[-1] | trim, after an empty <think></think> */
+        const char *last = NULL;
+        for (const char *p = cs; (p = find_in(p, (int)(cs + cn - p), "</think>")) != NULL; p += 8) last = p;
+        if (last) {
+            cn -= (int)(last + 8 - cs);
+            cs = last + 8;
+            trim_view(&cs, &cn);
+        }
+        buf_add(b, "<think></think>", -1);
+    }
+    const int has_cfm = cn >= ncfm && !memcmp(cs + cn - ncfm, cfm, (size_t)ncfm);
+    if (has_cfm) cn -= ncfm;
+    buf_add(b, cs, cn);
+    const Json *calls = json_get(m, "tool_calls");
+    int ok = 1;
+    if (calls && truthy(calls)) ok = render_tool_calls_lfm3(b, calls, err, errlen);
+    if (has_cfm) buf_add(b, cfm, ncfm);
+    buf_add(b, "<|im_end|>\n", -1);
+    buf_free(&cb);
+    return ok;
+}
+
 /* Renders the conversation into tokens; bounds[] receives the token position where each
  * message starts (the last one is the start of the generation prompt). */
 static int render_chat(const Json *messages, const Json *tools, int preserve_thinking, Toks *out, int **bounds,
@@ -419,7 +578,9 @@ static int render_chat(const Json *messages, const Json *tools, int preserve_thi
         if (truthy(c)) render_content(&sys, c);
         msg = msg->next;
     }
-    if (tools && tools->t == J_ARR && tools->n > 0) {
+    if (S.lfm3 && tools && tools->t == J_ARR && tools->n > 0) {
+        render_tools_lfm3(&sys, tools);
+    } else if (tools && tools->t == J_ARR && tools->n > 0) {
         if (sys.n) buf_add(&sys, "\n", 1);
         buf_add(&sys, "List of tools: [", -1);
         for (const Json *t = tools->child; t; t = t->next) {
@@ -447,7 +608,13 @@ static int render_chat(const Json *messages, const Json *tools, int preserve_thi
         if (!role) { snprintf(err, (size_t)errlen, "message %d has no role", idx); ok = 0; break; }
         seg.n = 0;
         const Json *content = json_get(m, "content");
-        if (!strcmp(role, "assistant")) {
+        if (S.lfm3 && !strcmp(role, "assistant")) {
+            ok = render_assistant_lfm3(&seg, m, preserve_thinking || idx > last_user, err, errlen);
+        } else if (S.lfm3 && !strcmp(role, "tool")) {
+            buf_add(&seg, "<|im_start|>tool\n", -1);
+            render_tool_response_lfm3(&seg, content);
+            buf_add(&seg, "<|im_end|>\n", -1);
+        } else if (!strcmp(role, "assistant")) {
             int keep = preserve_thinking || idx > last_user;
             const Json *th = json_get(m, "thinking");
             if (!th || th->t != J_STR) th = json_get(m, "reasoning");
@@ -684,6 +851,67 @@ fail:
     return 0;
 }
 
+/* LFM3: "\n<function=name>\n<parameter=k>\nvalue\n</parameter>\n</function>\n" (the text between
+ * <tool_call> and </tool_call>) -> one OpenAI tool_calls element appended to `out`. A value that
+ * is valid JSON other than a string (number, true, object...) keeps its type; anything else is
+ * a string. */
+static int parse_tool_call_xml(const char *s, int n, Buf *out, int *count) {
+    const char *e = s + n, *p = find_in(s, n, "<function=");
+    if (!p) return 0;
+    p += 10;
+    const char *ne = memchr(p, '>', (size_t)(e - p));
+    if (!ne || ne == p) return 0;
+    const char *name = p;
+    const int nl = (int)(ne - p);
+    p = ne + 1;
+    Buf args = { 0 };
+    buf_add(&args, "{", 1);
+    int nargs = 0;
+    for (;;) {
+        while (p < e && isspace((unsigned char)*p)) p++;
+        if (e - p >= 11 && !memcmp(p, "</function>", 11)) { p += 11; break; }
+        if (e - p < 11 || memcmp(p, "<parameter=", 11)) { buf_free(&args); return 0; }
+        p += 11;
+        const char *ke = memchr(p, '>', (size_t)(e - p));
+        if (!ke || ke == p) { buf_free(&args); return 0; }
+        const char *key = p;
+        const int kl = (int)(ke - p);
+        p = ke + 1;
+        const char *ve = find_in(p, (int)(e - p), "</parameter>");
+        if (!ve) { buf_free(&args); return 0; }
+        const char *v = p;
+        int vl = (int)(ve - p);
+        p = ve + 12;
+        /* the template writes "\n" + value + "\n" */
+        if (vl > 0 && v[0] == '\n') { v++; vl--; }
+        if (vl > 0 && v[vl - 1] == '\n') vl--;
+        if (nargs++) buf_add(&args, ",", 1);
+        buf_json_str(&args, key, kl);
+        buf_add(&args, ":", 1);
+        char err[8];
+        Json *j = vl > 0 ? json_parse(v, vl, err, sizeof(err)) : NULL;
+        if (j && j->t != J_STR) json_write(&args, j);
+        else buf_json_str(&args, v, vl);
+        json_free(j);
+    }
+    while (p < e && isspace((unsigned char)*p)) p++;
+    if (p != e) { buf_free(&args); return 0; }
+    buf_add(&args, "}", 1);
+    char id[32];
+    memcpy(id, "call_", 5);
+    random_id(id + 5, 24);
+    const int k = *count;
+    if (k) buf_add(out, ",", 1);
+    buf_printf(out, "{\"index\":%d,\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":", k, id);
+    buf_json_str(out, name, nl);
+    buf_add(out, ",\"arguments\":", -1);
+    buf_json_str(out, args.s, args.n);
+    buf_add(out, "}}", 2);
+    buf_free(&args);
+    *count = k + 1;
+    return 1;
+}
+
 /* ------------------------------------------------------------------ generation */
 
 enum { ST_THINK, ST_CONTENT, ST_TOOL };
@@ -821,11 +1049,13 @@ static int on_token(Gen *g, int tok) {
     }
     if (g->chat && tok == S.t_tc_end && g->state == ST_TOOL) {
         int calls_before = g->calls.n;
-        if (!parse_tool_calls(g->toolraw.s ? g->toolraw.s : "", g->toolraw.n, &g->calls, &g->ncalls)) {
+        const char *raw = g->toolraw.s ? g->toolraw.s : "";
+        if (!(S.lfm3 ? parse_tool_call_xml(raw, g->toolraw.n, &g->calls, &g->ncalls)
+                     : parse_tool_calls(raw, g->toolraw.n, &g->calls, &g->ncalls))) {
             g->calls.n = calls_before;
-            buf_add(&g->content, "<|tool_call_start|>", -1); /* not parseable: keep it visible */
-            buf_add(&g->content, g->toolraw.s ? g->toolraw.s : "", g->toolraw.n);
-            buf_add(&g->content, "<|tool_call_end|>", -1);
+            buf_add(&g->content, S.lfm3 ? "<tool_call>" : "<|tool_call_start|>", -1); /* not parseable: keep it visible */
+            buf_add(&g->content, raw, g->toolraw.n);
+            buf_add(&g->content, S.lfm3 ? "</tool_call>" : "<|tool_call_end|>", -1);
         }
         g->state = ST_CONTENT;
         return 0;
@@ -912,7 +1142,7 @@ static void generate(Gen *g, float *lg, const Toks *prompt) {
     }
     if (g->state == ST_TOOL) {
         /* unterminated tool call block: show it as text */
-        buf_add(&g->content, "<|tool_call_start|>", -1);
+        buf_add(&g->content, S.lfm3 ? "<tool_call>" : "<|tool_call_start|>", -1);
         buf_add(&g->content, g->toolraw.s ? g->toolraw.s : "", g->toolraw.n);
     }
     if (g->finish == FIN_STOP && g->ncalls) g->finish = FIN_TOOLS;
@@ -1359,8 +1589,9 @@ void server_attach(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *t
     S.t_eot = tok_find(tk, "<|endoftext|>");
     S.t_eos = tok_eos(tk);
     S.t_think_end = tok_find(tk, "</think>");
-    S.t_tc_start = tok_find(tk, "<|tool_call_start|>");
-    S.t_tc_end = tok_find(tk, "<|tool_call_end|>");
+    S.lfm3 = !strcmp(m->arch, "lfm3");
+    S.t_tc_start = tok_find(tk, S.lfm3 ? "<tool_call>" : "<|tool_call_start|>");
+    S.t_tc_end = tok_find(tk, S.lfm3 ? "</tool_call>" : "<|tool_call_end|>");
     S.rng = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ull | 1;
 }
 

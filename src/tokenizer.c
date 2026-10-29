@@ -250,7 +250,22 @@ void tok_free(Tokenizer *t) {
 /* ------------------------------------------------------------------ BPE */
 
 static int bpe_word(const Tokenizer *t, const unsigned char *s, int n, int *out, int max_out, int count) {
-    /* no whole-word shortcut: always apply merges in rank order, like the reference BPE */
+    /* ignore_merges (tokenizer.json of LFM2 / LFM2.5 / LFM3, llama.cpp for the lfm2 pre-tokenizer):
+     * a word that is itself in the vocabulary is one token, even where the merges would split it */
+    if (n <= 64) { /* the vocabulary holds the byte-level form: each byte as its own symbol's text */
+        char enc[64 * 2];
+        int el = 0, ok = 1;
+        for (int i = 0; i < n && ok; i++) {
+            const int bt = t->byte_tok[s[i]];
+            if (bt < 0 || t->text_len[bt] > 2) ok = 0;
+            else { memcpy(enc + el, t->text[bt], (size_t)t->text_len[bt]); el += t->text_len[bt]; }
+        }
+        const int whole = ok ? vocab_lookup(t, enc, el) : -1;
+        if (whole >= 0 && t->type[whole] != TT_CONTROL) {
+            if (count < max_out) out[count] = whole;
+            return count + 1;
+        }
+    }
     int stack_sym[256];
     int *sym = n <= 256 ? stack_sym : (int *)malloc(sizeof(int) * n);
     int ns = n;

@@ -1,4 +1,4 @@
-/* model.h - LFM2 / LFM2-MoE hybrid (short-conv + GQA attention + sparse MoE) forward pass. */
+/* model.h - LFM2 / LFM2-MoE / LFM3 hybrid (short-conv + GQA attention + sparse MoE) forward pass. */
 #ifndef PITHOS_MODEL_H
 #define PITHOS_MODEL_H
 
@@ -16,15 +16,17 @@ typedef struct {
 } Mat;
 
 typedef struct {
-    int is_attn, is_moe;
+    int is_attn, is_moe, is_swa;    /* is_swa: sliding-window attention (LFM3) */
     int attn_idx, conv_idx;
     const float *attn_norm, *ffn_norm;
+    const float *post_op_norm, *post_ffn_norm;  /* LFM3 sandwich norms, or NULL */
     /* short conv */
     Mat in_proj, out_proj;
     const float *conv_w;            /* [dim][l_cache] */
     /* attention */
     Mat wq, wk, wv, wo;
     const float *q_norm, *k_norm;
+    Mat attn_gate;                  /* LFM3: per-head sigmoid output gate [n_head][dim], or no data */
     /* dense ffn */
     Mat w_gate, w_up, w_down;
     /* moe */
@@ -40,7 +42,10 @@ typedef struct {
     int ff_dense, ff_exp, n_expert, n_expert_used, l_cache, n_ctx_train;
     int gating;                     /* 1 softmax, 2 sigmoid */
     int norm_topk;
-    float eps, rope_base;
+    float eps, rope_base, rope_base_swa;
+    const float *rope_freqs;        /* per-frequency divisors of the full-attention layers, or NULL */
+    int swa_window;                 /* sliding-window size of is_swa layers (tokens, current one included) */
+    int add_bos;                    /* tokenizer.ggml.add_bos_token (default 1) */
     Mat embed, output;
     const float *final_norm;
     Layer *layers;
