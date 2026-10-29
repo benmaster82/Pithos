@@ -1,0 +1,14 @@
+# Models that build.sh can download (bash build.sh --list-models).
+#
+# One model per line, fields separated by TABs:
+#   id  file  bytes  sha256  status  ram_gb  url  description
+# - id: the name passed to --download-model=ID (lower case, digits, '.', '-').
+# - file: the name it gets in models/ (no folders).
+# - bytes, sha256: the exact file; a download that does not match is never put in place.
+# - status: validated (checked against a reference: tokenizer, perplexity, chat template)
+#   or experimental (loads and runs, not checked yet; downloaded only when named).
+# - ram_gb: RAM for comfortable use (larger models also run from disk, more slowly).
+# - url: https, pinned to a repository revision, so the bytes cannot change under the same name.
+# The first validated line is the default of a plain --download-model.
+lfm2.5-24b	LFM2.5-24B-A2B-Q4_K_M.gguf	14526258464	d3334405b96228eb9908cdebb5c6194908f2da64282bda852afc3a3910c64e7d	validated	16	https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF/resolve/0912d33141f77e10705345a6732bfd83f0252fdc/LFM2.5-24B-A2B-Q4_K_M.gguf	LFM2.5 24B MoE (2B active): the reference model
+lfm3-1.7b	LFM3-1.7B-Q4_K_M.gguf	1099627808	3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4	validated	4	https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/bad5729bba61d076fff20d2548e62526665af215/LFM3-1.7B-Q4_K_M.gguf	LFM3 1.7B dense: small and fast

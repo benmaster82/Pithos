@@ -77,7 +77,8 @@ Both are real sessions with LFM2.5-24B-A2B on the reference laptop (i5-10500H, G
 ## Quick start
 
 1. **Get the model** (see [Downloading the model](#downloading-the-model) below).
-   On Linux, `bash build.sh --download-model` can handle both the build and this download.
+   On Linux, `bash build.sh --download-model` can handle both the build and this download
+   (`--download-model=lfm3-1.7b` for the small model, `--list-models` for the choices).
 2. **Build.** On Windows run `build.cmd`; on Linux run `bash build.sh`; on macOS run `make`
    (see [Building](#building)). You can compile before downloading the model.
 3. **Run.**
@@ -239,7 +240,10 @@ other package-manager paths still need validation on their distributions.
 
 ```bash
 bash build.sh --test             # build the C tests and run the shell tests
+bash build.sh --list-models      # the models it can download (models.tsv), without building
 bash build.sh --download-model   # also download/verify the reference 24B model
+bash build.sh --download-model=lfm3-1.7b              # the small model instead (1.0 GiB)
+bash build.sh --download-model=lfm3-1.7b,lfm2.5-24b   # both
 bash build.sh --no-install       # build without installing anything (offline/CI)
 bash build.sh --yes --test       # allow missing-package installation without prompting
 bash build.sh --native --jobs 4  # optimize for this CPU; not for distributing binaries
@@ -256,7 +260,11 @@ keep the package database and system up to date using the normal distribution pr
 The output is **`build/pithos`**. No model, Python, OpenCL SDK or GPU driver is
 needed to compile. Model download is opt-in; the script does not install GPU drivers.
 Use `bash build.sh --download-model` (or combine it with `--test`) to fetch the
-13.5 GiB reference model into `models/`. The script pins the Hugging Face revision,
+13.5 GiB reference model into `models/`, or `--download-model=ID[,ID...]` for the models
+listed by `--list-models`. The list lives in **`models.tsv`**: one line per model with its
+file name, exact size, SHA-256, a revision-pinned https URL and a status (`validated` models
+were checked against a reference; `experimental` ones are only downloaded when named).
+Adding a model is one line there. For every model the script pins the Hugging Face revision,
 checks free disk space, resumes interrupted transfers in a `.gguf.part` file, and
 verifies the exact size and SHA-256 before renaming it to `.gguf`. An existing valid
 model is verified and reused; an invalid existing model is preserved and reported

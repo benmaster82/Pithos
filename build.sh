@@ -12,7 +12,10 @@ If prerequisites are missing, show the package commands and ask before installin
   --yes          Allow installation of missing prerequisites without confirmation
   --no-install   Never install packages (also suitable for offline builds)
   --test         Also build the C tests and run test_shell in a temporary folder
-  --download-model  Download/verify the reference 24B GGUF (13.5 GiB) in models/
+  --download-model[=ID[,ID...]]
+                 Download/verify models in models/: by default the reference 24B
+                 (13.5 GiB); --download-model=lfm3-1.7b gets the small one (1.0 GiB)
+  --list-models  List the downloadable models (models.tsv) and exit without building
   --native       Optimize for this CPU; do not use for distributable binaries
   --jobs N       Parallel build jobs, 1-256 (default: detected CPU count, max 256)
   -h, --help     Show this help
@@ -31,19 +34,21 @@ allow_install=0
 no_install=0
 run_tests=0
 download_model=0
+download_ids=
+list_models=0
 native=0
 jobs=
-# Pin the source revision as well as the expected bytes: updates must be explicit.
-model_name=LFM2.5-24B-A2B-Q4_K_M.gguf
-model_size=14526258464
-model_sha256=d3334405b96228eb9908cdebb5c6194908f2da64282bda852afc3a3910c64e7d
-model_url=https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF/resolve/0912d33141f77e10705345a6732bfd83f0252fdc/LFM2.5-24B-A2B-Q4_K_M.gguf
 while (($#)); do
     case "$1" in
         --yes) allow_install=1 ;;
         --no-install) no_install=1 ;;
         --test) run_tests=1 ;;
         --download-model) download_model=1 ;;
+        --download-model=*)
+            download_model=1
+            download_ids=${1#--download-model=}
+            [[ $download_ids =~ ^[a-z0-9.,-]+$ ]] || option_error '--download-model= needs model ids (see --list-models).' ;;
+        --list-models) list_models=1 ;;
         --native) native=1 ;;
         --jobs)
             (($# >= 2)) || option_error '--jobs needs a number.'
@@ -66,6 +71,93 @@ esac
 
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 [[ -f "$repo/Makefile" && -f "$repo/src/main.c" ]] || die 'Keep build.sh in the Pithos source folder.'
+# ---------------------------------------------------------------- model catalog
+# models.tsv pins every model: file name, exact size, SHA-256 and a revision-pinned URL.
+catalog=$repo/models.tsv
+cat_id=() cat_file=() cat_bytes=() cat_sha=() cat_status=() cat_ram=() cat_url=() cat_desc=()
+default_model=-1
+load_catalog() {
+    ((${#cat_id[@]} == 0)) || return 0
+    [[ -f $catalog ]] || die "Model catalog not found: $catalog"
+    local line n=0 i id file bytes sha status ram url desc extra
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        line=${line%$'\r'}
+        [[ -z $line || $line == '#'* ]] && continue
+        IFS=$'\t' read -r id file bytes sha status ram url desc extra <<< "$line"
+        [[ $id =~ ^[a-z0-9][a-z0-9.-]{0,63}$ ]] || die "models.tsv line $n: invalid id '$id'."
+        [[ $file =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,200}\.gguf$ ]] || die "models.tsv line $n: invalid file name '$file'."
+        [[ $bytes =~ ^[1-9][0-9]{0,15}$ ]] || die "models.tsv line $n: invalid size '$bytes'."
+        [[ $sha =~ ^[0-9a-f]{64}$ ]] || die "models.tsv line $n: invalid SHA-256."
+        [[ $status == validated || $status == experimental ]] || die "models.tsv line $n: status must be validated or experimental."
+        [[ $ram =~ ^[0-9]{1,4}$ ]] || die "models.tsv line $n: invalid RAM size '$ram'."
+        [[ $url == https://* && $url != *[[:space:]]* ]] || die "models.tsv line $n: the URL must be https."
+        [[ -z $extra ]] || die "models.tsv line $n: too many fields."
+        for ((i = 0; i < ${#cat_id[@]}; i++)); do
+            [[ ${cat_id[i]} != "$id" && ${cat_file[i]} != "$file" ]] || die "models.tsv line $n: duplicate id or file name."
+        done
+        if ((default_model < 0)) && [[ $status == validated ]]; then default_model=${#cat_id[@]}; fi
+        cat_id+=("$id") cat_file+=("$file") cat_bytes+=("$bytes") cat_sha+=("$sha")
+        cat_status+=("$status") cat_ram+=("$ram") cat_url+=("$url") cat_desc+=("$desc")
+    done < "$catalog"
+    ((default_model >= 0)) || die 'models.tsv lists no validated model.'
+}
+
+# index of a catalog id, or -1
+model_index() {
+    local i
+    for ((i = 0; i < ${#cat_id[@]}; i++)); do
+        if [[ ${cat_id[i]} == "$1" ]]; then printf '%d' "$i"; return; fi
+    done
+    printf '%d' -1
+}
+
+format_size() {
+    local tenths
+    if (($1 >= 1073741824)); then
+        tenths=$((($1 * 10 + 536870912) / 1073741824))
+        printf '%d.%d GiB' $((tenths / 10)) $((tenths % 10))
+    else
+        printf '%d MiB' $((($1 + 524288) / 1048576))
+    fi
+}
+
+list_catalog() {
+    local i mark
+    printf '%-12s %-9s %-7s %-12s %s\n' ID SIZE RAM STATUS DESCRIPTION
+    for ((i = 0; i < ${#cat_id[@]}; i++)); do
+        mark=
+        ((i != default_model)) || mark=' (default)'
+        [[ ! -f $repo/models/${cat_file[i]} ]] || mark+=' [in models/]'
+        printf '%-12s %-9s %-7s %-12s %s%s\n' "${cat_id[i]}" "$(format_size "${cat_bytes[i]}")" "${cat_ram[i]} GB" \
+            "${cat_status[i]}" "${cat_desc[i]}" "$mark"
+    done
+    printf '\nDownload: bash build.sh --download-model=ID[,ID...]   (plain --download-model: %s)\n' "${cat_id[default_model]}"
+}
+
+selected=()
+if ((list_models || download_model)); then
+    load_catalog
+    if ((download_model)); then
+        if [[ -z $download_ids ]]; then
+            selected=("$default_model")
+        else
+            IFS=, read -r -a wanted <<< "$download_ids"
+            for want in "${wanted[@]}"; do
+                [[ -n $want ]] || continue
+                index=$(model_index "$want")
+                ((index >= 0)) || option_error "Unknown model: $want. Run bash build.sh --list-models."
+                [[ " ${selected[*]} " == *" $index "* ]] || selected+=("$index")
+            done
+            ((${#selected[@]})) || option_error '--download-model= needs model ids (see --list-models).'
+        fi
+    fi
+fi
+if ((list_models)); then
+    list_catalog
+    exit 0
+fi
+
 if [[ -z $jobs ]]; then
     jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')
     [[ $jobs =~ ^[1-9][0-9]{0,5}$ ]] || jobs=2
@@ -208,15 +300,19 @@ install_prerequisites() {
     hash -r
 }
 
+# verify_model_file PATH BYTES SHA256
 verify_model_file() {
     local size digest
     size=$(stat -Lc '%s' -- "$1") || return 1
-    [[ $size == "$model_size" ]] || return 1
+    [[ $size == "$2" ]] || return 1
     digest=$(sha256sum < "$1") || return 1
-    [[ ${digest%% *} == "$model_sha256" ]]
+    [[ ${digest%% *} == "$3" ]]
 }
 
-download_reference_model() {
+# fetch_model INDEX: download (or reuse) one catalog model, verified before it is put in place
+fetch_model() {
+    local model_id=${cat_id[$1]} model_name=${cat_file[$1]} model_size=${cat_bytes[$1]}
+    local model_sha256=${cat_sha[$1]} model_url=${cat_url[$1]}
     local tool directory model partial lock partial_size=0 free_kb='' available df_output required
     for tool in sha256sum stat df mkdir rmdir mv; do
         command -v "$tool" >/dev/null 2>&1 || die "--download-model requires $tool (GNU coreutils). Install it and retry."
@@ -233,9 +329,11 @@ download_reference_model() {
 
     if [[ -e $model || -L $model ]]; then
         [[ -f $model ]] || die "Model path is not a regular file: $model"
-        say 'Checking the existing reference model (size and SHA-256)...'
-        verify_model_file "$model" || die "Existing model failed verification: $model. It was not changed. Move it aside or remove it before retrying."
+        say "Checking the existing $model_name (size and SHA-256)..."
+        verify_model_file "$model" "$model_size" "$model_sha256" || die "Existing model failed verification: $model. It was not changed. Move it aside or remove it before retrying."
         say "Verified model already available: $model"
+        rmdir -- "$lock" 2>/dev/null || true
+        model_lock=
         return
     fi
     [[ ! -L $partial ]] || die "Refusing a symbolic link as a partial download: $partial"
@@ -254,21 +352,47 @@ download_reference_model() {
         # Existing partial data is already allocated; allow an extra 64 MiB margin.
         required=$((model_size - partial_size + 64 * 1024 * 1024))
         ((free_kb * 1024 >= required)) || die "Not enough free space: need at least $(((required + 1048575) / 1048576)) MiB more on the models filesystem."
-        say "Downloading $model_name (13.5 GiB; resuming from $partial_size bytes)..."
+        say "Downloading $model_name ($(format_size "$model_size"); resuming from $partial_size bytes)..."
         printf 'Source: %s\n' "$model_url"
         if ! curl --fail --location --show-error --progress-bar \
             --proto '=https' --proto-redir '=https' \
             --continue-at - --retry 5 --retry-delay 3 --connect-timeout 20 \
             --speed-limit 1024 --speed-time 60 --output "$partial" "$model_url"; then
-            die "Download failed. Partial data is kept in $partial. Rerun with --download-model to resume."
+            die "Download failed. Partial data is kept in $partial. Rerun with --download-model=$model_id to resume."
         fi
     fi
     say 'Verifying downloaded model size and SHA-256...'
-    verify_model_file "$partial" || die "Model verification failed. $partial was kept for inspection; move it aside or remove it and retry. No final model was created."
+    verify_model_file "$partial" "$model_size" "$model_sha256" || die "Model verification failed. $partial was kept for inspection; move it aside or remove it and retry. No final model was created."
     # Same-filesystem rename only after verification; never replace another file.
     mv -nT -- "$partial" "$model" || die 'Could not place the verified model in models/.'
     [[ ! -e $partial ]] || die 'A model file appeared during the download. Both files were preserved; inspect models/ before retrying.'
     say "Verified model ready: $model"
+    rmdir -- "$lock" 2>/dev/null || true
+    model_lock=
+}
+
+# How to start each catalog model found in models/ (the default one needs no -m).
+print_run_hints() {
+    local i found=0
+    if [[ -f $catalog ]]; then
+        load_catalog
+        for ((i = 0; i < ${#cat_id[@]}; i++)); do
+            [[ -f $repo/models/${cat_file[i]} ]] || continue
+            if ((found == 0)); then printf '\nTo start, from the Pithos folder:\n'; fi
+            found=1
+            if ((i == default_model)); then
+                printf '  ./build/pithos -p "Hello"   # %s (default model)\n' "${cat_id[i]}"
+            else
+                printf '  ./build/pithos -m models/%s -p "Hello"   # %s\n' "${cat_file[i]}" "${cat_id[i]}"
+            fi
+        done
+    fi
+    if ((found == 0)); then
+        printf 'No model in models/ yet. See the choices with: bash build.sh --list-models\n'
+        printf 'then download one, e.g.: bash build.sh --download-model=lfm3-1.7b\n'
+    else
+        printf 'The GPU is used when an OpenCL driver is available; --no-gpu runs on the CPU only.\n'
+    fi
 }
 
 say 'Checking Linux build prerequisites...'
@@ -300,9 +424,7 @@ if ((run_tests)); then
 fi
 
 say "Build complete: $repo/build/pithos"
-if ((download_model)); then
-    download_reference_model
-else
-    printf 'No model was downloaded. Follow README.md or rerun with --download-model.\n'
-fi
-printf 'Then, from the Pithos folder: ./build/pithos --no-gpu -p "Hello"\n'
+for index in "${selected[@]}"; do
+    fetch_model "$index"
+done
+print_run_hints

@@ -102,6 +102,7 @@ class BuildScriptTests(unittest.TestCase):
         (self.repo / 'src/main.c').touch()
         (self.repo / 'Makefile').touch()
         shutil.copy(Path(__file__).resolve().parents[1] / 'build.sh', self.repo / 'build.sh')
+        shutil.copy(Path(__file__).resolve().parents[1] / 'models.tsv', self.repo / 'models.tsv')
         dispatcher = self.bin / 'dispatcher'
         dispatcher.write_text(DISPATCHER)
         dispatcher.chmod(0o755)
@@ -134,19 +135,25 @@ class BuildScriptTests(unittest.TestCase):
     def builds(self):
         return [e for e in self.events('make') if e['args'] != ['--version']]
 
+    def write_catalog(self, rows):
+        lines = ['# disposable test catalog'] + ['\t'.join(row) for row in rows]
+        (self.repo / 'models.tsv').write_text('\n'.join(lines) + '\n')
+
     def configure_download(self):
-        """Use a small fixture in this disposable script, never in production."""
+        """Use a small fixture in this disposable catalog, never in production."""
         self.payload = b'GGUF-download-regression-fixture\n' * 32
         payload_path = self.root / 'model-payload'
         payload_path.write_bytes(self.payload)
         self.env['MOCK_DOWNLOAD_SOURCE'] = str(payload_path)
-        script = self.repo / 'build.sh'
-        text = script.read_text().replace('model_size=14526258464', f'model_size={len(self.payload)}')
-        text = text.replace('model_sha256=d3334405b96228eb9908cdebb5c6194908f2da64282bda852afc3a3910c64e7d',
-                            'model_sha256=' + hashlib.sha256(self.payload).hexdigest())
-        script.write_text(text)
+        size, digest = str(len(self.payload)), hashlib.sha256(self.payload).hexdigest()
+        self.rows = [
+            ['lfm2.5-24b', 'LFM2.5-24B-A2B-Q4_K_M.gguf', size, digest, 'validated', '16', 'https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF/resolve/0912d33141f77e10705345a6732bfd83f0252fdc/LFM2.5-24B-A2B-Q4_K_M.gguf', 'big model'],
+            ['lfm3-1.7b', 'LFM3-1.7B-Q4_K_M.gguf', size, digest, 'validated', '4', 'https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/bad5729bba61d076fff20d2548e62526665af215/LFM3-1.7B-Q4_K_M.gguf', 'small model'],
+        ]
+        self.write_catalog(self.rows)
         directory = self.repo / 'models'
         directory.mkdir()
+        self.small = directory / 'LFM3-1.7B-Q4_K_M.gguf'
         self.model = directory / 'LFM2.5-24B-A2B-Q4_K_M.gguf'
         self.partial = Path(str(self.model) + '.part')
         self.lock = Path(str(self.model) + '.download.lock')
@@ -282,11 +289,12 @@ class BuildScriptTests(unittest.TestCase):
                     thread = threading.Thread(target=server.serve_forever, daemon=True)
                     thread.start()
                     # This disposable test copy uses a local HTTP fixture. Production stays HTTPS-only.
+                    rows = [list(row) for row in self.rows]
+                    rows[0][6] = f'http://127.0.0.1:{server.server_port}/model'
+                    self.write_catalog(rows)
                     script = self.repo / 'build.sh'
-                    lines = script.read_text().splitlines()
-                    text = '\n'.join(f'model_url=http://127.0.0.1:{server.server_port}/model' if line.startswith('model_url=')
-                                     else line for line in lines) + '\n'
-                    script.write_text(text.replace("'=https'", "'=http,https'"))
+                    text = script.read_text().replace("'=https'", "'=http,https'")
+                    script.write_text(text.replace('$url == https://*', '$url == http*://*'))
                     try:
                         result = self.run_build('--no-install', '--download-model')
                     finally:
@@ -301,6 +309,74 @@ class BuildScriptTests(unittest.TestCase):
                     self.assertFalse(self.model.exists())
                     self.assertEqual(self.partial.read_bytes(), payload[:100])
                 self.assertFalse(self.lock.exists())
+
+    def test_list_models_reads_the_real_catalog_without_building(self):
+        result = self.run_build('--list-models')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for text in ('lfm2.5-24b', 'lfm3-1.7b', '(default)', '13.5 GiB', '1.0 GiB', 'validated'):
+            self.assertIn(text, result.stdout)
+        self.assertFalse(self.builds())
+        self.assertFalse(self.events('curl'))
+        self.assertFalse(self.events('apt-get'))
+
+    def test_named_model_is_downloaded_alone(self):
+        self.configure_download()
+        result = self.run_build('--no-install', '--download-model=lfm3-1.7b')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.small.read_bytes(), self.payload)
+        self.assertFalse(self.model.exists())
+        self.assertEqual(len(self.events('curl')), 1)
+        self.assertIn('/bad5729bba61d076fff20d2548e62526665af215/', self.events('curl')[0]['args'][-1])
+        self.assertIn('-m models/LFM3-1.7B-Q4_K_M.gguf', result.stdout)
+        self.assertFalse(list(self.small.parent.glob('*.lock')))
+
+    def test_several_models_in_one_run(self):
+        self.configure_download()
+        result = self.run_build('--no-install', '--download-model=lfm3-1.7b,lfm2.5-24b,lfm3-1.7b')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.small.read_bytes(), self.payload)
+        self.assertEqual(self.model.read_bytes(), self.payload)
+        self.assertEqual(len(self.events('curl')), 2)
+        self.assertIn('./build/pithos -p "Hello"', result.stdout)
+        self.assertFalse(list(self.model.parent.glob('*.lock')))
+
+    def test_unknown_model_is_an_option_error(self):
+        self.configure_download()
+        for arg in ('--download-model=missing', '--download-model=', '--download-model=../x'):
+            with self.subTest(arg=arg):
+                self.assertEqual(self.run_build('--no-install', arg).returncode, 2)
+        self.assertFalse(self.builds())
+        self.assertFalse(self.events('curl'))
+
+    def test_invalid_catalog_stops_before_any_download_or_build(self):
+        self.configure_download()
+        cases = {'invalid file name': (1, '../escape.gguf'), 'invalid SHA-256': (3, 'abc'),
+                 'URL must be https': (6, 'http://example.com/m.gguf'), 'status must be': (4, 'maybe')}
+        for message, (field, value) in cases.items():
+            with self.subTest(message=message):
+                rows = [list(row) for row in self.rows]
+                rows[1][field] = value
+                self.write_catalog(rows)
+                result = self.run_build('--no-install', '--download-model')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+        self.assertFalse(self.builds())
+        self.assertFalse(self.events('curl'))
+
+    def test_default_is_the_first_validated_model(self):
+        self.configure_download()
+        experimental = ['x-exp', 'X-EXP.gguf'] + self.rows[1][2:4] + ['experimental', '1', self.rows[1][6], 'not yet checked']
+        self.write_catalog([experimental, self.rows[1], self.rows[0]])
+        result = self.run_build('--no-install', '--download-model')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.small.exists())
+        self.assertFalse((self.small.parent / 'X-EXP.gguf').exists())
+
+    def test_without_models_the_hint_points_to_the_list(self):
+        result = self.run_build('--no-install')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--list-models', result.stdout)
+        self.assertIn('--download-model=lfm3-1.7b', result.stdout)
 
     def test_ready_environment_builds_from_other_directory_with_spaces(self):
         result = self.run_build('--no-install', '--jobs', '2')
