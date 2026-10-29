@@ -21,8 +21,8 @@
   <link rel="stylesheet" href="engine.css">
   <link rel="stylesheet" href="simple.css">
   <link rel="stylesheet" href="effects.css?v=2">
-  <link rel="stylesheet" href="models.css?v=1">
-  <script src="app.js?v=3" defer></script>
+  <link rel="stylesheet" href="models.css?v=2">
+  <script src="app.js?v=4" defer></script>
   <script src="effects.js?v=2" defer></script>
 </head>
 <body>
@@ -72,12 +72,12 @@
               <div><dt>Download</dt><dd id="model-size">14.5 GB</dd></div>
               <div><dt>RAM</dt><dd id="model-ram">16 GB</dd></div>
               <div><dt>With a GPU</dt><dd id="model-gpu">12–22 tok/s</dd></div>
-              <div><dt>CPU only</dt><dd id="model-cpu">5–8 tok/s</dd></div>
+              <div><dt>CPU only</dt><dd id="model-cpu">5–8 tok/s<small>benchmark 11–15</small></dd></div>
             </dl>
             <p class="model-blurb" id="model-blurb">24 billion parameters, about 2 billion active per token. The deepest answers; runs from disk when RAM is short.</p>
           </div>
           <div class="terminal-launch"><div class="terminal-launch-label"><span>START COMMAND</span><span id="hero-context">WINDOWS / NATIVE</span></div><div class="terminal-command"><span id="hero-prompt" aria-hidden="true">PS&gt;</span><code id="hero-code">.\build\pithos.exe --server</code><button class="copy-button icon-only" data-copy-target="hero-code" aria-label="Copy the startup command"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg></button></div></div>
-          <p class="model-foot">Speeds measured on a laptop: Core i5-10500H, 16 GB, GTX 1650 4 GB. The setup guide below follows your choice.</p>
+          <p class="model-foot">Speeds of real generation on a laptop: Core i5-10500H, 16 GB, GTX 1650 4 GB. The benchmark repeats one short context, so the experts it needs stay in RAM. The setup guide below follows your choice.</p>
         </div>
       </div>
     </section>

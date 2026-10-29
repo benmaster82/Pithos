@@ -11,6 +11,7 @@
 .model-stats div{background:#0b1118;padding:14px 12px}
 .model-stats dt{font:10px/1.4 var(--mono);letter-spacing:.6px;text-transform:uppercase;color:var(--muted)}
 .model-stats dd{margin:6px 0 0;font:600 19px/1.2 var(--sans);color:var(--ink);letter-spacing:-.3px;white-space:nowrap}
+.model-stats dd small{display:block;margin-top:5px;font:400 11px/1.3 var(--mono);letter-spacing:0;color:var(--muted)}
 .model-blurb{margin:16px 2px 0;font-size:15px;line-height:1.7;color:var(--ink)}
 .model-foot{margin:0;padding:0 18px 16px;font:11px/1.7 var(--mono);color:var(--muted)}
 .model-hero .terminal-launch{margin:16px 18px 14px}
