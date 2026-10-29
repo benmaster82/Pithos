@@ -113,15 +113,49 @@ static int *encode(const Tokenizer *tk, const char *text, int *n_out) {
     return ids;
 }
 
+typedef struct { char path[16][512]; int n; const char *dir; } FoundModels;
+
+static void collect_gguf(const char *name, void *u) {
+    FoundModels *f = (FoundModels *)u;
+    const size_t l = strlen(name);
+    if (l <= 5 || strcmp(name + l - 5, ".gguf")) return; /* also skips unfinished *.gguf.part */
+    if (f->n < 16) snprintf(f->path[f->n], sizeof(f->path[0]), "%s/%s", f->dir, name);
+    f->n++;
+}
+
+/* Without -m: the reference model if it is there, otherwise the only GGUF in the model folders.
+ * With several, or none, it says what it found and returns NULL. */
 static const char *default_model_path(void) {
-    static const char *cands[] = {
-        "models/LFM2.5-24B-A2B-Q4_K_M.gguf",
-        "../models/LFM2.5-24B-A2B-Q4_K_M.gguf",
-        "../../models/LFM2.5-24B-A2B-Q4_K_M.gguf",
-    };
-    for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]); i++) {
-        FILE *f = fopen(cands[i], "rb");
-        if (f) { fclose(f); return cands[i]; }
+    static const char *dirs[] = { "models", "../models", "../../models" };
+    static const char *ref = "LFM2.5-24B-A2B-Q4_K_M.gguf";
+    static char path[512];
+    const int nd = (int)(sizeof(dirs) / sizeof(dirs[0]));
+    for (int i = 0; i < nd; i++) {
+        snprintf(path, sizeof(path), "%s/%s", dirs[i], ref);
+        FILE *f = fopen(path, "rb");
+        if (f) { fclose(f); return path; }
+    }
+    static FoundModels found;
+    found.n = 0;
+    for (int i = 0; i < nd; i++) {
+        found.dir = dirs[i];
+        dir_list(dirs[i], collect_gguf, &found);
+    }
+    if (found.n == 1) {
+        snprintf(path, sizeof(path), "%s", found.path[0]);
+        fprintf(stderr, "no -m given: using the only model found, %s\n", path);
+        return path;
+    }
+    if (found.n > 1) {
+        qsort(found.path, (size_t)(found.n < 16 ? found.n : 16), sizeof(found.path[0]),
+              (int (*)(const void *, const void *))strcmp); /* the same order on every OS */
+        fprintf(stderr, "no -m given and %d models found; choose one:\n", found.n);
+        for (int i = 0; i < found.n && i < 16; i++) fprintf(stderr, "  -m %s\n", found.path[i]);
+        if (found.n > 16) fprintf(stderr, "  ...\n");
+    } else {
+        fprintf(stderr, "no model found in models/ (also looked in ../models and ../../models).\n"
+                        "Download one (README: \"Downloading the model\"; on Linux: bash build.sh --list-models)\n"
+                        "or pass its path with -m PATH.\n");
     }
     return NULL;
 }
@@ -130,7 +164,8 @@ static void usage(void) {
     printf(
         "Pithos " VERSION " - dependency-free C inference engine for LFM2 / LFM2-MoE GGUF models\n\n"
         "usage: pithos [options]\n"
-        "  -m, --model PATH        GGUF model (default: models/LFM2.5-24B-A2B-Q4_K_M.gguf)\n"
+        "  -m, --model PATH        GGUF model (default: models/LFM2.5-24B-A2B-Q4_K_M.gguf, else the only\n"
+        "                          .gguf in models/; also looked up in ../models and ../../models)\n"
         "  -p, --prompt TEXT       single prompt (chat template applied), then exit\n"
         "  -f, --file PATH         read the prompt from a file\n"
         "  -s, --system TEXT       system prompt\n"
@@ -609,7 +644,7 @@ static int real_main(int argc, char **argv) {
     if (!a.threads) a.threads = si.n_physical;
     if (a.tools_list || a.tool_name) return tools_cli(&a);
     if (!a.model) a.model = default_model_path();
-    if (!a.model) { fprintf(stderr, "model not found: use -m PATH\n"); return 1; }
+    if (!a.model) return 1; /* default_model_path said why */
 
     fprintf(stderr, "Pithos %s | CPU: %s | %d core / %d thread | RAM %.1f GB (%.1f GB free)\n", VERSION,
             si.brand[0] ? si.brand : "?", si.n_physical, si.n_logical, si.total_ram / 1073741824.0,

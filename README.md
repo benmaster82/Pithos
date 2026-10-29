@@ -540,7 +540,7 @@ checkpoint and only processes the rest:
 
 | Option | Effect |
 |---|---|
-| `-m PATH` | GGUF file (default `models/LFM2.5-24B-A2B-Q4_K_M.gguf`, also looked up in `..` and `../..`) |
+| `-m PATH` | GGUF file. Without it: `models/LFM2.5-24B-A2B-Q4_K_M.gguf` if present, otherwise the only `.gguf` in `models/`; with several, Pithos lists them. Also looked up in `../models` and `../../models` |
 | `-p TEXT` / `-f FILE` | single prompt with the model's chat template |
 | `-i` | interactive chat (default without a prompt). Commands `/reset`, `/exit` |
 | `-s TEXT` | system prompt |
