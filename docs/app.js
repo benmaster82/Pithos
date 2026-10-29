@@ -6,7 +6,7 @@ const MODELS = {
   big:{id:'lfm2.5-24b',name:'LFM2.5-24B-A2B',file:'LFM2.5-24B-A2B-Q4_K_M.gguf',
     url:'https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF/resolve/0912d33141f77e10705345a6732bfd83f0252fdc/LFM2.5-24B-A2B-Q4_K_M.gguf',
     hash:'d3334405b96228eb9908cdebb5c6194908f2da64282bda852afc3a3910c64e7d',
-    download:'14.5 GB',ram:'16',gpu:'12–22 tok/s',cpu:'~3 tok/s',
+    download:'14.5 GB',ram:'16',gpu:'12–22 tok/s',cpu:'5–8 tok/s',
     disk:'At least 15 GB free for the model',diskDetail:'About 14.5 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
     blurb:'24 billion parameters, about 2 billion active per token. The deepest answers; runs from disk when RAM is short.'},
   small:{id:'lfm3-1.7b',name:'LFM3-1.7B',file:'LFM3-1.7B-Q4_K_M.gguf',
