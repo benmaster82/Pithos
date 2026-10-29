@@ -1,4 +1,8 @@
 /* Content-led presentation: restrained type, flat surfaces, direct navigation. */
+:root{--paper:#000;--dark:#000}
+body{background:#000}
+.site-header{background:rgba(0,0,0,.96)}
+.terminal-launch{background:#000}
 body{font-family:var(--sans)}
 h1,h2,h3,.hero h1 em,.setup-intro h2{font-family:var(--sans);font-style:normal}
 .hero:before,.terminal-stage:before,.local-stamp,.visual-label,.terminal-topline,.terminal-stage-footer,.closing-decoration{display:none}
