@@ -9,6 +9,7 @@ The English landing page is published automatically by GitHub Pages from
 - `theme-hack.css`: terminal-inspired colors taken from the Pithos banner.
 - `engine.css`: ice-white typography, architecture diagram, and technical tables.
 - `simple.css`: restrained presentation, responsive typography, and flat surfaces.
+- `effects.js` / `effects.css`: decorative ASCII logo projection and inference pulses, with pause and reduced-motion support.
 - `app.js`: installation guide, CPU/GPU diagram, tabs, clipboard, and local progress storage.
 - `assets/`: original project graphics and self-hosted fonts with license files.
 
