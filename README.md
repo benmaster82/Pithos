@@ -36,7 +36,7 @@ Pithos is an inference engine written from scratch in C11 with **no dependencies
 libraries at build time, only the operating system API (Win32 or POSIX). It runs GGUF models of
 Liquid AI's LFM2 / LFM2-MoE / LFM3 architectures and is tuned for `LFM2.5-24B-A2B-Q4_K_M.gguf`
 (24 billion parameters, about 2 billion active per token) on an ordinary laptop. The small
-[LFM3-1.7B](#lfm3-17b-small-and-fast) runs too, on the CPU, at about 20 tokens per second.
+[LFM3-1.7B](#lfm3-17b-small-and-fast) runs too: about 55 tokens per second with the GPU, 20 on the CPU alone.
 
 **Pithos** is the engine and the server (in the myth, the *pithos* is Pandora's jar: it holds the
 model). **Pandora** is the agent in the web interface.
@@ -147,8 +147,10 @@ Pithos also rejects a truncated file and names the tensor that is missing.
 
 ### LFM3-1.7B: small and fast
 [LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B) is a 1.7-billion-parameter model
-that fits in 1.1 GB. It runs on the CPU (the GPU path covers MoE models), at about 20 tokens per
-second on the reference laptop, with the same chat, server, Pandora and terminal agent.
+that fits in 1.1 GB, with the same chat, server, Pandora and terminal agent. With a GPU every layer
+lives in VRAM (1.2 GB with a 8k context) and decoding runs there: about 55 tokens per second on the
+reference laptop (GTX 1650), against about 20 on the CPU alone. The prompt is read on the CPU
+(45-75 tokens per second).
 
 | | |
 |---|---|
@@ -572,8 +574,9 @@ without its reasoning is processed again.
 ### Other models
 Any GGUF of the `lfm2` (dense), `lfm2moe` or `lfm3` architecture loads, as long as its tensors use
 the supported formats: Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16, F32. BF16, Q2_K, Q3_K and IQ formats are
-not supported. GPU acceleration covers MoE models with Q4_K / Q6_K weights; dense models run on the
-CPU. Validated so far: LFM2.5-24B-A2B and LFM3-1.7B.
+not supported. GPU acceleration needs Q4_K / Q6_K weights: MoE models keep their hot experts and
+dense layers in VRAM, dense models (LFM3) all their layers. Validated so far: LFM2.5-24B-A2B and
+LFM3-1.7B.
 
 `lfm3` adds to LFM2: an RMSNorm on the output of every block before the residual sum (sandwich
 norm), a sigmoid gate per head on the attention output, sliding-window attention (256 tokens) on 5
@@ -669,6 +672,8 @@ for each of the 30 convolution layers.
 - LFM3-1.7B: perplexity against an independent PyTorch implementation written from the model's
   `modeling_lfm3.py`, on the same dequantized weights: 4.45 vs 4.39 with 256-token windows, 3.65
   vs 3.62 with 1024 (sliding window active). The gap is the int8 activations and the f16 KV cache.
+  On the GPU, token by token (`--ppl -b 1`): 4.390 / 3.622 with the f32 kernels, the reference's
+  4.390 / 3.621; 4.408 / 3.626 with the int8 (dp4a) ones.
 - `python tests/test_server.py` (with the server running): template against Jinja2, answers,
   streaming, prompt reuse across turns, tool calls, completions, stop strings, errors.
 - `python tests/versus.py [ROUNDS] [llama.cpp|llama.cpp-cuda]`: head-to-head with llama-server
@@ -696,7 +701,8 @@ for each of the 30 convolution layers.
 Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
 
 - Only the `lfm2` / `lfm2moe` / `lfm3` architectures. Formats Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16
-  and F32; on the GPU only Q4_K and Q6_K, and only for MoE models (LFM3 runs on the CPU).
+  and F32; on the GPU only Q4_K and Q6_K. On the GPU only decoding runs; the prompt is read on the
+  CPU.
 - LFM3's sliding-window layers keep the whole KV cache like the others (simpler; a ring buffer
   would save almost half of it at long contexts).
 - The NEON kernels and the GPU f32 path are written for ARM64/AMD/Intel, but have only been tested

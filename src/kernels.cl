@@ -437,7 +437,9 @@ __kernel void silu_mul(__global float *g, int n, int u_off) {
 /* Per-head RMSNorm + NEOX RoPE of q and k (cos/sin of this position from the host), then the
  * attention of one query head over positions [0, pos]. One work-group per query head: each one
  * prepares the k/v of the current position in local memory, and the first head of every kv
- * group appends them to the f16 KV cache (the other heads only read rows < pos from it). */
+ * group appends them to the f16 KV cache (the other heads only read rows < pos from it).
+ * LFM3: win > 0 limits a sliding-window layer to the last win positions, rope + rope_off picks
+ * its RoPE table, and has_gate scales each head by sigmoid(gate[h]). */
 inline float rope_rot(__local const float *t, __global const float *rope, int i, int hh) {
     const int f = i < hh ? i : i - hh;
     const float cs = rope[f], sn = rope[hh + f];
@@ -448,11 +450,12 @@ __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
 void attn_decode(__global const float *qkv, __global const uchar *A, ulong qn_off, ulong kn_off,
                  __global const float *rope /* cos[hd/2] | sin[hd/2] */, __global half *kc, __global half *vc, ulong lbase,
                  int pos, int n_head, int n_kv, int hd, int D, float eps, __global float *scores, int n_ctx,
-                 __global float *out, float scale) {
+                 __global float *out, float scale, int win, int rope_off, __global const float *gate, int has_gate) {
     __local float q[256], kn[256], vn[256], t[256], red[WG];
     const int h = get_group_id(0), lid = get_local_id(0), kvd = n_kv * hd, hh = hd / 2;
     const int grp = n_head / n_kv, kvh = h / grp, act = lid < hd;
     __global const float *qn = (__global const float *)(A + qn_off), *knw = (__global const float *)(A + kn_off);
+    rope += rope_off;
     float v = act ? qkv[h * hd + lid] : 0.f;
     float s = rsqrt(wg_sum(red, v * v) / hd + eps);
     t[lid] = act ? v * s * qn[lid] : 0.f;
@@ -471,10 +474,10 @@ void attn_decode(__global const float *qkv, __global const uchar *A, ulong qn_of
         }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    const int npos = pos + 1;
+    const int npos = pos + 1, j0 = win > 0 && npos > win ? npos - win : 0;
     __global float *sc = scores + (ulong)h * n_ctx;
     float mx = -INFINITY;
-    for (int j = lid; j < npos; j += WG) {
+    for (int j = j0 + lid; j < npos; j += WG) {
         float d = 0.f;
         if (j < pos) {
             __global const half *k = kc + lbase + (ulong)j * kvd + kvh * hd;
@@ -487,22 +490,34 @@ void attn_decode(__global const float *qkv, __global const uchar *A, ulong qn_of
     }
     mx = wg_max(red, mx);
     float sum = 0.f;
-    for (int j = lid; j < npos; j += WG) { const float e = exp(sc[j] - mx); sc[j] = e; sum += e; }
+    for (int j = j0 + lid; j < npos; j += WG) { const float e = exp(sc[j] - mx); sc[j] = e; sum += e; }
     sum = wg_sum(red, sum);
     barrier(CLK_GLOBAL_MEM_FENCE);
     /* weighted sum of V: WG/hd groups of hd threads take every (WG/hd)-th position */
     const int parts = WG / hd, d = lid % hd, part = lid / hd;
     float acc = 0.f;
     if (part < parts)
-        for (int j = part; j < npos; j += parts)
+        for (int j = j0 + part; j < npos; j += parts)
             acc += sc[j] * (j < pos ? vload_half(0, vc + lbase + (ulong)j * kvd + kvh * hd + d) : vn[d]);
     red[lid] = acc;
     barrier(CLK_LOCAL_MEM_FENCE);
     if (part == 0) {
         float o = 0.f;
         for (int k = 0; k < parts; k++) o += red[k * hd + d];
-        out[h * hd + d] = o / sum;
+        out[h * hd + d] = o / sum * (has_gate ? 1.f / (1.f + exp(-gate[h])) : 1.f);
     }
+}
+
+/* x += rmsnorm(t) * w: LFM3's norm on a block output before the residual sum; one work-group */
+__kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
+void add_norm(__global float *x, __global const float *t, __global const uchar *A, ulong w_off, int D, float eps) {
+    __local float red[WG];
+    const int lid = get_local_id(0);
+    __global const float *w = (__global const float *)(A + w_off);
+    float ss = 0.f;
+    for (int i = lid; i < D; i += WG) ss += t[i] * t[i];
+    const float s = rsqrt(wg_sum(red, ss) / D + eps);
+    for (int i = lid; i < D; i += WG) x[i] += t[i] * s * w[i];
 }
 
 /* top-k of the router logits with normalized weights; resident experts get their VRAM slot */

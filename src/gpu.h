@@ -48,7 +48,8 @@ int gpu_pending(Gpu *g);
  * the CPU computes that expert) and gpu_dense_moe_finish adds the CPU part (weighted sum, or
  * NULL); finally gpu_dense_logits. The pointers stay valid until gpu_dense_moe_finish. */
 int  gpu_dense_on(const Gpu *g);
-void gpu_dense_begin(Gpu *g, const float *x, const float *rope_cs /* cos[hd/2] | sin[hd/2] */, int pos);
+/* rope_cs: cos[hd/2] | sin[hd/2] of this position; rope_swa: the same for sliding-window layers (NULL: none) */
+void gpu_dense_begin(Gpu *g, const float *x, const float *rope_cs, const float *rope_swa, int pos);
 void gpu_dense_wait(Gpu *g, int layer, const float **x, const float **h, const int **ret);
 void gpu_dense_moe_finish(Gpu *g, int layer, const float *ycpu);
 void gpu_dense_logits(Gpu *g, float *out);

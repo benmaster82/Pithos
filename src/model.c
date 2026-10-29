@@ -901,13 +901,15 @@ static void forward_token_gpu(Context *c, int token, float *all_logits) {
     }
     if (token < 0 || token >= m->n_vocab) token = 0;
     dequant_row(m->embed.type, m->embed.data + (size_t)token * m->embed.row_bytes, c->x, D);
-    float rope[512];
+    float rope[512], rope_swa[512];
     for (int i = 0; i < hd / 2; i++) {
-        const double a = (double)pos * c->inv_freq[i];
+        const double a = (double)pos * c->inv_freq[i], as = (double)pos * c->inv_freq_swa[i];
         rope[i] = (float)cos(a);
         rope[hd / 2 + i] = (float)sin(a);
+        rope_swa[i] = (float)cos(as);
+        rope_swa[hd / 2 + i] = (float)sin(as);
     }
-    gpu_dense_begin(g, c->x, rope, pos);
+    gpu_dense_begin(g, c->x, rope, m->swa_window > 0 ? rope_swa : NULL, pos);
     for (int l = 0; l < m->n_layer; l++) {
         const Layer *L = &m->layers[l];
         if (!L->is_moe) continue;

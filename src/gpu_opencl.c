@@ -122,6 +122,7 @@ typedef struct { int slot; int layer; int expert; } UploadReq;
 typedef struct { int buf, type, rows, cols; cl_ulong off; const uint8_t *src; size_t bytes; } DT;
 typedef struct {
     DT attn_norm, ffn_norm, wq, wk, wv, wo, qn, kn, in_proj, out_proj, conv_w, router, bias, wg, wu, wd;
+    DT wgate, post_op, post_ffn;    /* LFM3: attention output gate, sandwich norms (src NULL if absent) */
 } DL;
 
 struct Gpu {
@@ -175,10 +176,12 @@ struct Gpu {
     GpuStats st;
     /* dense decode path (see below) */
     int dense, n_ctx, dff, n_dz, dz_fail;
+    cl_ulong dense_bytes;
     DL *dl;
     DT d_out, d_fnorm;
     cl_mem dz[4], dsmall;
     cl_mem dx, dbig, dtmp, dfg, dscores, dkc, dvc, dconv, drope, dres, dlog, dcount, dmeta2, dout, dgu2, dy2, dycpu, dlogits;
+    cl_mem dgate, dpost;        /* LFM3: per-head gate logits, a block output before its norm */
     cl_mem pin_in, pin_out, pin_y, pin_logits;
     float *h_in, *h_out, *h_yc, *h_logits;
     cl_ulong kv_bytes;
@@ -188,7 +191,7 @@ struct Gpu {
     int moe_open;                          /* MoE layer still waiting for its CPU part (-1: none) */
     int lookahead;                         /* 1: queue the next layer behind a user event */
     int eager;                             /* flush after every command */
-    cl_kernel k_mv, k_conv, k_silu, k_attn, k_route, k_comb;
+    cl_kernel k_mv, k_conv, k_silu, k_attn, k_route, k_comb, k_addn;
 };
 
 static int state_load(volatile int *p) {
@@ -376,10 +379,14 @@ static void dense_free(Gpu *g);
 Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int dense_ctx, const char *profile_path,
                 char *info, int infolen) {
     info[0] = 0;
-    if (m->n_layer > 64 || m->n_expert > 64 || !m->n_expert) { snprintf(info, infolen, "no compatible MoE in the model"); return NULL; }
+    /* a model without experts (LFM3, dense LFM2) runs entirely on the dense decode path */
+    const int moe = m->n_expert > 0;
+    if (m->n_layer > 64 || m->n_expert > 64) { snprintf(info, infolen, "too many layers or experts for the GPU kernels"); return NULL; }
+    if (!moe && dense_ctx <= 0) { snprintf(info, infolen, "dense model: the GPU needs its dense layers (no --no-gpu-dense)"); return NULL; }
     if (m->dim > 4096 || m->ff_exp > 2048) { snprintf(info, infolen, "sizes not supported by the GPU kernels"); return NULL; }
     Gpu *g = (Gpu *)calloc(1, sizeof(Gpu));
     g->m = m;
+    for (int i = 0; i < 64 * 64; i++) g->res_slot[i] = -1; /* no expert in VRAM (dense models: never) */
     if (!cl_load(&g->cl)) { snprintf(info, infolen, "OpenCL not available"); free(g); return NULL; }
     CLApi *cl = &g->cl;
     DevInfo devs[32];
@@ -446,7 +453,7 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
         size_t total = g->down_off[l] + ceil256(L->down_exps.expert_stride);
         if (total > slot) slot = total;
     }
-    if (!ok_layers) { snprintf(info, infolen, "expert formats not supported by the GPU"); gpu_destroy(g); return NULL; }
+    if (moe && !ok_layers) { snprintf(info, infolen, "expert formats not supported by the GPU"); gpu_destroy(g); return NULL; }
     g->slot_bytes = slot;
 
     /* VRAM budget: leave room for the display, the driver and the small buffers */
@@ -464,6 +471,7 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
             char derr[128];
             if (dense_alloc(g, dense_ctx, big_used, small_used, derr, sizeof(derr))) {
                 g->dense = 1;
+                g->dense_bytes = need;
                 g->lookahead = getenv("PITHOS_GPU_LOOKAHEAD") && atoi(getenv("PITHOS_GPU_LOOKAHEAD")) > 0;
                 g->eager = !getenv("PITHOS_GPU_EAGER") || atoi(getenv("PITHOS_GPU_EAGER")) > 0;
                 budget -= need;
@@ -476,6 +484,17 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
                 snprintf(dense_note, sizeof(dense_note), " | dense layers on CPU (%s)", derr);
             }
         }
+    }
+    if (!moe) {
+        if (!g->dense) {
+            snprintf(info, infolen, "%s%s", dv->name, dense_note[0] ? dense_note : " | dense layers on CPU");
+            gpu_destroy(g);
+            return NULL;
+        }
+        g->lk = lock_create(); /* no expert cache: only take_uploads uses it */
+        snprintf(info, infolen, "%s | %s | all layers in VRAM (%.2f GB)", dv->name, g->dp4a ? "int8/dp4a" : "f32",
+                 g->dense_bytes / 1073741824.0);
+        return g;
     }
     g->spa = (int)(per_arena / slot);
     if (g->spa < 1) { snprintf(info, infolen, "not enough VRAM"); gpu_destroy(g); return NULL; }
@@ -885,6 +904,10 @@ static cl_ulong dense_plan(Gpu *g, int n_ctx, cl_ulong arena_cap, cl_ulong *big_
             dense_place(g, &d->wo, &L->wo, NULL, 0, big_used, small_used, arena_cap);
             dense_place(g, &d->qn, NULL, L->q_norm, sizeof(float) * (size_t)m->head_dim, big_used, small_used, arena_cap);
             dense_place(g, &d->kn, NULL, L->k_norm, sizeof(float) * (size_t)m->head_dim, big_used, small_used, arena_cap);
+            if (L->attn_gate.data) {
+                if (!dense_type_ok(&L->attn_gate)) return 0;
+                dense_place(g, &d->wgate, &L->attn_gate, NULL, 0, big_used, small_used, arena_cap);
+            }
         } else {
             if (!dense_type_ok(&L->in_proj) || !dense_type_ok(&L->out_proj)) return 0;
             dense_place(g, &d->in_proj, &L->in_proj, NULL, 0, big_used, small_used, arena_cap);
@@ -903,6 +926,11 @@ static cl_ulong dense_plan(Gpu *g, int n_ctx, cl_ulong arena_cap, cl_ulong *big_
             dense_place(g, &d->wd, &L->w_down, NULL, 0, big_used, small_used, arena_cap);
             if (L->w_gate.rows > g->dff) g->dff = L->w_gate.rows;
         }
+        if (L->post_op_norm) {
+            if (L->is_moe) return 0; /* not wired into the MoE combine */
+            dense_place(g, &d->post_op, NULL, L->post_op_norm, D4, big_used, small_used, arena_cap);
+            dense_place(g, &d->post_ffn, NULL, L->post_ffn_norm, D4, big_used, small_used, arena_cap);
+        }
     }
     dense_place(g, &g->d_out, &m->output, NULL, 0, big_used, small_used, arena_cap);
     dense_place(g, &g->d_fnorm, NULL, m->final_norm, D4, big_used, small_used, arena_cap);
@@ -912,7 +940,7 @@ static cl_ulong dense_plan(Gpu *g, int n_ctx, cl_ulong arena_cap, cl_ulong *big_
     const int kvd = m->n_kv_head * m->head_dim;
     g->kv_bytes = sizeof(uint16_t) * (cl_ulong)m->n_attn * n_ctx * kvd;
     total += 2 * g->kv_bytes;
-    total += sizeof(float) * ((cl_ulong)m->n_head * n_ctx + (cl_ulong)m->n_vocab + 16 * (cl_ulong)m->dim + 2 * (cl_ulong)g->dff);
+    total += sizeof(float) * ((cl_ulong)m->n_head * n_ctx + (cl_ulong)m->n_vocab + 18 * (cl_ulong)m->dim + 2 * (cl_ulong)g->dff);
     total += sizeof(float) * (cl_ulong)(m->n_conv ? m->n_conv : 1) * (m->l_cache - 1) * m->dim;
     return total;
 }
@@ -922,7 +950,8 @@ static int dense_alloc(Gpu *g, int n_ctx, const cl_ulong *big_used, cl_ulong sma
     CLApi *cl = &g->cl;
     cl_int e = 0;
     int ok = 1;
-    const int D = m->dim, kvd = m->n_kv_head * m->head_dim, K = m->n_expert_used, F = m->ff_exp;
+    const int D = m->dim, kvd = m->n_kv_head * m->head_dim;
+    const int K = m->n_expert_used ? m->n_expert_used : 1, F = m->ff_exp ? m->ff_exp : 1; /* dense models: unused */
     g->n_ctx = n_ctx;
     for (int a = 0; a < g->n_dz; a++) g->dz[a] = mkbuf(g, CL_MEM_READ_ONLY, big_used[a], &ok);
     g->dsmall = mkbuf(g, CL_MEM_READ_ONLY, small_used, &ok);
@@ -937,7 +966,9 @@ static int dense_alloc(Gpu *g, int n_ctx, const cl_ulong *big_used, cl_ulong sma
     g->dvc = mkbuf(g, CL_MEM_READ_WRITE, g->kv_bytes ? g->kv_bytes : 4, &ok);
     g->conv_bytes = sizeof(float) * (size_t)(m->n_conv ? m->n_conv : 1) * (m->l_cache - 1) * D;
     g->dconv = mkbuf(g, CL_MEM_READ_WRITE, g->conv_bytes, &ok);
-    g->drope = mkbuf(g, CL_MEM_READ_ONLY, sizeof(float) * (size_t)m->head_dim, &ok);
+    g->drope = mkbuf(g, CL_MEM_READ_ONLY, sizeof(float) * 2 * (size_t)m->head_dim, &ok); /* full | sliding-window */
+    g->dgate = mkbuf(g, CL_MEM_READ_WRITE, sizeof(float) * (size_t)m->n_head, &ok);
+    g->dpost = mkbuf(g, CL_MEM_READ_WRITE, sizeof(float) * D, &ok);
     g->dres = mkbuf(g, CL_MEM_READ_ONLY, sizeof(int) * 64 * 64, &ok);
     g->dlog = mkbuf(g, CL_MEM_READ_WRITE, sizeof(float) * 64, &ok);
     g->dcount = mkbuf(g, CL_MEM_READ_WRITE, sizeof(int), &ok);
@@ -948,7 +979,7 @@ static int dense_alloc(Gpu *g, int n_ctx, const cl_ulong *big_used, cl_ulong sma
     g->dycpu = mkbuf(g, CL_MEM_READ_ONLY, sizeof(float) * D, &ok);
     g->dlogits = mkbuf(g, CL_MEM_READ_WRITE, sizeof(float) * (size_t)m->n_vocab, &ok);
     /* pinned staging */
-    const size_t in_bytes = sizeof(float) * (D + m->head_dim) + sizeof(int) * 64 * 64;
+    const size_t in_bytes = sizeof(float) * (D + 2 * m->head_dim) + sizeof(int) * 64 * 64;
     const size_t out_bytes = sizeof(float) * 2 * D + sizeof(int) * 3 * K;
     g->pin_in = mkbuf(g, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, in_bytes, &ok);
     g->pin_out = mkbuf(g, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, out_bytes, &ok);
@@ -963,12 +994,13 @@ static int dense_alloc(Gpu *g, int n_ctx, const cl_ulong *big_used, cl_ulong sma
     if (!g->h_in || !g->h_out || !g->h_yc || !g->h_logits) { snprintf(err, (size_t)errlen, "pinned buffers failed"); return 0; }
     /* upload the weights (read from the mapped model file) */
     for (int l = 0; l <= m->n_layer; l++) {
-        DT *ts[16];
+        DT *ts[24];
         int nt = 0;
         if (l < m->n_layer) {
             DL *d = &g->dl[l];
             DT *all[] = { &d->attn_norm, &d->ffn_norm, &d->wq, &d->wk, &d->wv, &d->wo, &d->qn, &d->kn, &d->in_proj,
-                          &d->out_proj, &d->conv_w, &d->router, &d->bias, &d->wg, &d->wu, &d->wd };
+                          &d->out_proj, &d->conv_w, &d->router, &d->bias, &d->wg, &d->wu, &d->wd,
+                          &d->wgate, &d->post_op, &d->post_ffn };
             for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) if (all[i]->src) ts[nt++] = all[i];
         } else {
             ts[nt++] = &g->d_out;
@@ -993,7 +1025,8 @@ static int dense_alloc(Gpu *g, int n_ctx, const cl_ulong *big_used, cl_ulong sma
     g->k_attn = cl->CreateKernel(g->prog, "attn_decode", &e);
     g->k_route = cl->CreateKernel(g->prog, "moe_route", &e);
     g->k_comb = cl->CreateKernel(g->prog, "moe_combine", &e);
-    if (!g->k_mv || !g->k_conv || !g->k_silu || !g->k_attn || !g->k_route || !g->k_comb) {
+    g->k_addn = cl->CreateKernel(g->prog, "add_norm", &e);
+    if (!g->k_mv || !g->k_conv || !g->k_silu || !g->k_attn || !g->k_route || !g->k_comb || !g->k_addn) {
         snprintf(err, (size_t)errlen, "dense kernels missing (%d)", e);
         return 0;
     }
@@ -1004,10 +1037,10 @@ static void dense_free(Gpu *g) {
     CLApi *cl = &g->cl;
     cl_mem bufs[] = { g->dsmall, g->dx, g->dbig, g->dtmp, g->dfg, g->dscores, g->dkc, g->dvc, g->dconv,
                       g->drope, g->dres, g->dlog, g->dcount, g->dmeta2, g->dout, g->dgu2, g->dy2, g->dycpu, g->dlogits, g->pin_in,
-                      g->pin_out, g->pin_y, g->pin_logits };
+                      g->pin_out, g->pin_y, g->pin_logits, g->dgate, g->dpost };
     for (size_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) if (bufs[i]) cl->ReleaseMemObject(bufs[i]);
     for (int a = 0; a < g->n_dz; a++) if (g->dz[a]) cl->ReleaseMemObject(g->dz[a]);
-    cl_kernel ks[] = { g->k_mv, g->k_conv, g->k_silu, g->k_attn, g->k_route, g->k_comb };
+    cl_kernel ks[] = { g->k_mv, g->k_conv, g->k_silu, g->k_attn, g->k_route, g->k_comb, g->k_addn };
     for (size_t i = 0; i < sizeof(ks) / sizeof(ks[0]); i++) if (ks[i]) cl->ReleaseKernel(ks[i]);
     free(g->dl);
 }
@@ -1103,12 +1136,13 @@ static int next_moe(const Model *m, int l) {
     return m->n_layer;
 }
 
-void gpu_dense_begin(Gpu *g, const float *x, const float *rope_cs, int pos) {
+void gpu_dense_begin(Gpu *g, const float *x, const float *rope_cs, const float *rope_swa, int pos) {
     const Model *m = g->m;
     const int D = m->dim, hd = m->head_dim;
     memcpy(g->h_in, x, sizeof(float) * D);
     memcpy(g->h_in + D, rope_cs, sizeof(float) * hd);
-    int *res = (int *)(g->h_in + D + hd);
+    memcpy(g->h_in + D + hd, rope_swa ? rope_swa : rope_cs, sizeof(float) * hd);
+    int *res = (int *)(g->h_in + D + 2 * hd);
     for (int i = 0; i < 64 * 64; i++) {
         const int s = g->res_slot[i];
         res[i] = s >= 0 && state_load(&g->slot_state[s]) == SLOT_READY ? s : -1;
@@ -1118,7 +1152,7 @@ void gpu_dense_begin(Gpu *g, const float *x, const float *rope_cs, int pos) {
     const cl_uint n_up = take_uploads(g, &up);
     check(g, cl->EnqueueWriteBuffer(g->q, g->dx, 0, 0, sizeof(float) * D, g->h_in, n_up, up, NULL), "write x");
     drop_uploads(g, up, n_up);
-    check(g, cl->EnqueueWriteBuffer(g->q, g->drope, 0, 0, sizeof(float) * hd, g->h_in + D, 0, NULL, NULL), "write rope");
+    check(g, cl->EnqueueWriteBuffer(g->q, g->drope, 0, 0, sizeof(float) * 2 * hd, g->h_in + D, 0, NULL, NULL), "write rope");
     check(g, cl->EnqueueWriteBuffer(g->q, g->dres, 0, 0, sizeof(int) * 64 * 64, res, 0, NULL, NULL), "write res");
     g->cur_pos = pos;
     g->enq = 0;
@@ -1126,6 +1160,23 @@ void gpu_dense_begin(Gpu *g, const float *x, const float *rope_cs, int pos) {
     g->moe_open = -1;
     /* keep one layer of lookahead in the queue beyond the next point where the host waits */
     dense_enqueue_upto(g, next_moe(m, -1) + 1 + g->lookahead);
+}
+
+/* x (+)= W in: straight into the residual stream, or (LFM3) through dpost and its RMSNorm */
+static void block_out(Gpu *g, const DT *w, cl_mem in, const DT *post) {
+    if (!post->src) {
+        dense_mv1(g, w, in, NULL, g->dx, 1);
+        return;
+    }
+    dense_mv1(g, w, in, NULL, g->dpost, 0);
+    cl_kernel k = g->k_addn;
+    ARGM(k, 0, g->dx);
+    ARGM(k, 1, g->dpost);
+    ARGM(k, 2, g->dsmall);
+    ARGU(k, 3, post->off);
+    ARGI(k, 4, g->m->dim);
+    ARGF(k, 5, g->m->eps);
+    run1(g, k, WG, WG, "add_norm");
 }
 
 static void dense_enqueue_layer(Gpu *g, int l) {
@@ -1141,6 +1192,7 @@ static void dense_enqueue_layer(Gpu *g, int l) {
         const DT *qkv[3] = { &d->wq, &d->wk, &d->wv };
         const int yo[3] = { 0, D, D + kvd };
         dense_mv(g, 3, qkv, yo, g->dx, &d->attn_norm, g->dbig, 0);
+        if (d->wgate.src) dense_mv1(g, &d->wgate, g->dx, &d->attn_norm, g->dgate, 0);
         k = g->k_attn;
         ARGM(k, 0, g->dbig);
         ARGM(k, 1, g->dsmall);
@@ -1160,8 +1212,12 @@ static void dense_enqueue_layer(Gpu *g, int l) {
         ARGI(k, 15, g->n_ctx);
         ARGM(k, 16, g->dtmp);
         ARGF(k, 17, 1.f / sqrtf((float)hd));
+        ARGI(k, 18, L->is_swa ? m->swa_window : 0);
+        ARGI(k, 19, L->is_swa ? hd : 0);
+        ARGM(k, 20, g->dgate);
+        ARGI(k, 21, d->wgate.src != NULL);
         run1(g, k, (size_t)m->n_head * WG, WG, "attn_decode");
-        dense_mv1(g, &d->wo, g->dtmp, NULL, g->dx, 1);
+        block_out(g, &d->wo, g->dtmp, &d->post_op);
     } else {
         dense_mv1(g, &d->in_proj, g->dx, &d->attn_norm, g->dbig, 0);
         k = g->k_conv;
@@ -1174,7 +1230,7 @@ static void dense_enqueue_layer(Gpu *g, int l) {
         ARGI(k, 6, D);
         ARGI(k, 7, m->l_cache);
         run1(g, k, (size_t)((D + 255) & ~255), 256, "shortconv");
-        dense_mv1(g, &d->out_proj, g->dtmp, NULL, g->dx, 1);
+        block_out(g, &d->out_proj, g->dtmp, &d->post_op);
     }
     if (!L->is_moe) {
         const int Fd = d->wg.rows;
@@ -1186,7 +1242,7 @@ static void dense_enqueue_layer(Gpu *g, int l) {
         ARGI(k, 1, Fd);
         ARGI(k, 2, g->dff);
         run1(g, k, (size_t)((Fd + 255) & ~255), 256, "silu_mul");
-        dense_mv1(g, &d->wd, g->dfg, NULL, g->dx, 1);
+        block_out(g, &d->wd, g->dfg, &d->post_ffn);
         return;
     }
     /* norm + router + top-k on the GPU, then x | h | choice go to the host in one read */
