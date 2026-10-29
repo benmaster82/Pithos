@@ -65,3 +65,35 @@ nav a{font-weight:500}
 @media(max-width:1000px){.hero{gap:32px}.setup-layout{gap:32px;grid-template-columns:1fr 1.2fr}.hero h1,.hero h1 em{font-size:54px}}
 @media(max-width:850px){.hero{grid-template-columns:1fr;max-width:720px;padding-block:56px}.hero-visual{max-width:640px}.setup-layout{grid-template-columns:1fr}.setup-intro>p{max-width:65ch}.section-space{padding-block:56px}.project-grid{gap:32px}}
 @media(max-width:680px){.hero h1,.hero h1 em{font-size:clamp(42px,10vw,58px);letter-spacing:-1.8px}.hero{padding-block:44px;gap:32px}.hero-description{font-size:17px}.hero-actions{gap:12px}.hero-actions>.text-link{padding:14px;font-size:13px}.hero-copy>.eyebrow{font-size:12px}.fact-strip{padding-bottom:32px;gap:20px}.fact-strip>div{padding-left:0}.section-space{padding-block:44px}.spec-grid{gap:24px}.header-inner{height:68px}.terminal-launch{margin:12px}.closing-cta{padding-block:36px}.closing-cta .button{width:auto}.section-heading h2,.setup-intro h2,.faq-intro h2{font-size:32px}.setup-wizard{padding:20px 16px}}
+
+/* Pure black surfaces, with borders and typography providing hierarchy. */
+.site-header{background:#000}
+.terminal-stage,.terminal-stage-header,.terminal-launch,.terminal-launch-label,.local-stamp,
+.spec-card,.spec-card-heading,.spec-card caption,.spec-card tr,.spec-card tr:hover,.spec-card th,.spec-card td,.validation-card,
+.engine-flow,.engine-core,.engine-core-heading,.engine-core-state,.flow-node,.runtime-node,.gpu-runtime,.flow-clients>span,
+.execution-tabs,.execution-tabs button,.execution-tabs button[aria-selected=true],.execution-tabs button:hover:not([aria-selected=true]),
+.setup-wizard,.os-tabs,.os-tabs button,.os-tabs button[aria-selected=true],.os-tabs button[aria-selected=true]:hover,.os-tabs button:hover,
+.code-block,.code-block-header,.step-note,.inline-command,.setup-reassurance,.guide-finished,
+.mode-card,.mode-card.is-selected,.mode-card:hover,.mode-card.is-selected:hover,.mode-panel,
+.screenshot-bar,.closing-cta,.hero-actions>.text-link,.model-check code,.faq-list code{background:#000;color:var(--ink);box-shadow:none}
+.engine-flow{background-image:none}
+.execution-tabs button[aria-selected=true],.os-tabs button[aria-selected=true]{box-shadow:inset 0 -2px 0 #edf6ff}
+.engine-core-heading{border-bottom:1px solid #edf6ff40}
+.mcp-section{border-top:1px solid #edf6ff20}
+.mcp-lead{max-width:75ch;margin-top:22px;color:#c4d2df;font-size:17px}
+.mcp-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:40px;margin-top:32px}
+.mcp-grid>*{min-width:0}
+.mcp-section h3{font:600 23px/1.35 var(--sans);margin-bottom:20px}
+.mcp-section h4{font:600 16px/1.5 var(--sans);margin:0 0 12px}
+.mcp-section p{line-height:1.8;color:#c4d2df}
+.mcp-section code{font:13px/1.8 var(--mono);overflow-wrap:anywhere;color:var(--ink)}
+.tool-list{margin:0 0 22px}
+.tool-list dt{font-weight:600;padding-top:17px;border-top:1px solid #edf6ff25}
+.tool-list dd{margin:7px 0 20px;color:#c4d2df;font-size:15px;line-height:1.8}
+.mcp-section a{text-decoration:underline;text-underline-offset:4px}
+.mcp-example{margin-top:40px;padding-top:30px;border-top:1px solid #edf6ff25}
+.mcp-example>p{margin-block:18px}
+.mcp-section .inline-command{align-items:center}
+.mcp-section .inline-command code{white-space:pre-wrap;word-break:break-word}
+.mcp-small{font-size:13px;margin-top:12px}
+@media(max-width:850px){.mcp-grid{grid-template-columns:1fr;gap:28px}}

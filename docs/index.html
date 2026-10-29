@@ -43,7 +43,7 @@
       <a class="brand" href="#" aria-label="Pithos, back to top"><img src="assets/pandora-mark.svg" width="32" height="32" alt=""><span>pithos<span class="brand-dot">.</span></span></a>
       <button class="menu-button" aria-label="Open navigation" aria-expanded="false" aria-controls="navigation"><span></span><span></span></button>
       <nav id="navigation" aria-label="Main navigation">
-        <a href="#project">Engine</a><a href="#architecture">How it works</a><a href="#specifications">Specs</a><a href="#get-started">Get started</a><a href="#faq">FAQ</a>
+        <a href="#project">Engine</a><a href="#architecture">How it works</a><a href="#specifications">Specs</a><a href="#get-started">Get started</a><a href="#mcp">MCP &amp; tools</a>
       </nav>
       <a class="header-github" href="https://github.com/benmaster82/Pithos" target="_blank" rel="noopener noreferrer"><svg aria-hidden="true" class="icon"><use href="#i-github"/></svg> GitHub <svg aria-hidden="true" class="icon small"><use href="#i-external"/></svg></a>
     </div>
@@ -155,6 +155,38 @@
 
 
 
+    <section class="mcp-section section-space wrap" id="mcp" aria-labelledby="mcp-title">
+      <div class="section-heading"><h2 id="mcp-title">MCP servers and tools</h2></div>
+      <p class="mcp-lead">Give your local agent access to files, commands, and external tools. Pithos is an MCP client: it connects to servers you configure and adds their tools to the agent.</p>
+      <div class="mcp-grid">
+        <article><h3>Tools included with Pithos</h3>
+          <dl class="tool-list">
+            <dt>Files and folders</dt><dd><code>list_directory</code>, <code>read_file</code>, <code>find_files</code>, <code>search_text</code>, <code>write_file</code></dd>
+            <dt>Web and utilities</dt><dd><code>web_search</code>, <code>fetch_url</code>, <code>calculator</code>, <code>get_current_datetime</code></dd>
+            <dt>Shell and processes</dt><dd><code>run_command</code>, <code>start_process</code>, <code>read_process</code>, <code>stop_process</code>, <code>list_processes</code>, <code>edit_file</code></dd>
+          </dl>
+          <p>Terminal agents have shell tools available. For browser agents, start Pithos with <code>--server --shell</code>. File tools use the working folder selected with <code>--workspace</code>.</p>
+        </article>
+        <article><h3>Which MCP servers work?</h3>
+          <dl class="tool-list">
+            <dt>Supported connection</dt><dd>Local processes using JSON-RPC over standard input/output (stdio). Start them with Node.js, Python, uvx, or another executable installed on your computer.</dd>
+            <dt>Configuration</dt><dd>Add servers to <code>mcp.json</code>, or pass <code>--mcp PATH</code>. Pithos discovers their tools and lists them as <code>server__toolname</code>.</dd>
+            <dt>Compatibility limits</dt><dd>Remote HTTP MCP connections are not supported. No third-party MCP server is bundled. A server must expose tools over stdio; individual integrations need their own configuration and testing.</dd>
+          </dl>
+          <p>Find integrations in the <a href="https://registry.modelcontextprotocol.io" target="_blank" rel="noopener noreferrer">official MCP registry ?</a>. Check the server's transport, required runtime, credentials, and installation instructions.</p>
+        </article>
+      </div>
+      <article class="mcp-example"><h3>Try the included MCP test server</h3>
+        <p>Python is required. Open a terminal in the Pithos repository folder. These commands use the example configuration already included in <code>tests/mcp_test.json</code> and list tools without loading the model.</p>
+        <div class="mcp-grid">
+          <div><h4>Windows · PowerShell</h4><div class="inline-command"><code id="mcp-windows">.\build\pithos.exe --mcp tests/mcp_test.json --tools-list</code><button class="copy-button icon-only" data-copy-target="mcp-windows" aria-label="Copy Windows MCP command"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg></button></div></div>
+          <div><h4>Linux · terminal</h4><div class="inline-command"><code id="mcp-linux">./build/pithos --mcp tests/mcp_test.json --tools-list</code><button class="copy-button icon-only" data-copy-target="mcp-linux" aria-label="Copy Linux MCP command"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg></button></div><p class="mcp-small">The example launches <code>python</code>; change it to <code>python3</code> in the JSON configuration if that is your installed command.</p></div>
+        </div>
+        <p>To use the configured server in an agent, replace <code>--tools-list</code> with <code>--agent</code> and provide your model path with <code>-m</code>. Use <code>--server --shell</code> for the browser interface. Pithos stops its MCP processes when it exits.</p>
+        <p>For application integrations, <code>GET /v1/tools</code> lists tools and MCP server states; <code>POST /v1/tools/call</code> invokes a tool. These are Pithos HTTP endpoints, not an MCP server transport.</p>
+        <a class="text-link" href="https://github.com/benmaster82/Pithos#adding-mcp-servers" target="_blank" rel="noopener noreferrer">MCP configuration and examples ?</a>
+      </article>
+    </section>
     <section class="faq-section section-space wrap" id="faq" aria-labelledby="faq-title"><div class="faq-intro"><span class="eyebrow">06 — A FEW THINGS TO KNOW</span><h2 id="faq-title">Frequently asked questions</h2><p>A technical project, explained without assuming you know the jargon.</p><a class="text-link" href="https://github.com/benmaster82/Pithos/issues" target="_blank" rel="noopener noreferrer">Ask the community <svg aria-hidden="true" class="icon"><use href="#i-external"/></svg></a></div><div class="faq-list">
       <details open><summary>What is the difference between Pithos and the model?<span>+</span></summary><p>Pithos is the program that runs the AI. The model contains the data and weights needed to generate answers. Pandora is the built-in web chat. On Linux, <code>build.sh --download-model</code> can build the program and download the reference model.</p></details>
       <details><summary>Do I need WSL2 on Windows?<span>+</span></summary><p>No. Pithos builds and runs natively on Windows with <code>build.cmd</code>. You need a compiler: GCC from MSYS2 or MSVC from Visual Studio/Build Tools. The Windows guide uses MSYS2. Ubuntu through WSL2 is an alternative, not a requirement.</p></details>
