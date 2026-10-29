@@ -17,6 +17,7 @@
 </p>
 
 <p align="center">
+  <a href="https://benmaster82.github.io/Pithos/">Website &amp; setup guide</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#screenshots">Screenshots</a> ·
   <a href="#results">Results</a> ·
