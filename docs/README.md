@@ -9,8 +9,9 @@ The English landing page is published automatically by GitHub Pages from
 - `theme-hack.css`: terminal-inspired colors taken from the Pithos banner.
 - `engine.css`: ice-white typography, architecture diagram, and technical tables.
 - `simple.css`: restrained presentation, responsive typography, and flat surfaces.
+- `models.css`: the model picker at the top (its data, as in `../models.tsv`, is in `app.js`).
 - `effects.js` / `effects.css`: decorative ASCII logo projection and inference pulses, with pause and reduced-motion support.
-- `app.js`: installation guide, CPU/GPU diagram, tabs, clipboard, and local progress storage.
+- `app.js`: model picker (it drives the guide and every command on the page), installation guide, CPU/GPU diagram, tabs, clipboard, and local progress storage.
 - `assets/`: original project graphics and self-hosted fonts with license files.
 
 Keep asset URLs relative so the site works at `/Pithos/`. When changing the public

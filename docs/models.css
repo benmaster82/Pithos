@@ -1,0 +1,34 @@
+/* Model picker in the hero, and the screenshot that follows the chosen interface. */
+.model-tabs{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding:18px 18px 0}
+.model-tabs button{display:grid;gap:4px;text-align:left;padding:14px 16px;min-height:44px;border:1px solid #edf6ff26;border-radius:10px;background:#090e14;color:var(--muted);font:inherit;cursor:pointer;transition:border-color .2s,background .2s}
+.model-tabs button strong{font:600 16px/1.3 var(--sans);color:var(--ink);letter-spacing:-.2px}
+.model-tabs button span{font:11px/1.5 var(--mono);letter-spacing:.2px}
+.model-tabs button:hover{border-color:#edf6ff70}
+.model-tabs button[aria-selected="true"]{border-color:var(--ink);background:#131c26}
+.model-tabs button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
+.model-card{padding:18px 18px 4px}
+.model-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;margin:0;border:1px solid #edf6ff1f;border-radius:10px;overflow:hidden;background:#edf6ff1f}
+.model-stats div{background:#0b1118;padding:14px 12px}
+.model-stats dt{font:10px/1.4 var(--mono);letter-spacing:.6px;text-transform:uppercase;color:var(--muted)}
+.model-stats dd{margin:6px 0 0;font:600 19px/1.2 var(--sans);color:var(--ink);letter-spacing:-.3px;white-space:nowrap}
+.model-blurb{margin:16px 2px 0;font-size:15px;line-height:1.7;color:var(--ink)}
+.model-foot{margin:0;padding:0 18px 16px;font:11px/1.7 var(--mono);color:var(--muted)}
+.model-hero .terminal-launch{margin:16px 18px 14px}
+.model-choice-note{margin:18px 0 0;font-size:14px;line-height:1.7;color:var(--muted)}
+.model-choice-note strong{color:var(--ink)}
+.model-choice-note a{color:var(--ink)}
+.spec-card table.second-model{border-top:1px solid #3a5066}
+.screenshot-card.is-terminal img{background:#0b0b0f}
+@media(max-width:1100px){.model-stats{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:680px){
+  .model-tabs{gap:8px;padding:14px 12px 0}
+  .model-tabs button{padding:12px}
+  .model-tabs button strong{font-size:14px}
+  .model-tabs button span{font-size:10px}
+  .model-card{padding:14px 12px 2px}
+  .model-stats dd{font-size:17px}
+  .model-blurb{font-size:14px}
+  .model-hero .terminal-launch{margin:14px 12px 12px}
+  .model-foot{padding:0 12px 14px;font-size:10px}
+}
+@media(max-width:365px){.model-tabs{grid-template-columns:1fr}}
