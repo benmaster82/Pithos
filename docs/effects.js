@@ -11,7 +11,8 @@
  function resize(){const r=hero.getBoundingClientRect();width=r.width;height=r.height;const d=Math.min(devicePixelRatio||1,1.5);canvas.width=Math.round(width*d);canvas.height=Math.round(height*d);ctx.setTransform(d,0,0,d,0,0);draw();}
  function draw(){
   ctx.clearRect(0,0,width,height);if(!points.length)return;
-  const size=Math.min(width*.9,620),cx=width*.56,cy=Math.min(height*.48,340);
+  const compact=width<760;
+  const size=compact?Math.min(width*.94,540):Math.min(width*.48,590),cx=compact?width*.5:width*.25,cy=compact?280:Math.min(height*.48,340);
   const angle=phase*.22,co=Math.cos(angle),si=Math.sin(angle);
   ctx.font=`${Math.max(9,size/49)}px monospace`;ctx.textAlign='center';ctx.textBaseline='middle';
   const chars='.:+*#@';
