@@ -7,6 +7,9 @@
     python xbox/deploy.py --xbox 192.168.1.23 files             # list LocalState
     python xbox/deploy.py --xbox 192.168.1.23 stop
 
+More engine options go in a pithos.args file in LocalState (for example "-t 6" or "-c 8192"),
+read when the app starts: upload it, then stop and launch the app.
+
 The portal uses a self-signed certificate, so TLS verification is off. --user/--password are
 only needed when Device Portal authentication is enabled in Dev Home.
 """

@@ -82,6 +82,8 @@ static std::wstring find_model(const std::wstring &dir, unsigned long long *size
     return found;
 }
 
+static std::string read_tail(const std::wstring &path, size_t max);
+
 static void server_thread(std::wstring local) {
     // stdout and stderr both go to pithos.log, opened shared so the Device Portal and the screen
     // can read it. An app has no standard streams: freopen gives them real descriptors first,
@@ -120,6 +122,20 @@ static void server_thread(std::wstring local) {
 
     std::vector<std::string> args = { "pithos", "--server", "--host", "0.0.0.0", "--port", "8080",
                                       "--no-gpu", "-m", utf8(model) };
+    // LocalState\pithos.args: more options (for example "-t 6"), separated by spaces or lines;
+    // they come after the defaults, so they also override them
+    size_t defaults = args.size();
+    std::string extra = read_tail(local + L"\\pithos.args", 4096);
+    for (size_t p = 0; (p = extra.find_first_not_of(" \t\r\n", p)) != std::string::npos;) {
+        size_t e = extra.find_first_of(" \t\r\n", p);
+        args.push_back(extra.substr(p, e == std::string::npos ? e : e - p));
+        p = e;
+    }
+    if (!extra.empty()) {
+        fprintf(stderr, "pithos: options from pithos.args:");
+        for (size_t i = defaults; i < args.size(); i++) fprintf(stderr, " %s", args[i].c_str());
+        fprintf(stderr, "\n");
+    }
     std::vector<char *> argv;
     for (auto &a : args) argv.push_back(&a[0]);
     argv.push_back(nullptr);
