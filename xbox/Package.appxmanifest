@@ -4,7 +4,7 @@
 <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
          xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
          IgnorableNamespaces="uap">
-  <Identity Name="Pithos.Server" Publisher="CN=Pithos" Version="0.1.2.0" ProcessorArchitecture="x64" />
+  <Identity Name="Pithos.Server" Publisher="CN=Pithos" Version="0.2.3.0" ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>Pithos</DisplayName>
     <PublisherDisplayName>Pithos</PublisherDisplayName>
@@ -21,7 +21,7 @@
   <Applications>
     <Application Id="App" Executable="pithos_xbox.exe" EntryPoint="Pithos.App">
       <uap:VisualElements DisplayName="Pithos" Description="Pithos: OpenAI-compatible LLM server"
-                          BackgroundColor="#0b1118"
+                          BackgroundColor="#0e110e"
                           Square150x150Logo="Assets\Square150x150Logo.png"
                           Square44x44Logo="Assets\Square44x44Logo.png">
         <uap:SplashScreen Image="Assets\SplashScreen.png" />

@@ -21,11 +21,12 @@ cl %CFLAGS% src\main.c src\model.c src\gguf.c src\tokenizer.c src\sampler.c src\
 cl %CFLAGS% /arch:AVX src\quant_avx.c /Fo%OBJ%\ || goto fail
 cl %CFLAGS% /arch:AVX2 src\quant_avx2.c /Fo%OBJ%\ || goto fail
 echo [xbox] compiling the app shell
-cl /nologo /c /O2 /MD /std:c++17 /EHsc /bigobj /DWINAPI_FAMILY=WINAPI_FAMILY_APP /I "%WindowsSdkDir%Include\%WindowsSDKVersion%cppwinrt" xbox\app.cpp /Fo%OBJ%\ || goto fail
+cl /nologo /c /O2 /MD /std:c++20 /EHsc /bigobj /DWINAPI_FAMILY=WINAPI_FAMILY_APP /I "%WindowsSdkDir%Include\%WindowsSDKVersion%cppwinrt" xbox\app.cpp /Fo%OBJ%\ || goto fail
 link /nologo /APPCONTAINER /SUBSYSTEM:WINDOWS /OUT:%LAYOUT%\pithos_xbox.exe %OBJ%\*.obj WindowsApp.lib || goto fail
 
 copy /y xbox\Package.appxmanifest %LAYOUT%\AppxManifest.xml >nul
 copy /y xbox\Assets\*.png %LAYOUT%\Assets\ >nul
+copy /y web\brand\pandora-mark.svg %LAYOUT%\Assets\pithos-mark.svg >nul
 echo [xbox] packaging
 makeappx pack /o /h SHA256 /d %LAYOUT% /p build-xbox\Pithos.appx >nul || goto fail
 if not exist build-xbox\pithos_xbox.pfx (
