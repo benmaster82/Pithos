@@ -411,6 +411,7 @@ void sys_info(SysInfo *si) {
     si->has_f16c = (r[2] >> 29) & 1;
     uint64_t xcr0 = osxsave ? xgetbv0() : 0;
     int os_avx = (xcr0 & 6) == 6;
+    si->has_avx = avx && os_avx;
     int os_avx512 = (xcr0 & 0xe6) == 0xe6;
     if (max_leaf >= 7) {
         cpuid(7, 0, r);

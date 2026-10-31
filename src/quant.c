@@ -377,9 +377,11 @@ const char *quant_init(const char *force) {
     SysInfo si;
     sys_info(&si);
 #if defined(__x86_64__) || defined(_M_X64)
-    if (si.has_avx2 && si.has_fma && si.has_f16c) {
+    const int avx2 = si.has_avx2 && si.has_fma && si.has_f16c, avx = si.has_avx && si.has_f16c;
+    if (avx2 && !(force && !strcmp(force, "avx")))
         kernels_init_avx2(&KS);
-    }
+    else if (avx)
+        kernels_init_avx(&KS);
 #endif
 #if defined(__aarch64__) || defined(_M_ARM64)
     kernels_init_neon(&KS);

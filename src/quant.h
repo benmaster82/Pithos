@@ -45,6 +45,7 @@ typedef struct {
 extern Kernels K_scalar;
 #if defined(__x86_64__) || defined(_M_X64)
 void kernels_init_avx2(Kernels *k);
+void kernels_init_avx(Kernels *k);   /* AVX + F16C, no AVX2/FMA (Jaguar, Ivy Bridge) */
 #endif
 #if defined(__aarch64__) || defined(_M_ARM64)
 void kernels_init_neon(Kernels *k);
@@ -52,7 +53,7 @@ void kernels_init_neon(Kernels *k);
 
 /* Active kernel table (set by quant_init). */
 extern Kernels KS;
-/* force: NULL/"auto", "scalar", "avx2", "neon". Returns name of selection. */
+/* force: NULL/"auto", "scalar", "avx", "avx2", "neon". Returns name of selection. */
 const char *quant_init(const char *force);
 
 /* Dequantize one row of K elements of the given type into f32. */

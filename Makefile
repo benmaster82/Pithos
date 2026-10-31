@@ -24,10 +24,10 @@ endif
 
 EXTRA_OBJ =
 ifneq (,$(filter x86_64 amd64 AMD64,$(UNAME_M)))
-  EXTRA_OBJ = $(BUILD)/quant_avx2.o
+  EXTRA_OBJ = $(BUILD)/quant_avx2.o $(BUILD)/quant_avx.o
 endif
 ifeq ($(OS),Windows_NT)
-  EXTRA_OBJ = $(BUILD)/quant_avx2.o
+  EXTRA_OBJ = $(BUILD)/quant_avx2.o $(BUILD)/quant_avx.o
 endif
 ifneq (,$(filter aarch64 arm64,$(UNAME_M)))
   ifeq ($(UNAME_S),Darwin)
@@ -47,6 +47,9 @@ $(BUILD):
 
 $(BUILD)/quant_avx2.o: src/quant_avx2.c src/quant.h | $(BUILD)
 	$(CC) $(CFLAGS) -mavx2 -mfma -mf16c -c $< -o $@
+
+$(BUILD)/quant_avx.o: src/quant_avx.c src/quant.h | $(BUILD)
+	$(CC) $(CFLAGS) -mavx -mf16c -c $< -o $@
 
 $(BUILD)/pithos$(EXE): $(SRC) $(EXTRA_OBJ) src/*.h | $(BUILD)
 	$(CC) $(CFLAGS) $(ARCHFLAGS) $(SRC) $(EXTRA_OBJ) -o $@ $(LDLIBS)

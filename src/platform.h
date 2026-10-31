@@ -121,7 +121,7 @@ double time_sec(void);
 
 /* ---- system info ---- */
 typedef struct {
-    int has_avx2, has_fma, has_f16c, has_avx512f, has_avx512bw, has_avx512vnni, has_avxvnni;
+    int has_avx, has_avx2, has_fma, has_f16c, has_avx512f, has_avx512bw, has_avx512vnni, has_avxvnni;
     int has_neon, has_dotprod;
     int n_logical, n_physical;
     uint64_t total_ram, avail_ram;

@@ -192,7 +192,7 @@ static void usage(void) {
         "      --gpu-mem MB        VRAM budget (default: VRAM - 900 MB)\n"
         "      --no-gpu-dense      keep attention/convolution/output on the CPU (GPU only for experts)\n"
         "      --list-gpus         list OpenCL devices and exit\n"
-        "      --kernels K         force kernels: auto | scalar\n"
+        "      --kernels K         force kernels: auto | scalar | avx (no AVX2)\n"
         "      --bench [PP,TG]     benchmark prompt processing and generation (default 128,64)\n"
         "      --tokenize TEXT     print token ids for TEXT and exit\n"
         "      --ids               print generated token ids (for testing)\n"

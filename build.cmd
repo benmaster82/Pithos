@@ -26,10 +26,11 @@ goto msvc
 echo [pithos] compiler: gcc
 set CFLAGS=-O3 -std=c11 -Wall -Wextra -Wno-unused-parameter
 gcc %CFLAGS% -mavx2 -mfma -mf16c -c src\quant_avx2.c -o build\quant_avx2.o || goto fail
-gcc %CFLAGS% -municode %SRC% build\quant_avx2.o -o build\pithos.exe -lm -lws2_32 || goto fail
+gcc %CFLAGS% -mavx -mf16c -c src\quant_avx.c -o build\quant_avx.o || goto fail
+gcc %CFLAGS% -municode %SRC% build\quant_avx2.o build\quant_avx.o -o build\pithos.exe -lm -lws2_32 || goto fail
 if /i "%WANT%"=="test" (
-    gcc %CFLAGS% tests\test_kernels.c src\gguf.c src\quant.c src\platform.c build\quant_avx2.o -o build\test_kernels.exe -lm || goto fail
-    gcc %CFLAGS% tests\test_gpu.c src\model.c src\gguf.c src\quant.c src\platform.c src\gpu_opencl.c build\quant_avx2.o -o build\test_gpu.exe -lm || goto fail
+    gcc %CFLAGS% tests\test_kernels.c src\gguf.c src\quant.c src\platform.c build\quant_avx2.o build\quant_avx.o -o build\test_kernels.exe -lm || goto fail
+    gcc %CFLAGS% tests\test_gpu.c src\model.c src\gguf.c src\quant.c src\platform.c src\gpu_opencl.c build\quant_avx2.o build\quant_avx.o -o build\test_gpu.exe -lm || goto fail
     gcc %CFLAGS% tests\test_shell.c src\tools.c src\proc.c src\platform.c src\json.c -o build\test_shell.exe -lm || goto fail
 )
 goto ok
@@ -45,9 +46,10 @@ call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>nul || goto nocompiler
 echo [pithos] compiler: MSVC
 set CLFLAGS=/nologo /O2 /Oi /GL /std:c11 /W3 /D_CRT_SECURE_NO_WARNINGS
 cl %CLFLAGS% /arch:AVX2 /c src\quant_avx2.c /Fobuild\quant_avx2.obj || goto fail
-cl %CLFLAGS% %SRC% build\quant_avx2.obj /Fobuild\ /Febuild\pithos.exe /link /LTCG || goto fail
+cl %CLFLAGS% /arch:AVX /c src\quant_avx.c /Fobuild\quant_avx.obj || goto fail
+cl %CLFLAGS% %SRC% build\quant_avx2.obj build\quant_avx.obj /Fobuild\ /Febuild\pithos.exe /link /LTCG || goto fail
 if /i "%2"=="test" (
-    cl %CLFLAGS% tests\test_kernels.c src\gguf.c src\quant.c src\platform.c build\quant_avx2.obj /Fobuild\ /Febuild\test_kernels.exe /link /LTCG || goto fail
+    cl %CLFLAGS% tests\test_kernels.c src\gguf.c src\quant.c src\platform.c build\quant_avx2.obj build\quant_avx.obj /Fobuild\ /Febuild\test_kernels.exe /link /LTCG || goto fail
     cl %CLFLAGS% tests\test_shell.c src\tools.c src\proc.c src\platform.c src\json.c /Fobuild\ /Febuild\test_shell.exe /link /LTCG || goto fail
 )
 goto ok

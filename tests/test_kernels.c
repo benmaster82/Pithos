@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../src/gguf.h"
+#include "../src/platform.h"
 #include "../src/quant.h"
 
 static float frand(unsigned *s) { *s = *s * 1664525u + 1013904223u; return ((*s >> 8) / 16777216.f) * 2.f - 1.f; }
@@ -51,20 +52,62 @@ static int check(const char *kname, const Kernels *k, const GGUFTensor *t) {
     return maxrel < 1e-5 && !bad;
 }
 
+/* Random rows for every weight format (covers types the test model does not use):
+ * random bytes with sane f16 block scales, wrapped in a fake tensor. */
+static int synth_check(const char *kname, const Kernels *k, uint32_t type) {
+    const int K = 2048, rows = 8;
+    const size_t rb = row_bytes(type, K);
+    uint8_t *data = malloc(rb * rows);
+    unsigned s = 99 + type;
+    for (size_t i = 0; i < rb * rows; i++) { s = s * 1664525u + 1013904223u; data[i] = (uint8_t)(s >> 24); }
+    const size_t bsz = type == GGML_Q8_0 ? sizeof(block_q8_0) : type == GGML_Q4_0 ? sizeof(block_q4_0)
+                     : type == GGML_Q4_K ? sizeof(block_q4_K) : type == GGML_Q5_K ? sizeof(block_q5_K) : sizeof(block_q6_K);
+    for (size_t off = 0; off + bsz <= rb * rows; off += bsz) {
+        f16_t d = f32_to_f16(0.01f + 0.001f * (float)(off % 7)), dmin = f32_to_f16(0.005f);
+        if (type == GGML_Q6_K) memcpy(data + off + bsz - 2, &d, 2);
+        else memcpy(data + off, &d, 2);
+        if (type == GGML_Q4_K || type == GGML_Q5_K) memcpy(data + off + 2, &dmin, 2);
+    }
+    GGUFTensor t;
+    memset(&t, 0, sizeof(t));
+    snprintf(t.name, sizeof(t.name), "synthetic.%s", ggml_type_name(type));
+    t.type = type;
+    t.ne[0] = K;
+    t.ne[1] = rows;
+    t.ne[2] = 1;
+    t.data = data;
+    int ok = check(kname, k, &t);
+    free(data);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     GGUF g;
     char err[256];
     if (argc < 2 || !gguf_open(&g, argv[1], err, sizeof(err))) { printf("usage: test_kernels model.gguf (%s)\n", argc < 2 ? "" : err); return 1; }
     quant_init(NULL);
-    Kernels ks[2] = { K_scalar, KS };
+    /* scalar reference, then every SIMD set this CPU can run */
+    Kernels ks[3];
+    int nk = 0;
+    ks[nk++] = K_scalar;
+#if defined(__x86_64__) || defined(_M_X64)
+    SysInfo si;
+    sys_info(&si);
+    if (si.has_avx && si.has_f16c) { ks[nk] = K_scalar; kernels_init_avx(&ks[nk]); nk++; }
+#endif
+    if (strcmp(KS.name, "scalar") && strcmp(KS.name, "avx")) ks[nk++] = KS;
     const char *names[] = { "token_embd.weight", "blk.0.ffn_down.weight", "blk.0.ffn_gate.weight",
                             "blk.2.ffn_gate_exps.weight", "blk.2.ffn_down_exps.weight", "blk.2.attn_v.weight" };
     int ok = 1;
-    for (int ki = 0; ki < 2; ki++)
+    for (int ki = 0; ki < nk; ki++)
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
             const GGUFTensor *t = gguf_tensor(&g, names[i]);
             if (t && ks[ki].dot[t->type]) ok &= check(ks[ki].name, &ks[ki], t);
         }
+    const uint32_t types[] = { GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0, GGML_Q4_0 };
+    for (int ki = 0; ki < nk; ki++)
+        for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++)
+            if (ks[ki].dot[types[i]]) ok &= synth_check(ks[ki].name, &ks[ki], types[i]);
     /* fp16 round trip */
     for (float f = -70000.f; f < 70000.f; f += 13.37f) {
         f16_t h = f32_to_f16(f);
@@ -72,10 +115,15 @@ int main(int argc, char **argv) {
         if (fabsf(f) < 65000 && fabsf(back - f) > fabsf(f) * 1e-3f + 1e-3f) { printf("fp16 fail %f -> %f\n", f, back); ok = 0; break; }
     }
     printf(ok ? "ALL OK\n" : "SOME FAILED\n");
-    /* single-core throughput over a whole tensor (second pass = resident in RAM) */
-    const char *bn[] = { "blk.2.ffn_gate_exps.weight", "blk.2.ffn_down_exps.weight" };
-    for (size_t i = 0; i < 2; i++) {
+    /* single-core throughput over a whole tensor (second pass = resident in RAM), per SIMD set;
+     * MoE models use an expert tensor, dense ones the first FFN */
+    const char *bn[] = { "blk.2.ffn_gate_exps.weight", "blk.2.ffn_down_exps.weight", "blk.0.ffn_gate.weight", "blk.0.ffn_down.weight" };
+    for (int ki = 1; ki < nk; ki++)
+    for (size_t i = 0; i < 4; i++) {
         const GGUFTensor *t = gguf_tensor(&g, bn[i]);
+        if (!t || (i >= 2 && gguf_tensor(&g, bn[0])) || !ks[ki].dot[t->type]) continue;
+        const Kernels KS = ks[ki];
+        printf("[%s] ", KS.name);
         const int K = (int)t->ne[0];
         const int rows = (int)(t->ne[1] * t->ne[2]);
         const size_t rb = row_bytes(t->type, K);
