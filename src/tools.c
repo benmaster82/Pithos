@@ -1596,7 +1596,10 @@ const char *tools_danger(const char *name, const Json *args) {
 /* ------------------------------------------------------------------ environment for the agent */
 
 static int on_path(const char *name) {
-#if defined(_WIN32)
+#if defined(PITHOS_UWP)
+    (void)name;
+    return 0;
+#elif defined(_WIN32)
     wchar_t w[64], found[MAX_PATH];
     if (!MultiByteToWideChar(CP_UTF8, 0, name, -1, w, 64)) return 0;
     const wchar_t *exts[] = { L".exe", L".cmd", L".bat", L".com" };

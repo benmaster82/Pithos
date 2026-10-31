@@ -38,14 +38,30 @@ int map_file(MappedFile *mf, const char *path) {
     memset(mf, 0, sizeof(*mf));
     wchar_t wpath[1024];
     if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024)) return 0;
+#ifdef PITHOS_UWP
+    /* app container (Xbox): only the *FromApp / CreateFile2 variants exist */
+    CREATEFILE2_EXTENDED_PARAMETERS ep;
+    memset(&ep, 0, sizeof(ep));
+    ep.dwSize = sizeof(ep);
+    ep.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+    ep.dwFileFlags = FILE_FLAG_RANDOM_ACCESS;
+    HANDLE hf = CreateFile2(wpath, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, &ep);
+#else
     HANDLE hf = CreateFileW(wpath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
                             FILE_ATTRIBUTE_NORMAL | FILE_FLAG_RANDOM_ACCESS, NULL);
+#endif
     if (hf == INVALID_HANDLE_VALUE) return 0;
     LARGE_INTEGER sz;
     if (!GetFileSizeEx(hf, &sz)) { CloseHandle(hf); return 0; }
+#ifdef PITHOS_UWP
+    HANDLE hm = CreateFileMappingFromApp(hf, NULL, PAGE_READONLY, 0, NULL);
+    if (!hm) { CloseHandle(hf); return 0; }
+    void *p = MapViewOfFileFromApp(hm, FILE_MAP_READ, 0, 0);
+#else
     HANDLE hm = CreateFileMappingW(hf, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!hm) { CloseHandle(hf); return 0; }
     void *p = MapViewOfFile(hm, FILE_MAP_READ, 0, 0, 0);
+#endif
     if (!p) { CloseHandle(hm); CloseHandle(hf); return 0; }
     mf->data = (const uint8_t *)p;
     mf->size = (uint64_t)sz.QuadPart;
@@ -80,6 +96,11 @@ void prefetch_memory(const void *addr, size_t len) {
     fn(GetCurrentProcess(), 1, &e, 0);
 }
 
+#ifdef PITHOS_UWP
+/* no working-set control inside an app container */
+void release_memory(const void *addr, size_t len) { (void)addr; (void)len; }
+int lock_memory(const void *addr, size_t len) { (void)addr; (void)len; return 0; }
+#else
 void release_memory(const void *addr, size_t len) {
     /* VirtualUnlock on pages that are not locked removes them from the working set
      * (documented behaviour); file-backed pages move to the standby list. */
@@ -97,6 +118,7 @@ int lock_memory(const void *addr, size_t len) {
     }
     return VirtualLock((LPVOID)addr, len) ? 1 : 0;
 }
+#endif
 #else
 int map_file(MappedFile *mf, const char *path) {
     memset(mf, 0, sizeof(*mf));

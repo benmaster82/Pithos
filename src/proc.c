@@ -6,7 +6,24 @@
 #include <string.h>
 #include "platform.h"
 
-#if defined(_WIN32)
+#if defined(PITHOS_UWP)
+/* app container (Xbox): no child processes, so MCP servers and shell commands are unavailable */
+struct Proc { int unused; };
+
+Proc *proc_start(const ProcOptions *o, char *err, int errlen) {
+    (void)o;
+    if (err && errlen > 0) snprintf(err, (size_t)errlen, "starting programs is not available in the app version");
+    return NULL;
+}
+int proc_pid(Proc *p) { (void)p; return 0; }
+int proc_read_err(Proc *p, char *buf, int cap) { (void)p; (void)buf; (void)cap; return 0; }
+int proc_write(Proc *p, const char *s, int n) { (void)p; (void)s; (void)n; return 0; }
+int proc_read(Proc *p, char *buf, int cap) { (void)p; (void)buf; (void)cap; return 0; }
+void proc_close_stdin(Proc *p) { (void)p; }
+int proc_wait(Proc *p, int timeout_ms) { (void)p; (void)timeout_ms; return 0; }
+void proc_kill(Proc *p) { (void)p; }
+void proc_free(Proc *p) { (void)p; }
+#elif defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif

@@ -924,7 +924,10 @@ static int real_main(int argc, char **argv) {
     return 0;
 }
 
-#if defined(_WIN32)
+#if defined(PITHOS_UWP)
+/* app container (Xbox): the app shell (xbox/app.cpp) builds UTF-8 arguments and calls this */
+int pithos_main(int argc, char **argv) { return real_main(argc, argv); }
+#elif defined(_WIN32)
 /* Windows passes argv in the ANSI code page: take the UTF-16 command line and convert to UTF-8. */
 int wmain(int argc, wchar_t **wargv) {
     char **argv = (char **)malloc(sizeof(char *) * (size_t)(argc + 1));

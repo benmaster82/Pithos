@@ -13,3 +13,7 @@ models/
 *.gguf
 *.pithos-cache/
 *.pithos-experts
+
+# Xbox build output (also holds the package signing key)
+build-xbox/
+__pycache__/
