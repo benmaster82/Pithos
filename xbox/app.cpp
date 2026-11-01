@@ -212,11 +212,17 @@ static std::wstring lan_address() {
     return L"<xbox address>";
 }
 
-const uint32_t BG = 0x0e110e, PANEL = 0x171b17, LINE = 0x283028, GREEN = 0x107c10, TEXT = 0xf1f4f1,
-               MUTED = 0x939d93, LOGTEXT = 0xc6cfc6, AMBER = 0xd9a520, RED = 0xd13438;
+// dark theme: a cool near-black background, the mark in white, text in ice white, ice blue accents
+const uint32_t BG = 0x0b0e12, PANEL = 0x12171d, LINE = 0x222b35, WHITE = 0xffffff, TEXT = 0xe6f2f8,
+               ICE = 0xa9cfe0, MUTED = 0x8696a4, LOGTEXT = 0xb9c8d4, USER = 0x1e3040, REPLY = 0x1a2028,
+               AMBER = 0xd9a520, RED = 0xd13438;
+
+static Windows::UI::Color color(uint32_t rgb) {
+    return Windows::UI::Color{ 255, (uint8_t)(rgb >> 16), (uint8_t)(rgb >> 8), (uint8_t)rgb };
+}
 
 static SolidColorBrush brush(uint32_t rgb) {
-    return SolidColorBrush(Windows::UI::Color{ 255, (uint8_t)(rgb >> 16), (uint8_t)(rgb >> 8), (uint8_t)rgb });
+    return SolidColorBrush(color(rgb));
 }
 
 static TextBlock text(hstring const &s, double size, uint32_t color, bool bold = false) {
@@ -264,7 +270,7 @@ static Shapes::Path logo(double size) {
     std::wstring xaml = L"<Path xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation' Stretch='Uniform' Data='F0 " +
                         wide(svg.substr(a + 4, b - a - 4)) + L"'/>";
     Shapes::Path p = Markup::XamlReader::Load(xaml).as<Shapes::Path>();
-    p.Fill(brush(GREEN));
+    p.Fill(brush(WHITE));
     p.Width(size);
     p.Height(size);
     RotateTransform r;
@@ -353,6 +359,14 @@ struct App : ApplicationT<App> {
     void OnLaunched(Windows::ApplicationModel::Activation::LaunchActivatedEventArgs const &) {
         Window window = Window::Current();
         if (!window.Content()) {
+            // controls and the gamepad focus frame take the system accent (the console's, often
+            // green): ice blue instead, set before any control exists
+            auto res = Resources();
+            res.Insert(box_value(L"SystemAccentColor"), box_value(color(ICE)));
+            for (const wchar_t *k : { L"SystemControlHighlightAccentBrush", L"SystemControlForegroundAccentBrush",
+                                      L"SystemControlBackgroundAccentBrush", L"SystemControlFocusVisualPrimaryBrush",
+                                      L"SystemControlRevealFocusVisualBrush" })
+                res.Insert(box_value(k), brush(ICE));
             m_dispatcher = window.Dispatcher();
             m_local = Windows::Storage::ApplicationData::Current().LocalFolder().Path();
             m_ip = lan_address();
@@ -381,15 +395,19 @@ struct App : ApplicationT<App> {
         if (auto mark = logo(52)) place(head, mark, 0, 0);
         StackPanel title;
         title.VerticalAlignment(VerticalAlignment::Center);
-        TextBlock name = text(L"", 32, TEXT, true);
-        Documents::Run word, dot;
-        word.Text(L"pithos");
-        dot.Text(L".");
-        dot.Foreground(brush(GREEN));
+        TextBlock name = text(L"", 32, WHITE, true);
+        Documents::Run word, x, server;
+        word.Text(L"Pithos");
+        x.Text(L".X");
+        x.Foreground(brush(ICE));
+        server.Text(L" Server");
+        server.Foreground(brush(TEXT));
+        server.FontWeight(Windows::UI::Text::FontWeights::SemiLight());
         name.Inlines().Append(word);
-        name.Inlines().Append(dot);
+        name.Inlines().Append(x);
+        name.Inlines().Append(server);
         title.Children().Append(name);
-        title.Children().Append(text(L"OpenAI-compatible LLM server on Xbox", 13, MUTED));
+        title.Children().Append(text(L"Local LLM inference on Xbox \x00b7 OpenAI-compatible API", 13, MUTED));
         place(head, title, 0, 1);
 
         m_pill = Border();
@@ -524,7 +542,7 @@ struct App : ApplicationT<App> {
         b.CornerRadius(CornerRadius{ 10, 10, 10, 10 });
         b.Padding(Thickness{ 14, 9, 14, 10 });
         b.MaxWidth(520);
-        b.Background(brush(user ? 0x0f4d10 : 0x232923));
+        b.Background(brush(user ? USER : REPLY));
         b.HorizontalAlignment(user ? HorizontalAlignment::Right : HorizontalAlignment::Left);
         m_chat_list.Children().Append(b);
         return t;
@@ -640,7 +658,7 @@ struct App : ApplicationT<App> {
         int state = g_state;
         if (state == LOADING && m_ready) state = RUNNING;
         static const wchar_t *names[] = { L"Waiting for a model", L"Loading the model", L"Server running", L"Server stopped" };
-        static const uint32_t colors[] = { AMBER, AMBER, GREEN, RED };
+        static const uint32_t colors[] = { AMBER, AMBER, ICE, RED };
         if (state != m_shown) {
             m_shown = state;
             m_status.Text(names[state]);
@@ -695,7 +713,7 @@ struct App : ApplicationT<App> {
         auto self = get_strong();
         ContentDialog d;
         d.Title(box_value(L"Stop the server?"));
-        d.Content(box_value(L"Pithos closes and stops answering on the network. "
+        d.Content(box_value(L"Pithos.X Server closes and stops answering on the network. "
                             L"Start it again from My games & apps or from Dev Home."));
         d.PrimaryButtonText(L"Stop and close");
         d.CloseButtonText(L"Cancel");

@@ -368,7 +368,7 @@ build. The web interface and the GPU kernels are embedded in the executable as g
 
 ## Xbox One
 
-Pithos runs on an **Xbox One in Developer Mode** as a UWP app. The console becomes an
+Pithos runs on an **Xbox One in Developer Mode** as a UWP app, **Pithos.X Server**. The console becomes an
 OpenAI-compatible server for your home network, with Pandora in the browser of any PC or phone, and
 the TV shows the server state and a chat with the model. Tested on an Xbox One S with
 **LFM3-1.7B** (the 24B model does not fit in the console's memory).
@@ -423,7 +423,7 @@ python xbox\deploy.py --xbox CONSOLE-IP stop
 1. **Install** the package, then **upload** the model. It goes into the app's `LocalState` folder.
    The app waits for a `.gguf` there and starts as soon as the upload is complete.
 2. **Switch the app to Game mode** for Direct3D 12 and 5 GB of RAM. On the console: **Dev Home** →
-   select **Pithos** → **View details** → **App type: Game**. This has to be done again after
+   select **Pithos.X Server** → **View details** → **App type: Game**. This has to be done again after
    every reinstall, because installing resets the type to *App*.
 3. **Choose the options** in a `pithos.args` file uploaded to `LocalState` (see below), then start
    Pithos from Dev Home or with `launch`. Launching from the portal works only while a user is
