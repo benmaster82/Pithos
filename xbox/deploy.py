@@ -1,11 +1,11 @@
 """Deploy Pithos to an Xbox in Developer Mode through the Device Portal REST API (stdlib only).
 
-    python xbox/deploy.py --xbox 192.168.1.23 install           # Pithos.appx + VCLibs dependency
-    python xbox/deploy.py --xbox 192.168.1.23 upload MODEL.gguf # into the app's LocalState
-    python xbox/deploy.py --xbox 192.168.1.23 launch
-    python xbox/deploy.py --xbox 192.168.1.23 log               # LocalState\\pithos.log
-    python xbox/deploy.py --xbox 192.168.1.23 files             # list LocalState
-    python xbox/deploy.py --xbox 192.168.1.23 stop
+    python xbox/deploy.py --xbox CONSOLE-IP install           # Pithos.appx + VCLibs dependency
+    python xbox/deploy.py --xbox CONSOLE-IP upload MODEL.gguf # into the app's LocalState
+    python xbox/deploy.py --xbox CONSOLE-IP launch
+    python xbox/deploy.py --xbox CONSOLE-IP log               # LocalState\\pithos.log
+    python xbox/deploy.py --xbox CONSOLE-IP files             # list LocalState
+    python xbox/deploy.py --xbox CONSOLE-IP stop
 
 More engine options go in a pithos.args file in LocalState (for example "-t 6" or "-c 8192"),
 read when the app starts: upload it, then stop and launch the app.
