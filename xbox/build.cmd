@@ -20,8 +20,14 @@ echo [xbox] compiling the engine
 cl %CFLAGS% src\main.c src\model.c src\gguf.c src\tokenizer.c src\sampler.c src\quant.c src\platform.c src\quant_neon.c src\gpu_opencl.c src\json.c src\pcache.c src\server.c src\proc.c src\tools.c src\agent.c /Fo%OBJ%\ || goto fail
 cl %CFLAGS% /arch:AVX src\quant_avx.c /Fo%OBJ%\ || goto fail
 cl %CFLAGS% /arch:AVX2 src\quant_avx2.c /Fo%OBJ%\ || goto fail
+echo [xbox] compiling the GPU probe shaders
+fxc /nologo /O3 /T cs_5_0 /E flops /Vn g_flops50 /Fh %OBJ%\cs_flops50.h xbox\gpu_probe.hlsl >nul || goto fail
+fxc /nologo /O3 /T cs_5_0 /E copy /Vn g_copy50 /Fh %OBJ%\cs_copy50.h xbox\gpu_probe.hlsl >nul || goto fail
+fxc /nologo /O3 /T cs_4_0 /E flops /Vn g_flops40 /Fh %OBJ%\cs_flops40.h xbox\gpu_probe.hlsl >nul || goto fail
+fxc /nologo /O3 /T cs_4_0 /E copy /Vn g_copy40 /Fh %OBJ%\cs_copy40.h xbox\gpu_probe.hlsl >nul || goto fail
+(echo #include "cs_flops50.h"& echo #include "cs_copy50.h"& echo #include "cs_flops40.h"& echo #include "cs_copy40.h") > %OBJ%\gpu_probe_cs.h
 echo [xbox] compiling the app shell
-cl /nologo /c /O2 /MD /std:c++20 /EHsc /bigobj /DWINAPI_FAMILY=WINAPI_FAMILY_APP /I "%WindowsSdkDir%Include\%WindowsSDKVersion%cppwinrt" xbox\app.cpp /Fo%OBJ%\ || goto fail
+cl /nologo /c /O2 /MD /std:c++20 /EHsc /bigobj /DWINAPI_FAMILY=WINAPI_FAMILY_APP /I "%WindowsSdkDir%Include\%WindowsSDKVersion%cppwinrt" /I %OBJ% xbox\app.cpp xbox\gpu_probe.cpp /Fo%OBJ%\ || goto fail
 link /nologo /APPCONTAINER /SUBSYSTEM:WINDOWS /OUT:%LAYOUT%\pithos_xbox.exe %OBJ%\*.obj WindowsApp.lib || goto fail
 
 copy /y xbox\Package.appxmanifest %LAYOUT%\AppxManifest.xml >nul
