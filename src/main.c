@@ -6,6 +6,7 @@
 #include <string.h>
 #include "agent.h"
 #include "gpu.h"
+#include "gpu_dx.h"
 #include "model.h"
 #include "pcache.h"
 #include "platform.h"
@@ -34,7 +35,7 @@ typedef struct {
     int agent, agent_auto, yolo, max_steps, agent_think;
     int threads, n_ctx, n_batch, n_predict;
     int interactive, raw, bench, show_think, keep_think, prefetch, mlock, stats, verbose, ids;
-    int gpu, gpu_device, gpu_mem, gpu_dense;
+    int gpu, gpu_device, gpu_mem, gpu_dense, d3d12;
     int bench_pp, bench_tg;
     SamplerParams sp;
 } Args;
@@ -192,6 +193,7 @@ static void usage(void) {
         "      --gpu-mem MB        VRAM budget (default: VRAM - 900 MB)\n"
         "      --no-gpu-dense      keep attention/convolution/output on the CPU (GPU only for experts)\n"
         "      --list-gpus         list OpenCL devices and exit\n"
+        "      --d3d12             prompt matmuls on a Direct3D 12 GPU (Windows; Xbox in Game mode)\n"
         "      --kernels K         force kernels: auto | scalar | avx (no AVX2)\n"
         "      --bench [PP,TG]     benchmark prompt processing and generation (default 128,64)\n"
         "      --tokenize TEXT     print token ids for TEXT and exit\n"
@@ -296,6 +298,7 @@ static int parse_args(int argc, char **argv, Args *a) {
         else if (!strcmp(s, "--gpu-device")) a->gpu_device = atoi(NEXT());
         else if (!strcmp(s, "--gpu-mem")) a->gpu_mem = atoi(NEXT());
         else if (!strcmp(s, "--list-gpus")) { gpu_list_devices(); exit(0); }
+        else if (!strcmp(s, "--d3d12")) a->d3d12 = 1;
         else if (!strcmp(s, "--mlock")) a->mlock = 1;
         else if (!strcmp(s, "--kernels")) a->kernels = NEXT();
         else if (!strcmp(s, "--tokenize")) a->tokenize = NEXT();
@@ -699,6 +702,13 @@ static int real_main(int argc, char **argv) {
         if (!gpu && ginfo[0]) fprintf(stderr, "     (%s)\n", ginfo);
         ctx_set_gpu(ctx, gpu);
     }
+    Dx *dx = NULL;
+    if (a.d3d12) {
+        char dinfo[512];
+        dx = dx_create(&m, dinfo, sizeof(dinfo));
+        fprintf(stderr, "Direct3D 12: %s%s\n", dx ? "" : "not used, ", dinfo);
+        ctx_set_dx(ctx, dx);
+    }
 
     Engine e;
     memset(&e, 0, sizeof(e));
@@ -731,7 +741,7 @@ static int real_main(int argc, char **argv) {
         if (a.cache_mb > 0)
             fprintf(stderr, "prompt reuse: %d stored conversations in %s\n", pcache_n_files(pc), cache_dir);
         snprintf(info, sizeof(info), "%s | %d thread | kernel %s | GPU: %s", si.brand[0] ? si.brand : "CPU", a.threads, kn,
-                 gpu ? "yes" : "no");
+                 gpu ? "yes" : dx ? "Direct3D 12" : "no");
         ServerConfig sc;
         memset(&sc, 0, sizeof(sc));
         sc.host = a.host;
@@ -918,6 +928,7 @@ static int real_main(int argc, char **argv) {
     sampler_free(&e.smp);
     ctx_free(ctx);
     gpu_destroy(gpu);
+    dx_destroy(dx);
     pool_destroy(pool);
     tok_free(tk);
     model_free(&m);

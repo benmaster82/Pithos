@@ -14,6 +14,7 @@
  * and partial rotation on the full-attention layers (rope_freqs divisors). */
 #include "model.h"
 #include "gpu.h"
+#include "gpu_dx.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,6 +28,7 @@
 #endif
 
 #define MAX_JOBS 160
+#define DX_MIN_TOKENS 16     /* smaller batches stay on the CPU */
 #define MAX_TASKS 32768
 #define TOK_TILE 16
 
@@ -215,6 +217,8 @@ struct Context {
     int n_threads, n_ctx, n_batch, pos, prefetch_rows;
     Prefetcher *pfq;            /* background read-ahead (NULL = off) */
     Gpu *gpu;                   /* optional expert co-processor (NULL = CPU only) */
+    Dx *dx;                     /* optional Direct3D 12 GPU for prompt matmuls */
+    int dx_min;                 /* tokens per batch from which matmuls go to dx */
     /* dense decode path: single tokens run on the GPU, which keeps its own copy of the KV cache
      * and of the convolution state. Rows [0, kv_cpu_n) / [0, kv_gpu_n) are valid on each side. */
     int gpu_dense, kv_cpu_n, kv_gpu_n, conv_cpu_ok, conv_gpu_ok;
@@ -325,6 +329,12 @@ void ctx_set_gpu(Context *c, struct Gpu *g) {
     c->gpu_dense = g && gpu_dense_on(g) && !(env && env[0] == '0');
     c->kv_gpu_n = 0;
     c->conv_gpu_ok = 0;
+}
+
+void ctx_set_dx(Context *c, struct Dx *d) {
+    c->dx = d;
+    const char *env = getenv("PITHOS_DX_MIN");
+    c->dx_min = env && atoi(env) > 0 ? atoi(env) : DX_MIN_TOKENS;
 }
 
 /* make the host copy of the state current (before CPU work or a snapshot) */
@@ -478,8 +488,21 @@ static void mm_task(void *ctx, int task, int tid) {
     }
 }
 
-static void job_run(Context *c, int cat) {
-    double t0 = time_sec();
+/* the whole batch on the Direct3D 12 GPU, if every job is a quantized matmul it holds over enough tokens */
+static int dx_run(Context *c) {
+    DxJob dj[16];
+    if (!c->dx || c->njobs > 16) return 0;
+    for (int ji = 0; ji < c->njobs; ji++) {
+        const MatJob *j = &c->jobs[ji];
+        if (!j->xq || j->nt < c->dx_min || !dx_has(c->dx, j->w)) return 0;
+        DxJob d = {j->w, j->xq, j->xstride, j->nt, j->out, j->ostride};
+        dj[ji] = d;
+    }
+    return dx_matmul(c->dx, dj, c->njobs);
+}
+
+/* split the jobs into row ranges for the thread pool */
+static void cpu_run(Context *c) {
     int nt = 0;
     for (int ji = 0; ji < c->njobs; ji++) {
         const MatJob *j = &c->jobs[ji];
@@ -497,6 +520,11 @@ static void job_run(Context *c, int cat) {
     }
     c->ntasks = nt;
     pool_run(c->pool, mm_task, c, nt);
+}
+
+static void job_run(Context *c, int cat) {
+    double t0 = time_sec();
+    if (!dx_run(c)) cpu_run(c);
     const double dt = time_sec() - t0;
     c->stats.t_matmul += dt;
     c->stats.t_cat[cat] += dt;
