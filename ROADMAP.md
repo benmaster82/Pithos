@@ -59,7 +59,37 @@ time scales with the bytes read.
 - [ ] Fuse the MoE combine into the first kernel of the next layer (ping-pong residual stream):
   ~1 ms per token.
 
+## 6. Direct3D 12 backend and Xbox (branch `xbox`)
+Measured on the Xbox One S in Game mode (LFM3-1.7B Q4_K_M): prompt 146 tok/s at 125 tokens and
+121 at 1000, generation 29.5 tok/s (26 after 1000 tokens of context). The GPU reads ~49 GB/s, and
+generation uses about 30 of them.
+
+- [ ] **Faster batched matmul kernels** (`mm_q4_K` / `mm_q6_K`): almost all of a prompt chunk's time
+  goes there. Try integer dot products on the Q8_K activations, as `mv_*` already does, and larger
+  tiles. A bigger batch (`-b 256`) gains only ~4% today.
+- [ ] **Attention over long prompts**: `attn_chunk` runs one group per head and token, reading the
+  K/V rows again for every token. Tiles of several queries sharing the loads (flash-attention style)
+  should remove the slowdown from 146 to 121 tok/s between 125 and 1000 tokens.
+- [ ] **Faster generation**: about 1.5x of bandwidth headroom left. Fewer barriers and dispatches
+  per token (for example, quantization fused into the norm kernels), and a look at the `mv_*`
+  memory access pattern.
+- [ ] **Logits of every token on the GPU**, so that `--ppl` and `ctx_forward_all` use the fast path too.
+- [ ] **Direct3D 12 on PCs**: on the GTX 1650, `--d3d12` doubles prompt speed compared with
+  OpenCL (~170 vs ~80 tok/s) but generates more slowly (40–50 vs 56 tok/s). Close the gap, or use
+  each backend for what it does best, then pick automatically. It would also serve GPUs without
+  OpenCL.
+- [ ] **Experts on Direct3D 12**: the backend handles models without experts only. The 24B model
+  does not fit in the Xbox's 5 GB, but it matters for PCs.
+- [ ] **Xbox app type**: every reinstall resets the app to "App", and the user must set "Game"
+  again in Dev Home before Direct3D 12 is available. Look for a way to declare it in the package.
+- [ ] **Merge `xbox` into `main`** after review: shared-code changes are small and measured neutral
+  on Windows and Linux.
+
 ## Done
+- Branch `xbox` (not released yet): UWP app for the Xbox One in Dev Mode with a status and chat
+  screen on the TV, AVX kernels for CPUs without AVX2 (Jaguar, Ivy Bridge), and a Direct3D 12
+  backend (`--d3d12`) running the whole forward pass on the GPU. On the Xbox: prompt 13.9 → 146
+  tok/s, generation 5.8 → 29.5 tok/s.
 - v0.4: dense layers in VRAM with fused kernels (14–18 tok/s on real text, up from 11–14).
 - v0.3: agent mode with built-in tools and an MCP client.
 - v0.2: OpenAI-compatible server, prompt reuse, web interface (now Pandora).
