@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#000000">
+  <title>Pithos.X Server — a recent LLM on an Xbox One</title>
+  <meta name="description" content="How an Xbox One S from a living room became a local LLM server: AVX kernels for the Jaguar CPU, a UWP app, and a Direct3D 12 backend that runs LFM3-1.7B at 29.5 tokens per second.">
+  <link rel="canonical" href="https://benmaster82.github.io/Pithos/xbox.html">
+  <meta property="og:type" content="article">
+  <meta property="og:locale" content="en_US">
+  <meta property="og:title" content="Pithos.X Server — a recent LLM on an Xbox One">
+  <meta property="og:description" content="Old hardware, new intelligence: LFM3-1.7B served from an Xbox One S at 29.5 tokens per second.">
+  <meta property="og:url" content="https://benmaster82.github.io/Pithos/xbox.html">
+  <meta property="og:image" content="https://benmaster82.github.io/Pithos/xbox-tv.png">
+  <link rel="icon" href="assets/pandora-mark.svg" type="image/svg+xml">
+  <link rel="preload" href="assets/fonts/dm-sans-regular.ttf" as="font" type="font/ttf" crossorigin>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="theme-hack.css">
+  <link rel="stylesheet" href="engine.css">
+  <link rel="stylesheet" href="simple.css">
+  <link rel="stylesheet" href="xbox.css?v=1">
+  <script>document.documentElement.classList.add('js')</script>
+  <script src="xbox.js?v=1" defer></script>
+</head>
+<body class="x-page">
+  <svg class="svg-library" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-external" viewBox="0 0 24 24"><path d="M7 17 17 7M7 7h10v10"/></symbol>
+    <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="i-github" viewBox="0 0 24 24"><path d="M9 19c-4 1-4-2-6-2m12 5v-4c0-1-.4-1.7-1-2 3 0 6-1 6-6a5 5 0 0 0-1-3c.2-1 0-2-.5-3-2 0-3 1-3 1a10 10 0 0 0-7 0S7 4 5 4c-.5 1-.7 2-.5 3a5 5 0 0 0-1 3c0 5 3 6 6 6-.6.3-1 1-1 2v4"/></symbol>
+  </defs></svg>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <div class="header-inner wrap">
+      <a class="brand" href="index.html" aria-label="Pithos home"><img src="assets/pandora-mark.svg" width="32" height="32" alt=""><span>pithos<span class="brand-dot">.</span></span></a>
+      <button class="menu-button" aria-label="Open navigation" aria-expanded="false" aria-controls="navigation"><span></span><span></span></button>
+      <nav id="navigation" aria-label="Main navigation">
+        <a href="index.html#project">Engine</a><a href="index.html#architecture">How it works</a><a href="index.html#specifications">Specs</a><a href="index.html#get-started">Get started</a><a href="index.html#mcp">MCP &amp; tools</a><a href="xbox.html" aria-current="page">Xbox</a>
+      </nav>
+      <a class="header-github" href="https://github.com/benmaster82/Pithos" target="_blank" rel="noopener noreferrer"><svg aria-hidden="true" class="icon"><use href="#i-github"/></svg> GitHub <svg aria-hidden="true" class="icon small"><use href="#i-external"/></svg></a>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="x-hero wrap" aria-labelledby="x-title">
+      <div class="x-hero-copy">
+        <div class="eyebrow"><span class="status-dot"></span> PITHOS.X SERVER / XBOX ONE S / LFM3-1.7B</div>
+        <h1 id="x-title">Old hardware.<br><em>New intelligence.</em></h1>
+        <p class="x-lead">The game console under the TV was designed in 2013. Today it runs a recent language model at <strong>29.5 tokens per second</strong> and answers every phone and computer in the house through an OpenAI-compatible API. This is how we got there, one wall at a time.</p>
+        <div class="x-hero-actions"><a class="button button-dark" href="#story">Read the story <svg aria-hidden="true" class="icon"><use href="#i-arrow"/></svg></a><a class="text-link" href="#try">Try it on your console <span>↗</span></a></div>
+      </div>
+      <figure class="x-hero-shot">
+        <img src="xbox-tv.png" width="1280" height="720" alt="Pithos.X Server on the TV: the server state, a chat, the addresses to connect to and the server log.">
+        <figcaption>The console's TV screen while the server runs. Real capture through the Device Portal.</figcaption>
+      </figure>
+    </section>
+
+    <div class="x-stats wrap" aria-label="Results at a glance">
+      <div><strong data-count="5.1" data-suffix="×">5.1×</strong><span>faster generation than the CPU alone, in the same mode</span></div>
+      <div><strong data-count="146">146</strong><span>tokens per second reading a prompt</span></div>
+      <div><strong data-count="29.5">29.5</strong><span>tokens per second writing the answer</span></div>
+      <div><strong data-count="1">1</strong><span>GPU submission per token, down from about 100</span></div>
+    </div>
+
+    <article class="x-story" id="story">
+      <section class="x-chapter wrap" aria-labelledby="c1">
+        <div class="x-chapter-num">01</div>
+        <div class="x-chapter-body">
+          <span class="eyebrow">THE IDEA</span>
+          <h2 id="c1">A teraflop, asleep in the living room.</h2>
+          <p>Millions of Xbox One consoles sit under televisions, switched off most of the day, waiting to be replaced. Inside each one: eight CPU cores, 8 GB of memory and a GPU that still delivers more than a trillion operations per second.</p>
+          <p>Small language models have become good enough to be useful. LFM3-1.7B, by Liquid AI, reasons, follows instructions and calls tools in 1.1 GB. So the question was simple: <strong>can a console from the last decade become the house's private AI server</strong>, with no cloud and no new hardware?</p>
+          <dl class="x-spec">
+            <div><dt>CPU</dt><dd>8 × AMD Jaguar, 1.75 GHz. AVX, but no AVX2 and no FMA.</dd></div>
+            <div><dt>GPU</dt><dd>AMD GCN. Measured: <strong>1.36–1.46 TFLOPS</strong>, <strong>47–49 GB/s</strong>.</dd></div>
+            <div><dt>Memory</dt><dd>8 GB shared with the system. An ordinary app gets little of it; a game gets about 5 GB.</dd></div>
+            <div><dt>Software</dt><dd>Developer Mode: signed UWP packages, installed over the network.</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <section class="x-chapter wrap" aria-labelledby="c2">
+        <div class="x-chapter-num">02</div>
+        <div class="x-chapter-body">
+          <span class="eyebrow">THE FIRST WALL</span>
+          <h2 id="c2">A CPU too old for the fast path.</h2>
+          <p>Pithos computes with hand-written AVX2 kernels: integer dot products on 256-bit registers, straight on the quantized weights. The Jaguar cores stop at AVX, with 128-bit integer operations. On the console Pithos would have fallen back to plain C.</p>
+          <p>So it got a third set of kernels, <code>quant_avx.c</code>: the same integer arithmetic in 128-bit pieces, without fused multiply-add. They are chosen at runtime, so they also help any PC without AVX2, such as Intel Ivy Bridge. Every kernel is checked against the reference on real model weights, and perplexity matches the AVX2 path (4.460 vs 4.454).</p>
+          <p class="x-note">First result, CPU only: <strong>7.3 tokens per second</strong>. It worked, and it was slow.</p>
+        </div>
+      </section>
+
+      <section class="x-chapter wrap" aria-labelledby="c3">
+        <div class="x-chapter-num">03</div>
+        <div class="x-chapter-body">
+          <span class="eyebrow">THE SECOND WALL</span>
+          <h2 id="c3">Living inside an app.</h2>
+          <p>An Xbox runs apps in a sandbox. There is no command line, no child processes, and only the app variants of the file APIs. The engine had to become a UWP package: the same C code compiled with <code>PITHOS_UWP</code>, inside a small C++ shell that waits for a model, starts the server on the local network and draws a screen for the TV.</p>
+          <p>Everything happens from a PC through the console's Device Portal: <code>deploy.py</code> installs the package, uploads the 1.1 GB model into the app's folder, starts it and reads its log. The TV shows the state, the addresses to connect to, the log, and a chat you can use with the gamepad.</p>
+        </div>
+      </section>
+
+      <section class="x-chapter wrap" aria-labelledby="c4">
+        <div class="x-chapter-num">04</div>
+        <div class="x-chapter-body">
+          <span class="eyebrow">THE KEY</span>
+          <h2 id="c4">Game mode opens the GPU.</h2>
+          <p>As an ordinary app, the console offers Direct3D 11 at feature level 10.1: no compute shaders worth using. A small probe built into the app found the door. Set the app type to <em>Game</em> in Dev Home, and the same package gets <strong>5 GB of RAM and Direct3D 12</strong> with shader model 5.1. The probe then measured 1.36 TFLOPS and 49 GB/s.</p>
+          <p>There is no OpenCL on Xbox, and Pithos's GPU code was OpenCL. So we wrote a new backend: <strong>Direct3D 12, driven from plain C</strong>, with <code>d3d12.dll</code> loaded at runtime and shaders compiled ahead of time to bytecode the console understands.</p>
+        </div>
+      </section>
+
+      <section class="x-chapter x-chapter-wide wrap" aria-labelledby="c5">
+        <div class="x-chapter-num">05</div>
+        <div class="x-chapter-body">
+          <span class="eyebrow">FOUR STEPS</span>
+          <h2 id="c5">From the CPU to the GPU, one step at a time.</h2>
+          <p>Each step moved more of the work to the GPU and was measured on the console, in Game mode, with LFM3-1.7B Q4_K_M.</p>
+          <ol class="x-steps">
+            <li><span class="x-step-tag">Start</span><div><h3>CPU only, 6 threads</h3><p>The baseline in Game mode, where 6 threads leave room for the system.</p></div></li>
+            <li><span class="x-step-tag">Step 1</span><div><h3>Prompt matmuls on the GPU</h3><p>Q4_K and Q6_K weights copied once into GPU memory; tiles of 64 rows × 64 tokens.</p></div></li>
+            <li><span class="x-step-tag">Step 2</span><div><h3>Decoding on the GPU too</h3><p>Matrix-vector kernels with integer dot products, like the CPU kernels, and the 128,000-token output layer.</p></div></li>
+            <li><span class="x-step-tag">Step 3</span><div><h3>The whole token in one command list</h3><p>Norms, RoPE, attention, convolution and SwiGLU on the GPU, with its own KV cache. About 100 submissions per token became one, and only the logits come back.</p></div></li>
+            <li><span class="x-step-tag">Step 4</span><div><h3>The whole prompt too</h3><p>Chunks of 64 tokens in a single pass: a causal convolution over the chunk and attention with a running softmax.</p></div></li>
+          </ol>
+          <div class="x-charts">
+            <figure class="x-chart" aria-labelledby="chart-gen">
+              <figcaption id="chart-gen"><strong>Generation</strong> <span>tokens per second</span></figcaption>
+              <div class="x-bar" style="--v:5.8"><span>CPU, Game mode</span><b>5.8</b></div>
+              <div class="x-bar" style="--v:5.8"><span>Step 1</span><b>5.8</b></div>
+              <div class="x-bar" style="--v:17"><span>Step 2</span><b>17</b></div>
+              <div class="x-bar is-final" style="--v:29.5"><span>Steps 3–4</span><b>29.5</b></div>
+            </figure>
+            <figure class="x-chart is-prompt" aria-labelledby="chart-prompt">
+              <figcaption id="chart-prompt"><strong>Prompt</strong> <span>tokens per second</span></figcaption>
+              <div class="x-bar" style="--v:13.9"><span>CPU, Game mode</span><b>13.9</b></div>
+              <div class="x-bar" style="--v:53"><span>Step 1</span><b>53</b></div>
+              <div class="x-bar" style="--v:58"><span>Steps 2–3</span><b>58</b></div>
+              <div class="x-bar is-final" style="--v:146"><span>Step 4</span><b>146</b></div>
+            </figure>
+          </div>
+          <p class="x-small">In App mode the CPU, with all 8 threads, reached 7.3 and 17.6. Game mode trades two cores for the GPU and 5 GB of memory. Prompt speed falls to 121 tokens per second at 1,000 tokens, and generation to 26 after 1,000 tokens of context, because attention grows with the context.</p>
+        </div>
+      </section>
+
+      <section class="x-chapter wrap" aria-labelledby="c6">
+        <div class="x-chapter-num">06</div>
+        <div class="x-chapter-body">
+          <span class="eyebrow">WHAT THE CONSOLE TAUGHT US</span>
+          <h2 id="c6">Three bugs worth remembering.</h2>
+          <div class="x-lessons">
+            <article><h3>The compiler that miscounted</h3><p>One matrix kernel gave wrong results for some weight scales. A C emulation of the shader and the compiler's disassembly showed that <code>fxc</code> mishandled a computed byte index. Reading the scales as 16-bit halves fixed it.</p></article>
+            <article><h3>The branch that never ran, and hung the GPU</h3><p>The compiler flattens branches, so a load inside an <code>if</code> that never runs is still executed. With no bounds checks on raw buffers, an address built from a "no weight" marker froze the device. Now every address stays valid, taken or not.</p></article>
+            <article><h3>Noise is not an error</h3><p>Activations are rounded to 8 bits, and any change in summation order flips a few roundings that grow token after token. Even the CPU kernels differ in this way. So the GPU is validated on real text: the probability of each next word matches the CPU (2.678 vs 2.692 on average).</p></article>
+          </div>
+        </div>
+      </section>
+
+      <section class="x-chapter x-chapter-wide wrap" aria-labelledby="c7">
+        <div class="x-chapter-num">07</div>
+        <div class="x-chapter-body">
+          <span class="eyebrow">THE RESULT</span>
+          <h2 id="c7">An AI server for the whole house.</h2>
+          <p>The console now serves Pandora, the Pithos web chat, to any browser on the network, and the same OpenAI-compatible API any application can use. Conversations are saved on the console and resume where they stopped, even after a restart.</p>
+          <figure class="x-shot">
+            <img src="xbox-pandora-dark.png" width="1280" height="860" loading="lazy" alt="Pandora in a PC browser, connected to the Xbox, with an answer generated at 26.6 tokens per second.">
+            <figcaption>Pandora in a PC browser, served by the console. The answer was generated by the Xbox at 26.6 tokens per second.</figcaption>
+          </figure>
+          <div class="x-two">
+            <div><h3>What you get</h3><ul class="x-list">
+              <li>Web chat at <code>http://CONSOLE-IP:8080</code> for every device in the house</li>
+              <li>OpenAI-compatible API at <code>/v1</code>, with streaming and tool calls</li>
+              <li>A chat on the TV, used with the gamepad</li>
+              <li>Agent mode with file tools, calculator and date</li>
+              <li>Prompt reuse saved on the console</li>
+            </ul></div>
+            <div><h3>Honest limits</h3><ul class="x-list is-limits">
+              <li>Tested on an Xbox One S with LFM3-1.7B; the 24B model does not fit</li>
+              <li>Game mode must be set again after every reinstall</li>
+              <li>No shell commands, MCP servers or web search inside the sandbox</li>
+              <li>Needs Developer Mode and a PC to build and install</li>
+            </ul></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="x-chapter wrap" aria-labelledby="c8">
+        <div class="x-chapter-num">08</div>
+        <div class="x-chapter-body">
+          <span class="eyebrow">BACK TO THE PC</span>
+          <h2 id="c8">The console made the PC faster too.</h2>
+          <p>The Direct3D 12 backend also works on Windows PCs. On the reference laptop (GTX 1650), <code>--no-gpu --d3d12</code> runs LFM3-1.7B at <strong>330 tokens per second</strong> on the prompt and <strong>69</strong> on generation, against 67–103 and 56 with OpenCL. The AVX kernels give older PCs without AVX2 a fast CPU path. Nothing changed for the default path on Windows and Linux: the same tokens, at the same speed.</p>
+        </div>
+      </section>
+    </article>
+
+    <section class="x-try section-space wrap" id="try" aria-labelledby="try-title">
+      <div class="section-heading"><span class="eyebrow">TRY IT</span><h2 id="try-title">Turn your console into a server.</h2></div>
+      <ol class="x-try-steps">
+        <li><strong>Developer Mode.</strong> Activate it with the Xbox Dev Mode app (<a href="https://learn.microsoft.com/windows/uwp/xbox-apps/devkit-activation" target="_blank" rel="noopener noreferrer">Microsoft's guide ↗</a>) and turn on the Device Portal in Dev Home.</li>
+        <li><strong>Build on a Windows PC.</strong> Visual Studio 2022 with the C++ UWP tools and the Windows SDK. Create the certificate once, then build:<pre><code>powershell -ExecutionPolicy Bypass -File xbox\make_cert.ps1
+xbox\build.cmd</code></pre></li>
+        <li><strong>Install and upload the model.</strong><pre><code>python xbox\deploy.py --xbox CONSOLE-IP install
+python xbox\deploy.py --xbox CONSOLE-IP upload models\LFM3-1.7B-Q4_K_M.gguf</code></pre></li>
+        <li><strong>Game mode.</strong> Dev Home → Pithos.X Server → View details → App type: Game. Put <code>-t 6 --d3d12</code> in <code>pithos.args</code>, then start the app.</li>
+        <li><strong>Connect.</strong> Open <code>http://CONSOLE-IP:8080</code> from any device on the network.</li>
+      </ol>
+      <a class="button button-dark" href="https://github.com/benmaster82/Pithos#xbox-one" target="_blank" rel="noopener noreferrer">Full instructions in the README <svg aria-hidden="true" class="icon"><use href="#i-external"/></svg></a>
+    </section>
+
+    <section class="closing-cta wrap"><div><span class="eyebrow">BEFORE YOU REPLACE IT.</span><h2>Old hardware is not obsolete. <em>It is waiting for software.</em></h2><p>Pithos is open source, written in C, with no dependencies.</p></div><a class="button button-dark" href="index.html">Discover Pithos <svg aria-hidden="true" class="icon"><use href="#i-arrow"/></svg></a></section>
+  </main>
+
+  <footer class="wrap site-footer"><div><a class="brand" href="index.html"><img src="assets/pandora-mark.svg" width="27" height="27" alt=""><span>pithos<span class="brand-dot">.</span></span></a><p>Artificial intelligence. Closer to you.</p></div><div class="footer-links"><a href="https://github.com/benmaster82/Pithos" target="_blank" rel="noopener noreferrer">GitHub ↗</a><a href="https://github.com/benmaster82/Pithos#xbox-one" target="_blank" rel="noopener noreferrer">Xbox instructions ↗</a><a href="https://github.com/benmaster82/Pithos/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">Code license ↗</a><a href="https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF" target="_blank" rel="noopener noreferrer">LFM3-1.7B ↗</a></div><div class="footer-bottom"><span>An open-source project by <a href="https://github.com/benmaster82" target="_blank" rel="noopener noreferrer">benmaster82</a>. Xbox is a trademark of Microsoft; this project is not affiliated with or endorsed by Microsoft.</span><span>MIT-licensed code · Model weights retain their own license.</span></div></footer>
+</body>
+</html>

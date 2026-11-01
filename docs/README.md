@@ -13,6 +13,7 @@ The English landing page is published automatically by GitHub Pages from
 - `effects.js` / `effects.css`: decorative ASCII logo projection and inference pulses, with pause and reduced-motion support.
 - `app.js`: model picker (it drives the guide and every command on the page), installation guide, CPU/GPU diagram, tabs, clipboard, and local progress storage.
 - `assets/`: original project graphics and self-hosted fonts with license files.
+- `xbox.html`, `xbox.css`, `xbox.js`: the Pithos.X Server story page (linked as "Xbox" in the top navigation); it reuses the shared stylesheets and the screenshots `xbox-tv.png` and `xbox-pandora-dark.png` from this folder.
 
 Keep asset URLs relative so the site works at `/Pithos/`. When changing the public
 hostname, also update the canonical URL and Open Graph URLs in `index.html`.
