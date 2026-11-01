@@ -44,11 +44,12 @@ static int check(Dx *d, const char *name, const Mat *w, int nt) {
     return ok;
 }
 
-/* Whole-token decoding against the CPU: the same text read token by token through a GPU
- * context and a CPU-only one. Random token streams are chaotic (rounding differences grow), so
- * the check uses real text and compares what matters: the probability of the actual next token
- * and the top choice. Prompt chunks between single tokens move the KV cache and the
- * convolution state back and forth; over 300 positions pass the 256-token sliding window. */
+/* The whole forward pass against the CPU: the same text read through a GPU context and a
+ * CPU-only one, mostly token by token with prompt chunks of several sizes in between (one
+ * longer than the batch, some below DX_MV_TOKENS). Random token streams are chaotic (rounding
+ * differences grow), so the check uses real text and compares what matters: the probability
+ * of the actual next token and the top choice. Over 300 positions pass the 256-token sliding
+ * window. PITHOS_DX_CHUNKS=0 sends the chunks through the CPU (and the state back and forth). */
 static const char *TEXT =
     "The lighthouse keeper climbed the spiral stairs every evening at dusk, counting the steps as his father had "
     "taught him. There were one hundred and twelve of them, worn smooth in the middle by a century of boots. At "
@@ -79,10 +80,11 @@ static int check_dense(Model *m, Dx *d) {
     double nll_g = 0, nll_c = 0;
     int agree = 0, steps = 0;
     for (int pos = 0; pos + 1 < n;) {
-        const int k = pos % 80 == 0 && pos + 24 < n ? 24 : 1;    /* a prompt chunk every 80 positions */
+        int k = pos == 0 ? 100 : pos % 80 == 0 ? 24 : pos % 80 == 40 ? 5 : 1;   /* prompt chunks */
+        if (pos + k >= n) k = 1;
         const float *lg = ctx_forward(g, toks + pos, k), *lc = ctx_forward(c, toks + pos, k);
         pos += k;
-        if (k > 1 || pos >= n) continue;
+        if (pos >= n) continue;
         /* log-probability of the actual next token under each */
         double mg = -1e30, mc = -1e30, sg = 0, sc = 0;
         int ag = 0, ac = 0;
@@ -109,7 +111,7 @@ static int check_dense(Model *m, Dx *d) {
     /* Q8_K activations make any change of summation order flip some roundings, which then
      * propagate: even the CPU kernels (scalar, AVX, AVX2) differ at this level */
     const int ok = fabs(nll_g - nll_c) < 0.02 * nll_c && agree >= steps * 85 / 100;
-    printf("  whole tokens  %d tokens of text, %d read one at a time | top-1 agrees %d/%d | "
+    printf("  whole pass  %d tokens of text, %d predictions | top-1 agrees %d/%d | "
            "mean NLL GPU %.4f CPU %.4f %s\n", n, steps, agree, steps, nll_g, nll_c, ok ? "ok" : "FAIL");
     ctx_free(g);
     ctx_free(c);

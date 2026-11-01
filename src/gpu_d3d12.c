@@ -24,13 +24,13 @@ Dx *dx_create(const Model *m, char *info, int infolen) {
 void dx_destroy(Dx *d) { (void)d; }
 int dx_has(const Dx *d, const uint8_t *w) { (void)d; (void)w; return 0; }
 int dx_matmul(Dx *d, const DxJob *jobs, int n) { (void)d; (void)jobs; (void)n; return 0; }
-int dx_dense_init(Dx *d, const Model *m, int n_ctx, char *info, int infolen) {
-    (void)d; (void)m; (void)n_ctx;
+int dx_dense_init(Dx *d, const Model *m, int n_ctx, int n_batch, char *info, int infolen) {
+    (void)d; (void)m; (void)n_ctx; (void)n_batch;
     snprintf(info, (size_t)infolen, "Direct3D 12 needs Windows");
     return 0;
 }
-int dx_dense_token(Dx *d, const float *x, const float *rope_cs, const float *rope_swa, int pos, float *logits) {
-    (void)d; (void)x; (void)rope_cs; (void)rope_swa; (void)pos; (void)logits;
+int dx_dense_forward(Dx *d, const float *x, int n, const float *rope_cs, const float *rope_swa, int pos0, float *logits) {
+    (void)d; (void)x; (void)n; (void)rope_cs; (void)rope_swa; (void)pos0; (void)logits;
     return 0;
 }
 void dx_dense_kv(Dx *d, uint16_t *kc, uint16_t *vc, int r0, int r1, int to_gpu) {
@@ -65,7 +65,8 @@ static const GUID DX_IID_Factory1 = {0x770aae78, 0xf26f, 0x4dba, {0xa8, 0x29, 0x
 #define DX_MV_TOKENS 12     /* fewer tokens: one matrix-vector product per token */
 
 enum { K_Q4_K, K_Q6_K, N_KERNELS };
-enum { T_RESID, T_QUANT, T_SILU, T_CONV, T_PREP, T_ATTN, N_TOKEN_KERNELS };    /* kernels_dx_token.hlsl */
+enum { T_RESID, T_QUANT, T_SILU, T_CONV, T_PREP, T_ATTN, T_CONV_CHUNK, T_CONV_STATE, T_ATTN_CHUNK,
+       N_TOKEN_KERNELS };   /* kernels_dx_token.hlsl */
 enum { ROOT_CONST, ROOT_T0, ROOT_T1, ROOT_U0, ROOT_U1, ROOT_U2 };              /* root parameters */
 
 typedef struct {
@@ -344,9 +345,11 @@ static int create_pipeline(Dx *d, HMODULE lib) {
         if (FAILED(ID3D12Device_CreateComputePipelineState(d->dev, &pd, &DX_IID_PipelineState, (void **)dst)))
             return 0;
     }
-    const BYTE *tcode[N_TOKEN_KERNELS] = {g_resid_norm, g_quant, g_silu_quant, g_shortconv, g_attn_prep, g_attention};
+    const BYTE *tcode[N_TOKEN_KERNELS] = {g_resid_norm, g_quant, g_silu_quant, g_shortconv, g_attn_prep, g_attention,
+                                          g_conv_chunk, g_conv_state, g_attn_chunk};
     const size_t tsize[N_TOKEN_KERNELS] = {sizeof(g_resid_norm), sizeof(g_quant), sizeof(g_silu_quant),
-                                           sizeof(g_shortconv), sizeof(g_attn_prep), sizeof(g_attention)};
+                                           sizeof(g_shortconv), sizeof(g_attn_prep), sizeof(g_attention),
+                                           sizeof(g_conv_chunk), sizeof(g_conv_state), sizeof(g_attn_chunk)};
     for (int k = 0; k < N_TOKEN_KERNELS; k++) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd;
         memset(&pd, 0, sizeof(pd));
@@ -555,12 +558,13 @@ int dx_matmul(Dx *d, const DxJob *jobs, int n) {
     return 1;
 }
 
-/* ------------------------------------------------------------------ whole-token decoding
+/* ------------------------------------------------------------------ whole forward pass
  *
- * dx_dense_token records the whole forward pass of one token into one command list (kernels
- * in kernels_dx_token.hlsl between the mv_* matmuls, separated by UAV barriers) and reads back
- * only the logits. The GPU keeps its own copy of the KV cache and of the convolution state,
- * in the CPU layout; dx_dense_kv / dx_dense_conv move rows between the two. */
+ * dx_dense_forward records the forward pass of one token or of a prompt chunk into one command
+ * list (kernels in kernels_dx_token.hlsl between the matmuls, separated by UAV barriers) and
+ * reads back only the logits of the last token. The GPU keeps its own copy of the KV cache and
+ * of the convolution state, in the CPU layout; dx_dense_kv / dx_dense_conv move rows between
+ * the two. Activations have one row per token, for up to n_batch tokens. */
 
 #define NONE_OFF 0xffffffffu
 
@@ -571,13 +575,13 @@ typedef struct {
 
 typedef struct DxDense {
     const Model *m;
-    int n_ctx, D, hd, nh, nkv, kvd, F, lc, n_attn, n_conv;
+    int n_ctx, B, D, hd, nh, nkv, kvd, F, lc, n_attn, n_conv;
     DxLayer *layers;
     const DxMat *output;
     UINT final_norm;
     ID3D12Resource *scratch, *kv, *cs, *sw;
     D3D12_GPU_VIRTUAL_ADDRESS sva, kva, cva, wva;
-    DxBuf in, lrb;                  /* this token's input (upload), logits (readback) */
+    DxBuf in, lrb;                  /* the tokens' input (upload), logits (readback) */
     size_t kv_half;                 /* bytes of the key half of kv */
     size_t o_x, o_out, o_tmp, o_hq, o_big, o_gate, o_fg, o_fu, o_fq, o_sc, o_logits;
 } DxDense;
@@ -615,7 +619,7 @@ static size_t carve(size_t *top, size_t bytes) {
     return o;
 }
 
-int dx_dense_init(Dx *d, const Model *m, int n_ctx, char *info, int infolen) {
+int dx_dense_init(Dx *d, const Model *m, int n_ctx, int n_batch, char *info, int infolen) {
     info[0] = 0;
     if (!d || d->broken) return 0;
     const int D = m->dim, hd = m->head_dim;
@@ -634,6 +638,7 @@ int dx_dense_init(Dx *d, const Model *m, int n_ctx, char *info, int infolen) {
     DxDense *t = (DxDense *)calloc(1, sizeof(DxDense));
     t->m = m;
     t->n_ctx = n_ctx;
+    t->B = n_batch < 1 ? 1 : n_batch;
     t->D = D;
     t->hd = hd;
     t->nh = m->n_head;
@@ -685,16 +690,16 @@ int dx_dense_init(Dx *d, const Model *m, int n_ctx, char *info, int infolen) {
     }
 
     size_t top = 0;
-    const int big = 3 * D > D + 2 * t->kvd ? 3 * D : D + 2 * t->kvd;
-    t->o_x = carve(&top, (size_t)D * 4);
-    t->o_out = carve(&top, (size_t)D * 4);
-    t->o_tmp = carve(&top, (size_t)D * 4);
-    t->o_hq = carve(&top, (size_t)(D / QK_K) * Q8_BYTES);
-    t->o_big = carve(&top, (size_t)big * 4);
-    t->o_gate = carve(&top, (size_t)t->nh * 4);
-    t->o_fg = carve(&top, (size_t)F * 4);
-    t->o_fu = carve(&top, (size_t)F * 4);
-    t->o_fq = carve(&top, (size_t)(F / QK_K) * Q8_BYTES);
+    const size_t B = (size_t)t->B, big = 3 * D > D + 2 * t->kvd ? 3 * D : D + 2 * t->kvd;
+    t->o_x = carve(&top, B * D * 4);
+    t->o_out = carve(&top, B * D * 4);
+    t->o_tmp = carve(&top, B * D * 4);
+    t->o_hq = carve(&top, B * (D / QK_K) * Q8_BYTES);
+    t->o_big = carve(&top, B * big * 4);
+    t->o_gate = carve(&top, B * t->nh * 4);
+    t->o_fg = carve(&top, B * F * 4);
+    t->o_fu = carve(&top, B * F * 4);
+    t->o_fq = carve(&top, B * (F / QK_K) * Q8_BYTES);
     t->o_sc = carve(&top, (size_t)t->nh * (size_t)n_ctx * 4);
     t->o_logits = carve(&top, (size_t)m->n_vocab * 4);
     t->kv_half = (size_t)t->n_attn * (size_t)n_ctx * (size_t)t->kvd * 2;
@@ -703,7 +708,7 @@ int dx_dense_init(Dx *d, const Model *m, int n_ctx, char *info, int infolen) {
     t->kv = buffer(d, D3D12_HEAP_TYPE_DEFAULT, t->kv_half ? 2 * t->kv_half : 256, D3D12_RESOURCE_STATE_COMMON, 1);
     t->cs = buffer(d, D3D12_HEAP_TYPE_DEFAULT, cs_bytes ? cs_bytes : 256, D3D12_RESOURCE_STATE_COMMON, 1);
     t->sw = buffer(d, D3D12_HEAP_TYPE_DEFAULT, len * 4, D3D12_RESOURCE_STATE_COMMON, 0);
-    ok = t->scratch && t->kv && t->cs && t->sw && buf_reserve(d, &t->in, D3D12_HEAP_TYPE_UPLOAD, (size_t)(D + 2 * hd) * 4) &&
+    ok = t->scratch && t->kv && t->cs && t->sw && buf_reserve(d, &t->in, D3D12_HEAP_TYPE_UPLOAD, B * (size_t)(D + 2 * hd) * 4) &&
          buf_reserve(d, &t->lrb, D3D12_HEAP_TYPE_READBACK, (size_t)m->n_vocab * 4) &&
          buf_reserve(d, &d->up, D3D12_HEAP_TYPE_UPLOAD, len * 4);
     if (ok) {
@@ -714,14 +719,15 @@ int dx_dense_init(Dx *d, const Model *m, int n_ctx, char *info, int infolen) {
     free(sw);
     if (!ok) {
         dense_free(d);
-        snprintf(info, (size_t)infolen, "not enough GPU memory for a %d-token context", n_ctx);
+        snprintf(info, (size_t)infolen, "not enough GPU memory for a %d-token context and %d-token batches", n_ctx, t->B);
         return 0;
     }
     t->sva = ID3D12Resource_GetGPUVirtualAddress(t->scratch);
     t->kva = ID3D12Resource_GetGPUVirtualAddress(t->kv);
     t->cva = ID3D12Resource_GetGPUVirtualAddress(t->cs);
     t->wva = ID3D12Resource_GetGPUVirtualAddress(t->sw);
-    snprintf(info, (size_t)infolen, "whole tokens on the GPU, %.0f MB of KV cache", 2.0 * t->kv_half / 1048576.0);
+    snprintf(info, (size_t)infolen, "whole forward pass on the GPU, %.0f MB of KV cache, %.0f MB of activations",
+             2.0 * t->kv_half / 1048576.0, top / 1048576.0);
     return 1;
 }
 
@@ -732,21 +738,23 @@ static void uav_barrier(Dx *d) {
     ID3D12GraphicsCommandList_ResourceBarrier(d->cl, 1, &b);
 }
 
-/* out (scratch offset oo) = matrix x . the Q8_K row at scratch offset xo */
-static void tok_mv(Dx *d, const DxMat *x, size_t xo, size_t oo) {
+/* out[t][r] (scratch offset oo, rows orow floats apart) = matrix x . the Q8_K rows of n tokens at xo */
+static void tok_mm(Dx *d, const DxMat *x, size_t xo, size_t oo, int n, int orow) {
     const DxDense *t = d->dense;
     const UINT nb = (UINT)(x->K / QK_K);
-    const UINT p[6] = {(UINT)x->rows, nb, 1, (UINT)x->gpu_row, nb * Q8_BYTES, (UINT)x->rows};
+    const UINT p[6] = {(UINT)x->rows, nb, (UINT)n, (UINT)x->gpu_row, nb * Q8_BYTES, (UINT)orow};
+    const int mv = n < DX_MV_TOKENS;
     ID3D12GraphicsCommandList *cl = d->cl;
-    ID3D12GraphicsCommandList_SetPipelineState(cl, d->pso_mv[x->kernel]);
+    ID3D12GraphicsCommandList_SetPipelineState(cl, mv ? d->pso_mv[x->kernel] : d->pso[x->kernel]);
     ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(cl, ROOT_CONST, 6, p, 0);
     ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(cl, ROOT_T0, x->va);
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(cl, ROOT_U1, t->sva + xo);
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(cl, ROOT_U0, t->sva + oo);
-    ID3D12GraphicsCommandList_Dispatch(cl, (UINT)(x->rows + 7) / 8, 1, 1);
+    if (mv) ID3D12GraphicsCommandList_Dispatch(cl, (UINT)(x->rows + 7) / 8, (UINT)n, 1);
+    else ID3D12GraphicsCommandList_Dispatch(cl, (UINT)(x->rows + 63) / 64, (UINT)(n + 63) / 64, 1);
 }
 
-static void tok_run(Dx *d, int k, const UINT c[16], UINT groups) {
+static void tok_run(Dx *d, int k, const UINT c[16], UINT groups, UINT tokens) {
     const DxDense *t = d->dense;
     ID3D12GraphicsCommandList *cl = d->cl;
     ID3D12GraphicsCommandList_SetPipelineState(cl, d->pso_tok[k]);
@@ -756,7 +764,7 @@ static void tok_run(Dx *d, int k, const UINT c[16], UINT groups) {
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(cl, ROOT_U0, t->sva);
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(cl, ROOT_U1, t->kva);
     ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(cl, ROOT_U2, t->cva);
-    ID3D12GraphicsCommandList_Dispatch(cl, groups, 1, 1);
+    ID3D12GraphicsCommandList_Dispatch(cl, groups, tokens, 1);
     uav_barrier(d);
 }
 
@@ -767,76 +775,94 @@ static UINT fbits(float f) {
 }
 
 /* x = norm (mode 0: embedding from the input; 1: x += out, RMS-normalized by post) -> Q8_K at hq */
-static void tok_resid(Dx *d, UINT mode, UINT post, UINT norm) {
+static void tok_resid(Dx *d, UINT mode, UINT post, UINT norm, int n) {
     const DxDense *t = d->dense;
     const UINT c[16] = {(UINT)t->D, (UINT)t->o_x, (UINT)t->o_out, (UINT)t->o_hq, mode, post, norm, fbits(t->m->eps)};
-    tok_run(d, T_RESID, c, 1);
+    tok_run(d, T_RESID, c, 1, (UINT)n);
 }
 
-int dx_dense_token(Dx *d, const float *x, const float *rope_cs, const float *rope_swa, int pos, float *logits) {
+int dx_dense_forward(Dx *d, const float *x, int n, const float *rope_cs, const float *rope_swa, int pos0, float *logits) {
     DxDense *t = d ? d->dense : NULL;
-    if (!t || d->broken || pos >= t->n_ctx) return 0;
+    if (!t || d->broken || n < 1 || n > t->B || pos0 + n > t->n_ctx) return 0;
     const Model *m = t->m;
-    const int D = t->D, hd = t->hd, kvd = t->kvd;
-    memcpy(t->in.map, x, sizeof(float) * (size_t)D);
-    memcpy(t->in.map + 4 * (size_t)D, rope_cs, sizeof(float) * (size_t)hd);
-    if (rope_swa) memcpy(t->in.map + 4 * (size_t)(D + hd), rope_swa, sizeof(float) * (size_t)hd);
+    const int D = t->D, hd = t->hd, kvd = t->kvd, qkvw = D + 2 * kvd;
+    const UINT nb = (UINT)(D / QK_K), un = (UINT)n;
+    memcpy(t->in.map, x, sizeof(float) * (size_t)n * D);
+    memcpy(t->in.map + 4 * (size_t)n * D, rope_cs, sizeof(float) * (size_t)n * hd);
+    if (rope_swa) memcpy(t->in.map + 4 * (size_t)n * (D + hd), rope_swa, sizeof(float) * (size_t)n * hd);
     ID3D12GraphicsCommandList *cl = d->cl;
     ID3D12GraphicsCommandList_SetComputeRootSignature(cl, d->rs);
 
-    tok_resid(d, 0, NONE_OFF, t->layers[0].attn_norm);
+    tok_resid(d, 0, NONE_OFF, t->layers[0].attn_norm, n);
     for (int l = 0; l < m->n_layer; l++) {
         const Layer *L = &m->layers[l];
         const DxLayer *X = &t->layers[l];
         if (L->is_attn) {
-            tok_mv(d, X->wq, t->o_hq, t->o_big);
-            tok_mv(d, X->wk, t->o_hq, t->o_big + 4 * (size_t)D);
-            tok_mv(d, X->wv, t->o_hq, t->o_big + 4 * (size_t)(D + kvd));
-            if (X->gate) tok_mv(d, X->gate, t->o_hq, t->o_gate);
+            tok_mm(d, X->wq, t->o_hq, t->o_big, n, qkvw);
+            tok_mm(d, X->wk, t->o_hq, t->o_big + 4 * (size_t)D, n, qkvw);
+            tok_mm(d, X->wv, t->o_hq, t->o_big + 4 * (size_t)(D + kvd), n, qkvw);
+            if (X->gate) tok_mm(d, X->gate, t->o_hq, t->o_gate, n, t->nh);
             uav_barrier(d);
             const size_t kbase = (size_t)L->attn_idx * (size_t)t->n_ctx * (size_t)kvd * 2;
-            const size_t krow = kbase + (size_t)pos * (size_t)kvd * 2;
-            const UINT rope = (UINT)(4 * (L->is_swa && rope_swa ? D + hd : D));
+            const size_t krow = kbase + (size_t)pos0 * (size_t)kvd * 2;
+            const UINT rope = (UINT)(4 * (size_t)n * (L->is_swa && rope_swa ? D + hd : D));
             const UINT cp[16] = {(UINT)hd, (UINT)t->o_big, (UINT)D, (UINT)kvd, X->q_norm, X->k_norm, rope, fbits(m->eps),
                                  (UINT)krow, (UINT)(t->kv_half + krow), (UINT)t->nh};
-            tok_run(d, T_PREP, cp, (UINT)(t->nh + t->nkv));
-            const int npos = pos + 1, j0 = L->is_swa && npos > m->swa_window ? npos - m->swa_window : 0;
-            const UINT ca[16] = {(UINT)hd, (UINT)t->o_big, X->gate ? (UINT)t->o_gate : NONE_OFF, (UINT)t->o_tmp,
-                                 (UINT)kbase, (UINT)(t->kv_half + kbase), (UINT)kvd, (UINT)t->o_sc,
-                                 (UINT)j0, (UINT)npos, (UINT)(t->nh / t->nkv), (UINT)t->n_ctx,
-                                 fbits(1.f / sqrtf((float)hd))};
-            tok_run(d, T_ATTN, ca, (UINT)t->nh);
-            const UINT cq[16] = {(UINT)t->o_tmp, (UINT)t->o_hq};
-            tok_run(d, T_QUANT, cq, (UINT)(D / QK_K));
-            tok_mv(d, X->wo, t->o_hq, t->o_out);
+            tok_run(d, T_PREP, cp, (UINT)(t->nh + t->nkv), un);
+            const UINT gate = X->gate ? (UINT)t->o_gate : NONE_OFF, scale = fbits(1.f / sqrtf((float)hd));
+            if (n == 1) {
+                const int npos = pos0 + 1, j0 = L->is_swa && npos > m->swa_window ? npos - m->swa_window : 0;
+                const UINT ca[16] = {(UINT)hd, (UINT)t->o_big, gate, (UINT)t->o_tmp,
+                                     (UINT)kbase, (UINT)(t->kv_half + kbase), (UINT)kvd, (UINT)t->o_sc,
+                                     (UINT)j0, (UINT)npos, (UINT)(t->nh / t->nkv), (UINT)t->n_ctx, scale};
+                tok_run(d, T_ATTN, ca, (UINT)t->nh, 1);
+            } else {
+                const UINT ca[16] = {(UINT)hd, (UINT)t->o_big, gate, (UINT)t->o_tmp,
+                                     (UINT)kbase, (UINT)(t->kv_half + kbase), (UINT)kvd, 0,
+                                     (UINT)pos0, (UINT)(L->is_swa && m->swa_window > 0 ? m->swa_window : 0),
+                                     (UINT)(t->nh / t->nkv), (UINT)t->nh, scale, (UINT)D};
+                tok_run(d, T_ATTN_CHUNK, ca, (UINT)t->nh, un);
+            }
+            const UINT cq[16] = {(UINT)t->o_tmp, (UINT)t->o_hq, (UINT)D * 4, nb * Q8_BYTES};
+            tok_run(d, T_QUANT, cq, nb, un);
+            tok_mm(d, X->wo, t->o_hq, t->o_out, n, D);
         } else {
-            tok_mv(d, X->in_proj, t->o_hq, t->o_big);
+            tok_mm(d, X->in_proj, t->o_hq, t->o_big, n, 3 * D);
             uav_barrier(d);
-            const UINT cc[16] = {(UINT)D, (UINT)t->o_big, (UINT)t->o_hq, (UINT)t->lc, X->conv_w,
-                                 (UINT)((size_t)L->conv_idx * (size_t)(t->lc - 1) * (size_t)D * 4)};
-            tok_run(d, T_CONV, cc, (UINT)(D / QK_K));
-            tok_mv(d, X->out_proj, t->o_hq, t->o_out);
+            const UINT state = (UINT)((size_t)L->conv_idx * (size_t)(t->lc - 1) * (size_t)D * 4);
+            const UINT cc[16] = {(UINT)D, (UINT)t->o_big, (UINT)t->o_hq, (UINT)t->lc, X->conv_w, state};
+            if (n == 1) {
+                tok_run(d, T_CONV, cc, nb, 1);
+            } else {
+                tok_run(d, T_CONV_CHUNK, cc, nb, un);
+                const UINT cs[16] = {(UINT)D, (UINT)t->o_big, un, (UINT)t->lc, 0, state};
+                tok_run(d, T_CONV_STATE, cs, nb, 1);
+            }
+            tok_mm(d, X->out_proj, t->o_hq, t->o_out, n, D);
         }
         uav_barrier(d);
-        tok_resid(d, 1, X->post_op, X->ffn_norm);
-        tok_mv(d, X->w_gate, t->o_hq, t->o_fg);
-        tok_mv(d, X->w_up, t->o_hq, t->o_fu);
+        tok_resid(d, 1, X->post_op, X->ffn_norm, n);
+        const int F = X->w_gate->rows;
+        tok_mm(d, X->w_gate, t->o_hq, t->o_fg, n, F);
+        tok_mm(d, X->w_up, t->o_hq, t->o_fu, n, F);
         uav_barrier(d);
-        const UINT cs[16] = {(UINT)t->o_fg, (UINT)t->o_fu, (UINT)t->o_fq};
-        tok_run(d, T_SILU, cs, (UINT)(X->w_gate->rows / QK_K));
-        tok_mv(d, X->w_down, t->o_fq, t->o_out);
+        const UINT cs[16] = {(UINT)t->o_fg, (UINT)t->o_fu, (UINT)t->o_fq, (UINT)F};
+        tok_run(d, T_SILU, cs, (UINT)(F / QK_K), un);
+        tok_mm(d, X->w_down, t->o_fq, t->o_out, n, D);
         uav_barrier(d);
-        tok_resid(d, 1, X->post_ffn, l + 1 < m->n_layer ? t->layers[l + 1].attn_norm : t->final_norm);
+        tok_resid(d, 1, X->post_ffn, l + 1 < m->n_layer ? t->layers[l + 1].attn_norm : t->final_norm, n);
     }
-    tok_mv(d, t->output, t->o_hq, t->o_logits);
-    barrier(d, t->scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    ID3D12GraphicsCommandList_CopyBufferRegion(cl, t->lrb.res, 0, t->scratch, t->o_logits, (UINT64)m->n_vocab * 4);
+    if (logits) {
+        tok_mm(d, t->output, t->o_hq + (size_t)(n - 1) * nb * Q8_BYTES, t->o_logits, 1, m->n_vocab);
+        barrier(d, t->scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ID3D12GraphicsCommandList_CopyBufferRegion(cl, t->lrb.res, 0, t->scratch, t->o_logits, (UINT64)m->n_vocab * 4);
+    }
     if (!submit(d)) {
         d->broken = 1;
         fprintf(stderr, "Direct3D 12: the GPU stopped responding\n");
         return 0;
     }
-    memcpy(logits, t->lrb.map, sizeof(float) * (size_t)m->n_vocab);
+    if (logits) memcpy(logits, t->lrb.map, sizeof(float) * (size_t)m->n_vocab);
     return 1;
 }
 

@@ -220,6 +220,8 @@ struct Context {
     Dx *dx;                     /* optional Direct3D 12 GPU for prompt matmuls */
     int dx_min;                 /* tokens per batch from which matmuls go to dx */
     int dx_dense;               /* single tokens entirely on dx (same KV / conv bookkeeping as gpu_dense) */
+    int dx_chunks;              /* prompt chunks too */
+    float *rope;                /* [2][n_batch][head_dim] RoPE tables of a chunk's positions */
     /* dense decode path: single tokens run on the GPU, which keeps its own copy of the KV cache
      * and of the convolution state. Rows [0, kv_cpu_n) / [0, kv_gpu_n) are valid on each side. */
     int gpu_dense, kv_cpu_n, kv_gpu_n, conv_cpu_ok, conv_gpu_ok;
@@ -281,6 +283,7 @@ Context *ctx_create(Model *m, ThreadPool *pool, int n_ctx, int n_batch) {
     c->tmp = (float *)amalloc(sizeof(float) * B * D);
     c->out = (float *)amalloc(sizeof(float) * B * D);
     c->gate = (float *)amalloc(sizeof(float) * B * m->n_head);
+    c->rope = (float *)amalloc(sizeof(float) * 2 * B * m->head_dim);
     c->logits = (float *)amalloc(sizeof(float) * m->n_vocab);
     c->hq = (block_q8_K *)amalloc(sizeof(block_q8_K) * B * nbd);
     c->tq = (block_q8_K *)amalloc(sizeof(block_q8_K) * B * nbd);
@@ -316,7 +319,7 @@ Context *ctx_create(Model *m, ThreadPool *pool, int n_ctx, int n_batch) {
 void ctx_free(Context *c) {
     if (!c) return;
     if (c->pfq) prefetcher_destroy(c->pfq);
-    void *a[] = { c->kc, c->vc, c->conv, c->x, c->h, c->big, c->tmp, c->out, c->gate, c->logits, c->hq, c->tq,
+    void *a[] = { c->kc, c->vc, c->conv, c->x, c->h, c->big, c->tmp, c->out, c->gate, c->rope, c->logits, c->hq, c->tq,
                   c->fg, c->fu, c->fq, c->rlog, c->selw, c->sel, c->a_tok, c->a_slot, c->tok_a, c->xg,
                   c->eg, c->eu, c->eq, c->eo, c->scores, c->gy, c->on_gpu, c->ga_e, c->ga_t };
     for (size_t i = 0; i < sizeof(a) / sizeof(a[0]); i++) aligned_free(a[i]);
@@ -334,10 +337,12 @@ void ctx_set_gpu(Context *c, struct Gpu *g) {
 
 int ctx_set_dx(Context *c, struct Dx *d, char *info, int infolen) {
     c->dx = d;
-    const char *env = getenv("PITHOS_DX_MIN"), *dense = getenv("PITHOS_DX_DENSE");
+    const char *env = getenv("PITHOS_DX_MIN"), *dense = getenv("PITHOS_DX_DENSE"), *chunks = getenv("PITHOS_DX_CHUNKS");
     c->dx_min = env && atoi(env) > 0 ? atoi(env) : DX_MIN_TOKENS;
     info[0] = 0;
-    c->dx_dense = d && !c->gpu_dense && !(dense && dense[0] == '0') && dx_dense_init(d, c->m, c->n_ctx, info, infolen);
+    c->dx_dense = d && !c->gpu_dense && !(dense && dense[0] == '0') &&
+                  dx_dense_init(d, c->m, c->n_ctx, c->n_batch, info, infolen);
+    c->dx_chunks = c->dx_dense && !(chunks && chunks[0] == '0');   /* =0: prompts as before (matmuls only) */
     c->kv_gpu_n = 0;
     c->conv_gpu_ok = 0;
     return c->dx_dense;
@@ -935,29 +940,32 @@ static void rope_tables(const Context *c, int pos, float *rope, float *rope_swa)
     }
 }
 
-/* the whole token on the Direct3D 12 GPU (models without experts) */
-static void forward_token_dx(Context *c, int token, float *all_logits) {
+/* a token or a prompt chunk entirely on the Direct3D 12 GPU (models without experts) */
+static void forward_dx(Context *c, const int *tokens, int n, float *logits) {
     const Model *m = c->m;
-    const int D = m->dim, pos = c->pos;
-    if (c->kv_gpu_n < pos) {
-        dx_dense_kv(c->dx, c->kc, c->vc, c->kv_gpu_n, pos, 1);
-        c->kv_gpu_n = pos;
+    const int D = m->dim, hd = m->head_dim, pos0 = c->pos;
+    if (c->kv_gpu_n < pos0) {
+        dx_dense_kv(c->dx, c->kc, c->vc, c->kv_gpu_n, pos0, 1);
+        c->kv_gpu_n = pos0;
     }
     if (!c->conv_gpu_ok) {
         dx_dense_conv(c->dx, c->conv, 1);
         c->conv_gpu_ok = 1;
     }
-    if (token < 0 || token >= m->n_vocab) token = 0;
-    dequant_row(m->embed.type, m->embed.data + (size_t)token * m->embed.row_bytes, c->x, D);
-    float rope[512], rope_swa[512];
-    rope_tables(c, pos, rope, rope_swa);
-    if (!dx_dense_token(c->dx, c->x, rope, m->swa_window > 0 ? rope_swa : NULL, pos, c->logits))
+    float *rope = c->rope, *rope_swa = c->rope + (size_t)n * hd;
+    for (int t = 0; t < n; t++) {
+        int id = tokens[t];
+        if (id < 0 || id >= m->n_vocab) id = 0;
+        dequant_row(m->embed.type, m->embed.data + (size_t)id * m->embed.row_bytes, c->x + (size_t)t * D, D);
+        rope_tables(c, pos0 + t, rope + (size_t)t * hd, rope_swa + (size_t)t * hd);
+    }
+    if (!dx_dense_forward(c->dx, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL))
         memset(c->logits, 0, sizeof(float) * (size_t)m->n_vocab);   /* the GPU failed: the message says so */
-    if (all_logits) memcpy(all_logits, c->logits, sizeof(float) * (size_t)m->n_vocab);
-    c->pos++;
-    c->tok_counter++;
-    c->kv_gpu_n = pos + 1;
-    if (c->kv_cpu_n > pos) c->kv_cpu_n = pos;
+    if (logits && logits != c->logits) memcpy(logits, c->logits, sizeof(float) * (size_t)m->n_vocab);
+    c->pos += n;
+    c->tok_counter += (uint32_t)n;
+    c->kv_gpu_n = c->pos;
+    if (c->kv_cpu_n > pos0) c->kv_cpu_n = pos0;
     c->conv_cpu_ok = 0;
 }
 
@@ -1033,7 +1041,11 @@ static void forward_chunk(Context *c, const int *tokens, int n, int want_logits,
         return;
     }
     if (c->dx_dense && n == 1) {
-        forward_token_dx(c, tokens[0], all_logits);
+        forward_dx(c, tokens, 1, all_logits ? all_logits : c->logits);
+        return;
+    }
+    if (c->dx_dense && c->dx_chunks && !all_logits) {   /* logits of every token: the path below */
+        forward_dx(c, tokens, n, want_logits ? c->logits : NULL);
         return;
     }
     const int pos0 = c->pos;

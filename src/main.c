@@ -193,7 +193,7 @@ static void usage(void) {
         "      --gpu-mem MB        VRAM budget (default: VRAM - 900 MB)\n"
         "      --no-gpu-dense      keep attention/convolution/output on the CPU (GPU only for experts)\n"
         "      --list-gpus         list OpenCL devices and exit\n"
-        "      --d3d12             prompt matmuls on a Direct3D 12 GPU (Windows; Xbox in Game mode)\n"
+        "      --d3d12             run on a Direct3D 12 GPU (Windows; Xbox in Game mode)\n"
         "      --kernels K         force kernels: auto | scalar | avx (no AVX2)\n"
         "      --bench [PP,TG]     benchmark prompt processing and generation (default 128,64)\n"
         "      --tokenize TEXT     print token ids for TEXT and exit\n"
@@ -709,7 +709,7 @@ static int real_main(int argc, char **argv) {
         fprintf(stderr, "Direct3D 12: %s%s\n", dx ? "" : "not used, ", dinfo);
         if (dx) {
             int whole = ctx_set_dx(ctx, dx, dinfo, sizeof(dinfo));
-            if (dinfo[0]) fprintf(stderr, "             %s%s\n", whole ? "" : "single tokens: CPU and GPU, ", dinfo);
+            if (dinfo[0]) fprintf(stderr, "             %s%s\n", whole ? "" : "matmuls only: ", dinfo);
         }
     }
 

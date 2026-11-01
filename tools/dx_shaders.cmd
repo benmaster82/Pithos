@@ -12,7 +12,7 @@ for %%e in (mm_q4_K mm_q6_K mv_q4_K mv_q6_K) do (
     type %TEMP%\pithos_%%e.h >> %OUT%
     del %TEMP%\pithos_%%e.h
 )
-for %%e in (resid_norm quant silu_quant shortconv attn_prep attention) do (
+for %%e in (resid_norm quant silu_quant shortconv attn_prep attention conv_chunk conv_state attn_chunk) do (
     "%FXC%" /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E %%e /Vn g_%%e /Fh %TEMP%\pithos_%%e.h src\kernels_dx_token.hlsl >nul || goto fail
     type %TEMP%\pithos_%%e.h >> %OUT%
     del %TEMP%\pithos_%%e.h

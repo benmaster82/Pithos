@@ -96,10 +96,11 @@ class Portal:
         return body
 
     def package(self):
-        for p in self.json("GET", "/api/app/packagemanager/packages").get("InstalledPackages", []):
-            if p.get("Name") == PACKAGE_NAME or p.get("PackageFullName", "").startswith(PACKAGE_NAME + "_"):
-                return p
-        return None
+        """the newest installed version (an older one can stay listed until the console lets go of it)"""
+        found = [p for p in self.json("GET", "/api/app/packagemanager/packages").get("InstalledPackages", [])
+                 if p.get("Name") == PACKAGE_NAME or p.get("PackageFullName", "").startswith(PACKAGE_NAME + "_")]
+        ver = lambda p: tuple(p.get("Version", {}).get(k, 0) for k in ("Major", "Minor", "Build", "Revision"))
+        return max(found, key=ver) if found else None
 
 
 def b64(s):
