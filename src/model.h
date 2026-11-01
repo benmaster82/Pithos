@@ -81,7 +81,8 @@ void     ctx_set_prefetch(Context *c, int on);
 struct Gpu;
 void     ctx_set_gpu(Context *c, struct Gpu *g);
 struct Dx;
-void     ctx_set_dx(Context *c, struct Dx *d);
+/* info: whether single tokens run entirely on the GPU (returns 1), or why not */
+int      ctx_set_dx(Context *c, struct Dx *d, char *info, int infolen);
 
 /* Snapshot / restore the recurrent state + position (KV entries beyond pos are ignored). */
 typedef struct { int pos; float *conv; } CtxSnapshot;

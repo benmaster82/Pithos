@@ -219,6 +219,7 @@ struct Context {
     Gpu *gpu;                   /* optional expert co-processor (NULL = CPU only) */
     Dx *dx;                     /* optional Direct3D 12 GPU for prompt matmuls */
     int dx_min;                 /* tokens per batch from which matmuls go to dx */
+    int dx_dense;               /* single tokens entirely on dx (same KV / conv bookkeeping as gpu_dense) */
     /* dense decode path: single tokens run on the GPU, which keeps its own copy of the KV cache
      * and of the convolution state. Rows [0, kv_cpu_n) / [0, kv_gpu_n) are valid on each side. */
     int gpu_dense, kv_cpu_n, kv_gpu_n, conv_cpu_ok, conv_gpu_ok;
@@ -331,21 +332,28 @@ void ctx_set_gpu(Context *c, struct Gpu *g) {
     c->conv_gpu_ok = 0;
 }
 
-void ctx_set_dx(Context *c, struct Dx *d) {
+int ctx_set_dx(Context *c, struct Dx *d, char *info, int infolen) {
     c->dx = d;
-    const char *env = getenv("PITHOS_DX_MIN");
+    const char *env = getenv("PITHOS_DX_MIN"), *dense = getenv("PITHOS_DX_DENSE");
     c->dx_min = env && atoi(env) > 0 ? atoi(env) : DX_MIN_TOKENS;
+    info[0] = 0;
+    c->dx_dense = d && !c->gpu_dense && !(dense && dense[0] == '0') && dx_dense_init(d, c->m, c->n_ctx, info, infolen);
+    c->kv_gpu_n = 0;
+    c->conv_gpu_ok = 0;
+    return c->dx_dense;
 }
 
 /* make the host copy of the state current (before CPU work or a snapshot) */
 static void sync_to_cpu(Context *c, int kv_rows) {
-    if (!c->gpu_dense) return;
+    if (!c->gpu_dense && !c->dx_dense) return;
     if (c->kv_cpu_n < kv_rows) {
-        gpu_dense_kv(c->gpu, c->kc, c->vc, c->kv_cpu_n, kv_rows, 0);
+        if (c->gpu_dense) gpu_dense_kv(c->gpu, c->kc, c->vc, c->kv_cpu_n, kv_rows, 0);
+        else dx_dense_kv(c->dx, c->kc, c->vc, c->kv_cpu_n, kv_rows, 0);
         c->kv_cpu_n = kv_rows;
     }
     if (!c->conv_cpu_ok) {
-        gpu_dense_conv(c->gpu, c->conv, 0);
+        if (c->gpu_dense) gpu_dense_conv(c->gpu, c->conv, 0);
+        else dx_dense_conv(c->dx, c->conv, 0);
         c->conv_cpu_ok = 1;
     }
 }
@@ -915,9 +923,47 @@ static int cpu_experts_one(Context *c, const Layer *L, const int *sel, const int
 }
 
 /* One token through every layer on the GPU; the CPU only computes the non-resident experts. */
+/* cos | sin of the RoPE angles at pos, for full and sliding-window attention layers */
+static void rope_tables(const Context *c, int pos, float *rope, float *rope_swa) {
+    const int hd = c->m->head_dim;
+    for (int i = 0; i < hd / 2; i++) {
+        const double a = (double)pos * c->inv_freq[i], as = (double)pos * c->inv_freq_swa[i];
+        rope[i] = (float)cos(a);
+        rope[hd / 2 + i] = (float)sin(a);
+        rope_swa[i] = (float)cos(as);
+        rope_swa[hd / 2 + i] = (float)sin(as);
+    }
+}
+
+/* the whole token on the Direct3D 12 GPU (models without experts) */
+static void forward_token_dx(Context *c, int token, float *all_logits) {
+    const Model *m = c->m;
+    const int D = m->dim, pos = c->pos;
+    if (c->kv_gpu_n < pos) {
+        dx_dense_kv(c->dx, c->kc, c->vc, c->kv_gpu_n, pos, 1);
+        c->kv_gpu_n = pos;
+    }
+    if (!c->conv_gpu_ok) {
+        dx_dense_conv(c->dx, c->conv, 1);
+        c->conv_gpu_ok = 1;
+    }
+    if (token < 0 || token >= m->n_vocab) token = 0;
+    dequant_row(m->embed.type, m->embed.data + (size_t)token * m->embed.row_bytes, c->x, D);
+    float rope[512], rope_swa[512];
+    rope_tables(c, pos, rope, rope_swa);
+    if (!dx_dense_token(c->dx, c->x, rope, m->swa_window > 0 ? rope_swa : NULL, pos, c->logits))
+        memset(c->logits, 0, sizeof(float) * (size_t)m->n_vocab);   /* the GPU failed: the message says so */
+    if (all_logits) memcpy(all_logits, c->logits, sizeof(float) * (size_t)m->n_vocab);
+    c->pos++;
+    c->tok_counter++;
+    c->kv_gpu_n = pos + 1;
+    if (c->kv_cpu_n > pos) c->kv_cpu_n = pos;
+    c->conv_cpu_ok = 0;
+}
+
 static void forward_token_gpu(Context *c, int token, float *all_logits) {
     const Model *m = c->m;
-    const int D = m->dim, K = m->n_expert_used, hd = m->head_dim, pos = c->pos;
+    const int D = m->dim, K = m->n_expert_used, pos = c->pos;
     Gpu *g = c->gpu;
     if (c->kv_gpu_n < pos) {
         gpu_dense_kv(g, c->kc, c->vc, c->kv_gpu_n, pos, 1);
@@ -930,13 +976,7 @@ static void forward_token_gpu(Context *c, int token, float *all_logits) {
     if (token < 0 || token >= m->n_vocab) token = 0;
     dequant_row(m->embed.type, m->embed.data + (size_t)token * m->embed.row_bytes, c->x, D);
     float rope[512], rope_swa[512];
-    for (int i = 0; i < hd / 2; i++) {
-        const double a = (double)pos * c->inv_freq[i], as = (double)pos * c->inv_freq_swa[i];
-        rope[i] = (float)cos(a);
-        rope[hd / 2 + i] = (float)sin(a);
-        rope_swa[i] = (float)cos(as);
-        rope_swa[hd / 2 + i] = (float)sin(as);
-    }
+    rope_tables(c, pos, rope, rope_swa);
     gpu_dense_begin(g, c->x, rope, m->swa_window > 0 ? rope_swa : NULL, pos);
     for (int l = 0; l < m->n_layer; l++) {
         const Layer *L = &m->layers[l];
@@ -990,6 +1030,10 @@ static void forward_chunk(Context *c, const int *tokens, int n, int want_logits,
     const int D = m->dim;
     if (c->gpu_dense && n == 1) {
         forward_token_gpu(c, tokens[0], all_logits);
+        return;
+    }
+    if (c->dx_dense && n == 1) {
+        forward_token_dx(c, tokens[0], all_logits);
         return;
     }
     const int pos0 = c->pos;

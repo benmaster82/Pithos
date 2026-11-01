@@ -707,7 +707,10 @@ static int real_main(int argc, char **argv) {
         char dinfo[512];
         dx = dx_create(&m, dinfo, sizeof(dinfo));
         fprintf(stderr, "Direct3D 12: %s%s\n", dx ? "" : "not used, ", dinfo);
-        ctx_set_dx(ctx, dx);
+        if (dx) {
+            int whole = ctx_set_dx(ctx, dx, dinfo, sizeof(dinfo));
+            if (dinfo[0]) fprintf(stderr, "             %s%s\n", whole ? "" : "single tokens: CPU and GPU, ", dinfo);
+        }
     }
 
     Engine e;

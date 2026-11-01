@@ -13,7 +13,7 @@
 // Regenerate kernels_dx.h after editing:  tools\dx_shaders.cmd
 
 ByteAddressBuffer W : register(t0);     // weight rows, wrow bytes apart
-ByteAddressBuffer X : register(t1);     // Q8_K activation rows, xrow bytes apart
+RWByteAddressBuffer X : register(u1);   // Q8_K activation rows, xrow bytes apart (the decode pass's scratch)
 RWByteAddressBuffer O : register(u0);   // out[t * orow + r], floats
 
 cbuffer P : register(b0) {

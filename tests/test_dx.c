@@ -8,6 +8,7 @@
 #include "../src/model.h"
 #include "../src/platform.h"
 #include "../src/quant.h"
+#include "../src/tokenizer.h"
 
 static int check(Dx *d, const char *name, const Mat *w, int nt) {
     const int K = w->cols, nbk = K / QK_K;
@@ -43,6 +44,80 @@ static int check(Dx *d, const char *name, const Mat *w, int nt) {
     return ok;
 }
 
+/* Whole-token decoding against the CPU: the same text read token by token through a GPU
+ * context and a CPU-only one. Random token streams are chaotic (rounding differences grow), so
+ * the check uses real text and compares what matters: the probability of the actual next token
+ * and the top choice. Prompt chunks between single tokens move the KV cache and the
+ * convolution state back and forth; over 300 positions pass the 256-token sliding window. */
+static const char *TEXT =
+    "The lighthouse keeper climbed the spiral stairs every evening at dusk, counting the steps as his father had "
+    "taught him. There were one hundred and twelve of them, worn smooth in the middle by a century of boots. At "
+    "the top he wiped the great lens with a soft cloth, trimmed the wick, and lit the lamp. Out on the water the "
+    "fishing boats were already turning for home, their engines a low hum beneath the cries of the gulls. He "
+    "liked this hour best: the sea grew dark before the sky did, and for a few minutes the horizon was a thin "
+    "silver line that seemed to hold the whole world together. Il guardiano del faro scendeva poi in cucina, "
+    "dove la moglie aveva preparato una zuppa di pesce con il pane del giorno prima. Parlavano del tempo, delle "
+    "reti da riparare e del figlio che studiava ingegneria in città e scriveva lettere lunghe e piene di disegni. "
+    "Nelle notti di tempesta il vento faceva vibrare i vetri e lui restava sveglio fino all'alba, controllando "
+    "che la luce non si spegnesse mai. In spring the keeper planted tomatoes in the sheltered corner behind the "
+    "tower, where the stone walls kept off the salt wind. In summer tourists came on the ferry and asked to see "
+    "the lamp; he showed them gladly, explaining how the lens bent the light into a beam that could be seen "
+    "twenty miles away. In autumn the storms returned, and in winter the island was quiet again, with only the "
+    "two of them, the radio, and the long white beam sweeping across the black water every ten seconds.";
+
+static int check_dense(Model *m, Dx *d) {
+    char err[256];
+    Tokenizer *tk = tok_load(&m->gguf, err, sizeof(err));
+    ThreadPool *pool = pool_create(4);
+    Context *g = ctx_create(m, pool, 1024, 64), *c = ctx_create(m, pool, 1024, 64);
+    if (!tk || (!getenv("DX_NONE") && !ctx_set_dx(g, d, err, sizeof(err)) && !getenv("PITHOS_DX_DENSE"))) {   /* =0: matmuls only */
+        printf("  whole-token decoding not available: %s\n", tk ? err : "no tokenizer");
+        return 1;
+    }
+    static int toks[1024];
+    const int n = tok_encode(tk, TEXT, (int)strlen(TEXT), 0, toks, 1024);
+    double nll_g = 0, nll_c = 0;
+    int agree = 0, steps = 0;
+    for (int pos = 0; pos + 1 < n;) {
+        const int k = pos % 80 == 0 && pos + 24 < n ? 24 : 1;    /* a prompt chunk every 80 positions */
+        const float *lg = ctx_forward(g, toks + pos, k), *lc = ctx_forward(c, toks + pos, k);
+        pos += k;
+        if (k > 1 || pos >= n) continue;
+        /* log-probability of the actual next token under each */
+        double mg = -1e30, mc = -1e30, sg = 0, sc = 0;
+        int ag = 0, ac = 0;
+        for (int v = 0; v < m->n_vocab; v++) {
+            if (lg[v] > mg) { mg = lg[v]; ag = v; }
+            if (lc[v] > mc) { mc = lc[v]; ac = v; }
+        }
+        for (int v = 0; v < m->n_vocab; v++) {
+            sg += exp(lg[v] - mg);
+            sc += exp(lc[v] - mc);
+        }
+        nll_g += mg + log(sg) - lg[toks[pos]];
+        nll_c += mc + log(sc) - lc[toks[pos]];
+        agree += ag == ac;
+        if (getenv("DX_TRACE") && steps < 12) {
+            double e = 0;
+            for (int v = 0; v < m->n_vocab; v++) e = fmax(e, fabs(lg[v] - lc[v]));
+            printf("    pos %3d  max |logit diff| %.5f (top %.3f)  top1 %s\n", pos - 1, e, mc, ag == ac ? "=" : "x");
+        }
+        steps++;
+    }
+    nll_g /= steps;
+    nll_c /= steps;
+    /* Q8_K activations make any change of summation order flip some roundings, which then
+     * propagate: even the CPU kernels (scalar, AVX, AVX2) differ at this level */
+    const int ok = fabs(nll_g - nll_c) < 0.02 * nll_c && agree >= steps * 85 / 100;
+    printf("  whole tokens  %d tokens of text, %d read one at a time | top-1 agrees %d/%d | "
+           "mean NLL GPU %.4f CPU %.4f %s\n", n, steps, agree, steps, nll_g, nll_c, ok ? "ok" : "FAIL");
+    ctx_free(g);
+    ctx_free(c);
+    pool_destroy(pool);
+    tok_free(tk);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     Model m;
     char err[512];
@@ -73,6 +148,7 @@ int main(int argc, char **argv) {
         if (!dx_has(d, pick[i]->data)) { printf("  %-10s not on the GPU\n", names[i]); ok = 0; continue; }
         for (size_t k = 0; k < sizeof(nts) / sizeof(nts[0]); k++) ok &= check(d, names[i], pick[i], nts[k]);
     }
+    ok &= check_dense(&m, d);
     dx_destroy(d);
     printf("%s\n", ok ? "test_dx: OK" : "test_dx: FAILED");
     return ok ? 0 : 1;
