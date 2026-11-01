@@ -2,10 +2,12 @@
  *
  * Every weight matrix lives in its own GPU buffer (Q6_K blocks are repacked from 210 to 212
  * bytes so that the shaders read aligned words). dx_matmul copies the Q8_K activations into a
- * GPU buffer, dispatches one kernel per matrix (kernels_dx.hlsl: 64 rows x 64 tokens per
- * group) and reads the results back, all in one command list. Buffers rely on the implicit
+ * GPU buffer, dispatches one kernel per matrix (kernels_dx.hlsl: tiles of 64 rows x 64 tokens
+ * for batches, 8 rows of one token per group below DX_MV_TOKENS) and reads the results back,
+ * all in one command list. Buffers rely on the implicit
  * state promotion from COMMON at the start of each command list and decay back after it. */
 #include "gpu_dx.h"
+#include "platform.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +46,7 @@ static const GUID DX_IID_Factory1 = {0x770aae78, 0xf26f, 0x4dba, {0xa8, 0x29, 0x
 #define Q8_BYTES 292        /* sizeof(block_q8_K) */
 #define Q6K_GPU_BYTES 212   /* repacked q6_K block */
 #define STAGE_BYTES (64u << 20)
+#define DX_MV_TOKENS 12     /* fewer tokens: one matrix-vector product per token */
 
 enum { K_Q4_K, K_Q6_K, N_KERNELS };
 
@@ -71,7 +74,7 @@ struct Dx {
     HANDLE event;
     UINT64 fence_val;
     ID3D12RootSignature *rs;
-    ID3D12PipelineState *pso[N_KERNELS];
+    ID3D12PipelineState *pso[N_KERNELS], *pso_mv[N_KERNELS];
     DxMat *mats;                    /* sorted by host address */
     int nmats, broken;
     DxBuf up, x, o, rb;             /* upload, activations, results, readback */
@@ -153,6 +156,10 @@ static int submit(Dx *d) {
     ID3D12CommandQueue_ExecuteCommandLists(d->queue, 1, lists);
     const UINT64 v = ++d->fence_val;
     if (FAILED(ID3D12CommandQueue_Signal(d->queue, d->fence, v))) return 0;
+    /* decoding submits ~100 short command lists per token: poll for the first 2 ms, which
+     * answers sooner than waking up from the event */
+    const double t0 = time_sec();
+    while (ID3D12Fence_GetCompletedValue(d->fence) < v && time_sec() - t0 < 2e-3) YieldProcessor();
     if (ID3D12Fence_GetCompletedValue(d->fence) < v) {
         if (FAILED(ID3D12Fence_SetEventOnCompletion(d->fence, v, d->event))) return 0;
         WaitForSingleObjectEx(d->event, INFINITE, FALSE);
@@ -196,14 +203,15 @@ static const DxMat *find_mat(const Dx *d, const uint8_t *w) {
     return NULL;
 }
 
-/* file layout -> GPU layout of one matrix */
-static void pack_mat(const DxMat *x, uint8_t *dst) {
+/* file layout -> GPU layout of rows [r0, r1) of a matrix */
+static void pack_rows(const DxMat *x, int r0, int r1, uint8_t *dst) {
+    const uint8_t *src = x->host + (size_t)r0 * x->row_bytes;
     if (x->kernel != K_Q6_K) {
-        memcpy(dst, x->host, x->row_bytes * (size_t)x->rows);
+        memcpy(dst, src, x->row_bytes * (size_t)(r1 - r0));
         return;
     }
-    const size_t nblk = (size_t)x->rows * (size_t)(x->K / QK_K);
-    const block_q6_K *b = (const block_q6_K *)x->host;
+    const size_t nblk = (size_t)(r1 - r0) * (size_t)(x->K / QK_K);
+    const block_q6_K *b = (const block_q6_K *)src;
     for (size_t i = 0; i < nblk; i++, dst += Q6K_GPU_BYTES) {
         memcpy(dst, &b[i].d, 2);
         dst[2] = dst[3] = 0;
@@ -213,6 +221,7 @@ static void pack_mat(const DxMat *x, uint8_t *dst) {
     }
 }
 
+/* matrices go up through the staging buffer, in pieces of whole rows when they do not fit */
 static int upload_weights(Dx *d, char *err, int errlen) {
     if (!buf_reserve(d, &d->up, D3D12_HEAP_TYPE_UPLOAD, STAGE_BYTES)) {
         snprintf(err, (size_t)errlen, "cannot allocate the upload buffer");
@@ -221,24 +230,26 @@ static int upload_weights(Dx *d, char *err, int errlen) {
     size_t used = 0;
     for (int i = 0; i < d->nmats; i++) {
         DxMat *x = &d->mats[i];
-        const size_t bytes = x->gpu_row * (size_t)x->rows;
-        if (bytes > d->up.size) {
-            snprintf(err, (size_t)errlen, "matrix of %zu MB is larger than the upload buffer", bytes >> 20);
-            return 0;
-        }
-        x->res = buffer(d, D3D12_HEAP_TYPE_DEFAULT, bytes, D3D12_RESOURCE_STATE_COMMON, 0);
+        x->res = buffer(d, D3D12_HEAP_TYPE_DEFAULT, x->gpu_row * (size_t)x->rows, D3D12_RESOURCE_STATE_COMMON, 0);
         if (!x->res) {
             snprintf(err, (size_t)errlen, "out of GPU memory after %d of %d matrices", i, d->nmats);
             return 0;
         }
         x->va = ID3D12Resource_GetGPUVirtualAddress(x->res);
-        if (used + bytes > d->up.size) {
-            if (!submit(d)) { snprintf(err, (size_t)errlen, "weight upload failed"); return 0; }
-            used = 0;
+        for (int r0 = 0; r0 < x->rows;) {
+            int n = (int)((d->up.size - used) / x->gpu_row);
+            if (n > x->rows - r0) n = x->rows - r0;
+            if (n < 1 || (n < x->rows - r0 && used)) {   /* full: send what is staged */
+                if (!submit(d)) { snprintf(err, (size_t)errlen, "weight upload failed"); return 0; }
+                used = 0;
+                continue;
+            }
+            const size_t bytes = x->gpu_row * (size_t)n;
+            pack_rows(x, r0, r0 + n, d->up.map + used);
+            ID3D12GraphicsCommandList_CopyBufferRegion(d->cl, x->res, x->gpu_row * (size_t)r0, d->up.res, used, bytes);
+            used = (used + bytes + 255) & ~(size_t)255;
+            r0 += n;
         }
-        pack_mat(x, d->up.map + used);
-        ID3D12GraphicsCommandList_CopyBufferRegion(d->cl, x->res, 0, d->up.res, used, bytes);
-        used = (used + bytes + 255) & ~(size_t)255;
     }
     if (!submit(d)) { snprintf(err, (size_t)errlen, "weight upload failed"); return 0; }
     buf_free(&d->up);   /* dx_matmul allocates what it needs */
@@ -270,15 +281,16 @@ static int create_pipeline(Dx *d, HMODULE lib) {
                                                   ID3D10Blob_GetBufferSize(blob), &DX_IID_RootSignature, (void **)&d->rs);
     ID3D10Blob_Release(blob);
     if (FAILED(hr)) return 0;
-    const BYTE *code[N_KERNELS] = {g_mm_q4_K, g_mm_q6_K};
-    const size_t size[N_KERNELS] = {sizeof(g_mm_q4_K), sizeof(g_mm_q6_K)};
-    for (int k = 0; k < N_KERNELS; k++) {
+    const BYTE *code[2 * N_KERNELS] = {g_mm_q4_K, g_mm_q6_K, g_mv_q4_K, g_mv_q6_K};
+    const size_t size[2 * N_KERNELS] = {sizeof(g_mm_q4_K), sizeof(g_mm_q6_K), sizeof(g_mv_q4_K), sizeof(g_mv_q6_K)};
+    for (int k = 0; k < 2 * N_KERNELS; k++) {
         D3D12_COMPUTE_PIPELINE_STATE_DESC pd;
         memset(&pd, 0, sizeof(pd));
         pd.pRootSignature = d->rs;
         pd.CS.pShaderBytecode = code[k];
         pd.CS.BytecodeLength = size[k];
-        if (FAILED(ID3D12Device_CreateComputePipelineState(d->dev, &pd, &DX_IID_PipelineState, (void **)&d->pso[k])))
+        ID3D12PipelineState **dst = k < N_KERNELS ? &d->pso[k] : &d->pso_mv[k - N_KERNELS];
+        if (FAILED(ID3D12Device_CreateComputePipelineState(d->dev, &pd, &DX_IID_PipelineState, (void **)dst)))
             return 0;
     }
     return 1;
@@ -361,6 +373,7 @@ Dx *dx_create(const Model *m, char *info, int infolen) {
                            &L->w_gate, &L->w_up, &L->w_down};
         for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) add_mat(d, ws[i], &cap);
     }
+    add_mat(d, &m->output, &cap);
     if (!d->nmats) {
         snprintf(info, (size_t)infolen, "no Q4_K / Q6_K dense weights in this model");
         dx_destroy(d);
@@ -388,8 +401,10 @@ void dx_destroy(Dx *d) {
     buf_free(&d->x);
     buf_free(&d->o);
     buf_free(&d->rb);
-    for (int k = 0; k < N_KERNELS; k++)
+    for (int k = 0; k < N_KERNELS; k++) {
         if (d->pso[k]) ID3D12PipelineState_Release(d->pso[k]);
+        if (d->pso_mv[k]) ID3D12PipelineState_Release(d->pso_mv[k]);
+    }
     if (d->rs) ID3D12RootSignature_Release(d->rs);
     if (d->fence) ID3D12Fence_Release(d->fence);
     if (d->cl) ID3D12GraphicsCommandList_Release(d->cl);
@@ -447,12 +462,14 @@ int dx_matmul(Dx *d, const DxJob *jobs, int n) {
         const DxMat *x = mat[i];
         const UINT nb = (UINT)(x->K / QK_K);
         const UINT p[6] = {(UINT)x->rows, nb, (UINT)jobs[i].nt, (UINT)x->gpu_row, nb * Q8_BYTES, (UINT)x->rows};
-        ID3D12GraphicsCommandList_SetPipelineState(cl, d->pso[x->kernel]);
+        const int mv = jobs[i].nt < DX_MV_TOKENS;
+        ID3D12GraphicsCommandList_SetPipelineState(cl, mv ? d->pso_mv[x->kernel] : d->pso[x->kernel]);
         ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(cl, 0, 6, p, 0);
         ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(cl, 1, x->va);
         ID3D12GraphicsCommandList_SetComputeRootShaderResourceView(cl, 2, xva + xoff[i]);
         ID3D12GraphicsCommandList_SetComputeRootUnorderedAccessView(cl, 3, ova + ooff[i]);
-        ID3D12GraphicsCommandList_Dispatch(cl, (UINT)(x->rows + 63) / 64, (UINT)(jobs[i].nt + 63) / 64, 1);
+        if (mv) ID3D12GraphicsCommandList_Dispatch(cl, (UINT)(x->rows + 7) / 8, (UINT)jobs[i].nt, 1);
+        else ID3D12GraphicsCommandList_Dispatch(cl, (UINT)(x->rows + 63) / 64, (UINT)(jobs[i].nt + 63) / 64, 1);
     }
     barrier(d, d->o.res, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     ID3D12GraphicsCommandList_CopyBufferRegion(cl, d->rb.res, 0, d->o.res, 0, obytes);

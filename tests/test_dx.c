@@ -52,8 +52,8 @@ int main(int argc, char **argv) {
     if (!d) { printf("no Direct3D 12: %s\n", err); return 0; }
     printf("Direct3D 12: %s\n", err);
     /* the first layer with each shape and type */
-    const Mat *pick[8] = {0};
-    const char *names[8] = {"ffn_up", "ffn_down/4", "ffn_down/6", "attn_q", "attn_k", "attn_gate", "in_proj", "attn_v/6"};
+    const Mat *pick[9] = {0};
+    const char *names[9] = {"ffn_up", "ffn_down/4", "ffn_down/6", "attn_q", "attn_k", "attn_gate", "in_proj", "attn_v/6", "output"};
     for (int l = 0; l < m.n_layer; l++) {
         const Layer *L = &m.layers[l];
         if (!pick[0] && L->w_up.data) pick[0] = &L->w_up;
@@ -65,9 +65,10 @@ int main(int argc, char **argv) {
         if (!pick[6] && L->in_proj.data) pick[6] = &L->in_proj;
         if (!pick[7] && L->wv.data && L->wv.type == GGML_Q6_K) pick[7] = &L->wv;
     }
+    pick[8] = &m.output;
     int ok = 1;
-    const int nts[] = {1, 37, 64, 256};
-    for (int i = 0; i < 8; i++) {
+    const int nts[] = {1, 3, 8, 37, 64, 256};
+    for (int i = 0; i < 9; i++) {
         if (!pick[i]) continue;
         if (!dx_has(d, pick[i]->data)) { printf("  %-10s not on the GPU\n", names[i]); ok = 0; continue; }
         for (size_t k = 0; k < sizeof(nts) / sizeof(nts[0]); k++) ok &= check(d, names[i], pick[i], nts[k]);

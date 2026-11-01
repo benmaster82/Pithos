@@ -1,10 +1,14 @@
-// kernels_dx.hlsl - Direct3D 12 compute kernels for gpu_d3d12.c (prompt matmuls).
+// kernels_dx.hlsl - Direct3D 12 compute kernels for gpu_d3d12.c (matmuls).
 //
-// out[t][r] = sum_k W[r][k] * x[t][k] for a tile of 64 weight rows x 64 tokens per group of
-// 256 threads. Weights stay quantized in GPU memory (Q4_K as in the GGUF file, Q6_K repacked
-// to 4-byte aligned 212-byte blocks, see gpu_d3d12.c); activations are the Q8_K rows the CPU
-// path uses. Each step dequantizes a 32-wide slice of K into group-shared memory, then every
-// thread accumulates 4 rows x 4 tokens.
+// out[t][r] = sum_k W[r][k] * x[t][k]. Weights stay quantized in GPU memory (Q4_K as in the
+// GGUF file, Q6_K repacked to 4-byte aligned 212-byte blocks, see gpu_d3d12.c); activations
+// are the Q8_K rows the CPU path uses.
+// mm_*: batches. A group of 256 threads computes a tile of 64 rows x 64 tokens: each step
+//       dequantizes a 32-wide slice of K into group-shared memory, then every thread
+//       accumulates 4 rows x 4 tokens.
+// mv_*: a few tokens (decoding). A group computes 8 rows of one token; the 32 threads of a
+//       row split it into 64-value pieces, take integer dot products like the CPU kernels,
+//       and add up their sums in group-shared memory.
 //
 // Regenerate kernels_dx.h after editing:  tools\dx_shaders.cmd
 
@@ -140,4 +144,100 @@ void mm_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
         }
     }
     store(r0, t0, tr, tt, a0, a1, a2, a3);
+}
+
+// ---------------------------------------------------------------- matrix x few vectors
+
+groupshared float red[256];
+
+int sx(uint w, uint k) { return int(w << (24 - 8 * k)) >> 24; }     // signed byte k of a word
+
+// sum of the 32 lanes of each row; lane 0 writes the result
+void reduce_store(uint li, uint r, uint t, float sum) {
+    red[li] = sum;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = 16; s > 0; s >>= 1) {
+        if ((li & 31) < s) red[li] += red[li + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if ((li & 31) == 0 && r < rows) O.Store((t * orow + r) * 4, asuint(red[li]));
+}
+
+// scales and mins (s1, s2, m1, m2) of sub-blocks 2p and 2p+1, read as 16-bit halves of the
+// 12 scale bytes (fxc miscompiles the byte-index version with j = 2p + 1)
+uint4 scales_pair(uint3 sc, uint p) {
+    const uint sh = (p & 1) * 16, hx = sc.x >> sh, hy = sc.y >> sh, hz = sc.z >> sh;
+    if (p < 2) return uint4(hx & 63, (hx >> 8) & 63, hy & 63, (hy >> 8) & 63);
+    return uint4((hz & 15) | (((hx >> 6) & 3) << 4), ((hz >> 8) & 15) | (((hx >> 14) & 3) << 4),
+                 ((hz >> 4) & 15) | (((hy >> 6) & 3) << 4), ((hz >> 12) & 15) | (((hy >> 14) & 3) << 4));
+}
+
+// piece p of a block: sub-blocks 2p (low nibbles of qs[32p..]) and 2p+1 (high nibbles)
+[numthreads(256, 1, 1)]
+void mv_q4_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint r = gid.x * 8 + (li >> 5), t = gid.y;
+    float sum = 0;
+    if (r < rows) {
+        const uint wbase = r * wrow, xbase = t * xrow;
+        for (uint p = li & 31; p < nb * 4; p += 32) {
+            const uint b = p >> 2, pp = p & 3;
+            const uint wb = wbase + b * Q4K_BYTES, xb = xbase + b * Q8_BYTES;
+            const uint dd = W.Load(wb);
+            const uint3 sc = W.Load3(wb + 4);
+            const uint4 sm = scales_pair(sc, pp);
+            const uint4 q[2] = { W.Load4(wb + 16 + pp * 32), W.Load4(wb + 32 + pp * 32) };
+            const uint4 xl[2] = { X.Load4(xb + 4 + pp * 64), X.Load4(xb + 20 + pp * 64) };
+            const uint4 xh[2] = { X.Load4(xb + 36 + pp * 64), X.Load4(xb + 52 + pp * 64) };
+            int d1 = 0, n1 = 0, d2 = 0, n2 = 0;
+            [unroll] for (uint i = 0; i < 8; i++) {
+                const uint w = q[i >> 2][i & 3], a = xl[i >> 2][i & 3], c = xh[i >> 2][i & 3];
+                [unroll] for (uint k = 0; k < 4; k++) {
+                    const int va = sx(a, k), vc = sx(c, k);
+                    d1 += int((w >> (8 * k)) & 15) * va;
+                    d2 += int((w >> (8 * k + 4)) & 15) * vc;
+                    n1 += va;
+                    n2 += vc;
+                }
+            }
+            sum += asfloat(X.Load(xb)) * (f16tof32(dd) * float(int(sm.x) * d1 + int(sm.y) * d2) -
+                                          f16tof32(dd >> 16) * float(int(sm.z) * n1 + int(sm.w) * n2));
+        }
+    }
+    reduce_store(li, r, t, sum);
+}
+
+// piece p of a block: half h = p / 2, ql bytes [h*64 + a*32, +32) with a = p % 2: low nibbles
+// make sub-block j1 = 4h + a, high nibbles j2 = j1 + 2; scales change every 16 values
+[numthreads(256, 1, 1)]
+void mv_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint r = gid.x * 8 + (li >> 5), t = gid.y;
+    float sum = 0;
+    if (r < rows) {
+        const uint wbase = r * wrow, xbase = t * xrow;
+        for (uint p = li & 31; p < nb * 4; p += 32) {
+            const uint b = p >> 2, h = (p & 3) >> 1, a = p & 1;
+            const uint wb = wbase + b * Q6K_BYTES, xb = xbase + b * Q8_BYTES;
+            const uint j1 = h * 4 + a, j2 = j1 + 2;
+            const uint4 ql[2] = { W.Load4(wb + 4 + h * 64 + a * 32), W.Load4(wb + 20 + h * 64 + a * 32) };
+            const uint4 qh[2] = { W.Load4(wb + 132 + h * 32), W.Load4(wb + 148 + h * 32) };
+            const uint4 x1[2] = { X.Load4(xb + 4 + j1 * 32), X.Load4(xb + 20 + j1 * 32) };
+            const uint4 x2[2] = { X.Load4(xb + 4 + j2 * 32), X.Load4(xb + 20 + j2 * 32) };
+            const uint sl = W.Load(wb + 196 + h * 8), sh = W.Load(wb + 200 + h * 8);
+            const uint hs1 = a * 2, hs2 = a * 2 + 4;
+            int d1[2] = { 0, 0 }, d2[2] = { 0, 0 };
+            [unroll] for (uint i = 0; i < 8; i++) {
+                const uint wl = ql[i >> 2][i & 3], wh = qh[i >> 2][i & 3];
+                const uint u = x1[i >> 2][i & 3], v = x2[i >> 2][i & 3];
+                [unroll] for (uint k = 0; k < 4; k++) {
+                    const uint bl = (wl >> (8 * k)) & 255, bh = (wh >> (8 * k)) & 255;
+                    d1[i >> 2] += (int((bl & 15) | (((bh >> hs1) & 3) << 4)) - 32) * sx(u, k);
+                    d2[i >> 2] += (int((bl >> 4) | (((bh >> hs2) & 3) << 4)) - 32) * sx(v, k);
+                }
+            }
+            const int dot = sx(sl, a * 2) * d1[0] + sx(sl, a * 2 + 1) * d1[1] + sx(sh, a * 2) * d2[0] +
+                            sx(sh, a * 2 + 1) * d2[1];
+            sum += asfloat(X.Load(xb)) * f16tof32(W.Load(wb)) * float(dot);
+        }
+    }
+    reduce_store(li, r, t, sum);
 }

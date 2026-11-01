@@ -28,7 +28,7 @@
 #endif
 
 #define MAX_JOBS 160
-#define DX_MIN_TOKENS 16     /* smaller batches stay on the CPU */
+#define DX_MIN_TOKENS 1      /* default PITHOS_DX_MIN: matmuls over fewer tokens stay on the CPU */
 #define MAX_TASKS 32768
 #define TOK_TILE 16
 
