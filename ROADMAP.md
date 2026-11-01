@@ -74,10 +74,11 @@ generation uses about 30 of them.
   per token (for example, quantization fused into the norm kernels), and a look at the `mv_*`
   memory access pattern.
 - [ ] **Logits of every token on the GPU**, so that `--ppl` and `ctx_forward_all` use the fast path too.
-- [ ] **Direct3D 12 on PCs**: on the GTX 1650, `--d3d12` doubles prompt speed compared with
-  OpenCL (~170 vs ~80 tok/s) but generates more slowly (40–50 vs 56 tok/s). Close the gap, or use
-  each backend for what it does best, then pick automatically. It would also serve GPUs without
-  OpenCL.
+- [ ] **Direct3D 12 by default for dense models on Windows**: on the GTX 1650 with LFM3-1.7B,
+  `--no-gpu --d3d12` gives 330 tok/s of prompt and 69 of generation, against 67–103 and 56 with
+  OpenCL. Today it has to be asked for explicitly. Plain `--d3d12` with OpenCL active only moves
+  the prompt matmuls (190 / 56). Pick it automatically, keeping OpenCL for MoE models. It would also
+  serve GPUs without OpenCL.
 - [ ] **Experts on Direct3D 12**: the backend handles models without experts only. The 24B model
   does not fit in the Xbox's 5 GB, but it matters for PCs.
 - [ ] **Xbox app type**: every reinstall resets the app to "App", and the user must set "Game"

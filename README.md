@@ -12,7 +12,8 @@
 <p align="center">
   <img alt="C11, no dependencies" src="https://img.shields.io/badge/C11-no%20dependencies-7c5cf6">
   <img alt="Windows, Linux, macOS" src="https://img.shields.io/badge/Windows%20%7C%20Linux%20%7C%20macOS-x86--64%20%26%20ARM64-ec5c8c">
-  <img alt="GPU: OpenCL, optional" src="https://img.shields.io/badge/GPU-OpenCL%2C%20optional-f5a05a">
+  <img alt="Xbox One in Developer Mode" src="https://img.shields.io/badge/Xbox%20One-Developer%20Mode-107c10">
+  <img alt="GPU: OpenCL or Direct3D 12, optional" src="https://img.shields.io/badge/GPU-OpenCL%20%7C%20Direct3D%2012%2C%20optional-f5a05a">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-2ea043"></a>
 </p>
 
@@ -22,6 +23,7 @@
   <a href="#screenshots">Screenshots</a> ·
   <a href="#results">Results</a> ·
   <a href="#terminal-agent">Terminal agent</a> ·
+  <a href="#xbox-one">Xbox One</a> ·
   <a href="#adding-mcp-servers">MCP</a> ·
   <a href="ROADMAP.md">Roadmap</a>
 </p>
@@ -31,6 +33,7 @@
 | **About 1.9× faster than llama.cpp** | 17–22 tok/s against 11 tok/s with CUDA, on the same laptop and model ([head-to-head](#head-to-head-with-llamacpp-v04-2026-10-24)) |
 | **Runs a 13.5 GB model on 16 GB of RAM** | experts stream from disk, the hot ones live in a 4 GB GPU |
 | **Agents included** | Pandora in the browser, and a terminal agent that runs commands, fixes code and checks its own work |
+| **Runs on an Xbox One** | an OpenAI-compatible server for your home network, with LFM3-1.7B on the console's GPU: 29.5 tok/s generation, ~140 tok/s prompt ([Xbox One](#xbox-one)) |
 
 Pithos is an inference engine written from scratch in C11 with **no dependencies**: no external
 libraries at build time, only the operating system API (Win32 or POSIX). It runs GGUF models of
@@ -41,9 +44,13 @@ Liquid AI's LFM2 / LFM2-MoE / LFM3 architectures and is tuned for `LFM2.5-24B-A2
 **Pithos** is the engine and the server (in the myth, the *pithos* is Pandora's jar: it holds the
 model). **Pandora** is the agent in the web interface.
 
-- CPU inference with AVX2 / NEON integer kernels that read the quantized weights in place.
+- CPU inference with AVX2 / AVX / NEON integer kernels that read the quantized weights in place.
 - Optional OpenCL GPU acceleration: hot experts and all dense layers in VRAM, with the remaining experts
   computed on the CPU in parallel.
+- Optional Direct3D 12 GPU acceleration (`--d3d12`, Windows and Xbox): for dense models such as
+  LFM3, the whole forward pass, prompt included, runs on the GPU.
+- **An Xbox One app**: the server runs on a console in Developer Mode, with a status and chat screen
+  on the TV.
 - Works with models larger than the free RAM (asynchronous read-ahead, expert prediction).
 - OpenAI-compatible HTTP server with prompt reuse across turns, also after a restart.
 - **Pandora**, a single-file web chat with an agent mode: web search, files, calculator and any
@@ -92,7 +99,8 @@ build\pithos.exe --agent                   terminal agent in the current folder 
 build\pithos.exe --bench                   prompt and generation benchmark
 ```
 
-On Linux / macOS the binary is `build/pithos`, with the same options.
+On Linux / macOS the binary is `build/pithos`, with the same options. For the console, see
+[Xbox One](#xbox-one): the app is built on a Windows PC and installed over the network.
 
 ### Downloading the model
 Pithos uses the file **`LFM2.5-24B-A2B-Q4_K_M.gguf`** from Liquid AI's public repository
@@ -150,8 +158,22 @@ Pithos also rejects a truncated file and names the tensor that is missing.
 [LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B) is a 1.7-billion-parameter model
 that fits in 1.1 GB, with the same chat, server, Pandora and terminal agent. With a GPU every layer
 lives in VRAM (1.2 GB with a 8k context) and decoding runs there: about 55 tokens per second on the
-reference laptop (GTX 1650), against about 20 on the CPU alone. The prompt is read on the CPU
-(45-75 tokens per second).
+reference laptop (GTX 1650), against about 20 on the CPU alone. With OpenCL the prompt is read on
+the CPU (45-75 tokens per second). On Windows, **`--no-gpu --d3d12`** runs everything on the GPU
+through Direct3D 12 instead, which is faster on both counts: about 330 tokens per second of prompt
+and 69 of generation on the same laptop. This is also the model that runs on the
+[Xbox One](#xbox-one).
+
+| LFM3-1.7B on the reference laptop | Prompt | Generation |
+|---|---:|---:|
+| CPU only (`--no-gpu`) | 80–100 tok/s | 23 tok/s |
+| OpenCL (default) | 67–103 tok/s | 56 tok/s |
+| OpenCL, with prompt matmuls on Direct3D 12 (`--d3d12`) | 190 tok/s | 56 tok/s |
+| **Direct3D 12 only (`--no-gpu --d3d12`)** | **330 tok/s** | **69 tok/s** |
+
+```
+build\pithos.exe -m models\LFM3-1.7B-Q4_K_M.gguf --no-gpu --d3d12 --server --open
+```
 
 | | |
 |---|---|
@@ -213,7 +235,9 @@ machine's free RAM).
 
 **Windows**: `build.cmd` uses gcc from MSYS2 (`C:\msys64\mingw64` or `ucrt64`) when present,
 otherwise MSVC (Visual Studio or Build Tools, found automatically). `build.cmd test` also builds
-the tests.
+the tests. The Direct3D 12 backend is always included: `d3d12.dll` is loaded at runtime and the
+shaders are precompiled in `src/kernels_dx.h`, so no extra SDK is needed. The Xbox app has its own
+build, described in [Xbox One](#xbox-one).
 
 ### Linux / WSL
 
@@ -332,13 +356,110 @@ cd /path/to/your-project
 
 On macOS / MinGW, use `make` (or `make NATIVE=1` to tune for the local CPU).
 
-The x86-64 binary contains both the portable scalar kernels and the AVX2/FMA/F16C ones and picks
-at runtime. On ARM64 the NEON kernels are used (with `dotprod` when available).
+The x86-64 binary contains the portable scalar kernels, the AVX2/FMA/F16C ones and 128-bit
+AVX/F16C ones for CPUs without AVX2 (Intel Ivy Bridge, AMD Jaguar as in the Xbox One), and picks
+at runtime (`--kernels avx` forces the AVX set). On ARM64 the NEON kernels are used (with
+`dotprod` when available).
 
 The GPU is optional: `OpenCL.dll` / `libOpenCL.so` is loaded at runtime, so no SDK is needed to
 build. The web interface and the GPU kernels are embedded in the executable as generated headers
 (`src/webui_html.h`, `src/kernels_cl.h`), so Python is only needed to regenerate them
 (`tools/embed.py`).
+
+## Xbox One
+
+Pithos runs on an **Xbox One in Developer Mode** as a UWP app. The console becomes an
+OpenAI-compatible server for your home network, with Pandora in the browser of any PC or phone, and
+the TV shows the server state and a chat with the model. Tested on an Xbox One S with
+**LFM3-1.7B** (the 24B model does not fit in the console's memory).
+
+| Xbox One S, LFM3-1.7B Q4_K_M | Prompt | Generation |
+|---|---:|---:|
+| App mode, CPU only (8 threads) | 17.6 tok/s | 7.3 tok/s |
+| **Game mode, Direct3D 12** (`-t 6 --d3d12`) | **146 tok/s** (121 at 1000 tokens) | **29.5 tok/s** (26 after 1000 tokens of context) |
+
+The console's CPU (8 AMD Jaguar cores) has no AVX2, so it uses the AVX kernels. In Game mode the
+app gets about 5 GB of RAM and Direct3D 12 on the GPU, which runs the whole forward pass: weights,
+KV cache and activations live in GPU memory, and only the logits come back.
+
+### What you need
+- **The console in Developer Mode.** Install the *Xbox Dev Mode* app from the Store on the console
+  and follow [Microsoft's activation guide](https://learn.microsoft.com/windows/uwp/xbox-apps/devkit-activation)
+  (it needs a Microsoft Partner Center developer account). Then, in **Dev Home**, turn on the
+  **Device Portal** under the remote access settings. It answers at `https://CONSOLE-IP:11443`.
+- **A Windows PC on the same network** with:
+  - Visual Studio 2022 with the *MSVC v143* and *C++ Universal Windows Platform tools* components;
+  - the Windows SDK 10.0.26100 (it provides `makeappx`, `signtool` and `fxc`);
+  - Python 3, for the deployment script (standard library only).
+- **The model**: `LFM3-1.7B-Q4_K_M.gguf` ([download](#lfm3-17b-small-and-fast)).
+
+### Building the app
+From the Pithos folder, on the PC:
+
+```
+powershell -ExecutionPolicy Bypass -File xbox\make_cert.ps1     once: signing certificate
+xbox\build.cmd                                                   -> build-xbox\Pithos.appx
+```
+
+`make_cert.ps1` creates a self-signed certificate (`CN=Pithos`, the publisher in
+`xbox\Package.appxmanifest`) in `build-xbox\pithos_xbox.pfx`. Developer Mode installs packages signed
+this way. The `build-xbox` folder is not versioned: keep the certificate private, and do not
+commit it. `build.cmd` compiles the same engine sources with `PITHOS_UWP` (file APIs allowed in an
+app container, no child processes), the app shell `xbox\app.cpp`, and packs and signs the result.
+
+### Installing and starting
+`xbox\deploy.py` talks to the Device Portal (add `--user` / `--password` if you enabled portal
+authentication):
+
+```
+python xbox\deploy.py --xbox CONSOLE-IP install                        the app and its VCLibs dependency
+python xbox\deploy.py --xbox CONSOLE-IP upload models\LFM3-1.7B-Q4_K_M.gguf
+python xbox\deploy.py --xbox CONSOLE-IP launch
+python xbox\deploy.py --xbox CONSOLE-IP log                            the server log
+python xbox\deploy.py --xbox CONSOLE-IP files                          the app's LocalState folder
+python xbox\deploy.py --xbox CONSOLE-IP stop
+```
+
+1. **Install** the package, then **upload** the model. It goes into the app's `LocalState` folder.
+   The app waits for a `.gguf` there and starts as soon as the upload is complete.
+2. **Switch the app to Game mode** for Direct3D 12 and 5 GB of RAM. On the console: **Dev Home** →
+   select **Pithos** → **View details** → **App type: Game**. This has to be done again after
+   every reinstall, because installing resets the type to *App*.
+3. **Choose the options** in a `pithos.args` file uploaded to `LocalState` (see below), then start
+   Pithos from Dev Home or with `launch`. Launching from the portal works only while a user is
+   signed in on the console.
+4. **Connect** from any device on the network: Pandora at **`http://CONSOLE-IP:8080`**, the API at
+   `http://CONSOLE-IP:8080/v1` (model name: the file name without `.gguf`). The TV shows the same
+   addresses.
+
+To update the app, increase `Version` in `xbox\Package.appxmanifest`, rebuild, `stop`, `install`,
+and set the app type to Game again. `LocalState` (the model, `pithos.args` and the saved
+conversations) is kept across updates.
+
+### Options and best use
+The app starts the server as `pithos --server --host 0.0.0.0 --port 8080 --no-gpu -m MODEL`
+(`--no-gpu` refers to OpenCL, which the Xbox does not have). The options in `LocalState\pithos.args`
+are added after these, so they can also override them. Upload the file, then restart the app:
+
+| Mode | Recommended `pithos.args` | Why |
+|---|---|---|
+| Game (recommended) | `-t 6 --d3d12` | the GPU does all the work; 6 CPU threads leave room for the system |
+| App (no Game type) | `-t 8` | Direct3D 12 is not available; all 8 cores give the best CPU speed |
+
+- **Start-up**: with `--d3d12` the server answers about a minute after launch, while the weights
+  are copied into GPU memory. The log line `whole forward pass on the GPU` confirms the fast path.
+- **Context**: the server uses 16,384 tokens by default (352 MB of KV cache on the GPU). `-c 8192`
+  halves it.
+- **Batch**: `-b 256` gains only ~4% on long prompts over the default 64.
+- **Access**: the server listens on the whole local network without a key. Add `--api-key KEY`
+  to require one on `/v1`.
+- **Prompt reuse** works as on the PC: conversations are saved in `LocalState` and continue after
+  a restart.
+- **The TV screen** shows the state, the addresses, the end of the log, a chat with the model
+  (without tools) and a button that stops the server.
+- **What is missing on the console**: there are no child processes, so no shell tools and no MCP
+  servers, and no `curl`, so no web tools. Pandora's agent mode keeps the file tools (in
+  `LocalState\workspace`), the calculator and the date.
 
 ## Server and web chat
 
@@ -554,6 +675,8 @@ checkpoint and only processes the rest:
 | `--keep-think` | keep the reasoning of past turns in the context |
 | `--no-gpu`, `--gpu-device N`, `--gpu-mem MB`, `--list-gpus` | GPU control |
 | `--no-gpu-dense` | in generation, use the GPU only for experts (attention, convolutions and output on the CPU) |
+| `--d3d12` | Direct3D 12 GPU (Windows, Xbox in Game mode). With `--no-gpu`, dense models (LFM3) run the whole forward pass on it, the fastest choice for them. With the OpenCL GPU also active, or for MoE models, only the prompt matmuls run there |
+| `--kernels K` | force the CPU kernels: `auto`, `scalar` or `avx` (the set for CPUs without AVX2) |
 | `--prefetch` / `--no-prefetch` | expert read-ahead (default: on when the model exceeds the free RAM) |
 | `--mlock` | try to lock the model in RAM |
 | `--bench [PP,TG]` | benchmark with a per-operation profile |
@@ -614,6 +737,9 @@ for each of the 30 convolution layers.
 | `src/model.c` | forward pass, KV cache, matmul scheduler, MoE, prefetch |
 | `src/quant.c`, `quant_avx2.c`, `quant_neon.c` | Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/F16/F32 formats; scalar, AVX2 and NEON kernels |
 | `src/gpu_opencl.c`, `src/kernels.cl` | expert cache and dense layers in VRAM through OpenCL loaded at runtime |
+| `src/gpu_d3d12.c`, `src/kernels_dx.hlsl`, `src/kernels_dx_token.hlsl` | Direct3D 12 backend: matmul kernels and the other steps of the forward pass (compiled into `src/kernels_dx.h` by `tools\dx_shaders.cmd`, which needs `fxc` from the Windows SDK) |
+| `src/quant_avx.c` | 128-bit AVX/F16C kernels for CPUs without AVX2 |
+| `xbox/` | Xbox app: shell with the TV screen (`app.cpp`), manifest, build, signing and deployment scripts, GPU probe |
 | `src/platform.c` | mmap, thread pool, prefetch, system info (Win32 / POSIX) |
 | `src/sampler.c`, `src/main.c` | sampling, CLI, terminal chat |
 | `src/server.c`, `src/json.c` | HTTP server, OpenAI API, chat template, tool calls, JSON |
@@ -671,9 +797,30 @@ for each of the 30 convolution layers.
   - **Prompt:** prompt processing stays on the CPU batch path. The KV cache and the convolution state
     are synced only when switching between the two paths.
 
+### GPU through Direct3D 12 (Windows and Xbox)
+- **Runtime loading:** `d3d12.dll` is loaded at runtime, and the shaders are precompiled DXBC
+  (shader model 5.0), so they also run on the Xbox One's GPU. The adapter with the most dedicated
+  memory is used.
+- **Weights:** every Q4_K / Q6_K matrix is copied once into GPU memory. Q6_K blocks are repacked
+  from 210 to 212 bytes, so that the shaders read aligned words.
+- **Matmuls:** tiles of 64 rows × 64 tokens for batches. Below 12 tokens, groups of 8 rows of one
+  token use integer dot products on the Q8_K activations, like the CPU kernels.
+- **Whole forward pass** (dense models): a token, or a prompt chunk of up to `-b` tokens, is
+  recorded into one command list and submitted once. It covers the norms and residual sums, Q8_K
+  quantization, q/k norm with RoPE and the KV cache writes, attention, the short convolution and
+  SwiGLU. For a chunk, the convolution runs causally over all of its tokens at once, and attention
+  uses a running softmax per head and token. Only the logits of the last token are read back.
+- **State:** the GPU keeps its own KV cache and convolution state, synced with the CPU copies only
+  when a request needs the other path (for example, a snapshot for prompt reuse).
+
 ## Validation
 - `build\test_kernels.exe MODEL`: every kernel (scalar and AVX2) against the reference dequantization on real model rows (relative error ~1e-8).
 - `build\test_gpu.exe MODEL`: experts computed in VRAM against an f32 reference (f32: 3e-7; int8: ~9e-3, like the activation quantization on the CPU).
+- `build\test_dx.exe MODEL` (Windows): every Direct3D 12 matmul shape against the CPU (relative
+  error ~1e-6). Then the whole forward pass on real text, mixing prompt chunks of 100, 24 and 5
+  tokens with single tokens. The mean probability of the actual next token matches the CPU (NLL
+  2.678 vs 2.692), and so does the top choice (93%, the level of int8 rounding noise; the CPU
+  kernels differ among themselves in the same way).
 - Tokenizer identical to Hugging Face `tokenizers` (each model's `tokenizer.json`) and to
   `llama-tokenize`, on texts with accents, numbers, spaces, code, CJK, emoji and special tokens.
 - Perplexity compared with `llama-perplexity` (table above).
@@ -704,13 +851,20 @@ for each of the 30 convolution layers.
 | `PITHOS_GPU_DENSE=0` | same as `--no-gpu-dense` |
 | `PITHOS_GPU_EAGER=0` | do not flush the queue after every kernel |
 | `PITHOS_GPU_LOOKAHEAD=1` | queue the next layer behind a user event (slower with NVIDIA drivers on Windows) |
+| `PITHOS_DX_DENSE=0` | Direct3D 12: matmuls only, the rest on the CPU |
+| `PITHOS_DX_CHUNKS=0` | Direct3D 12: prompt chunks go through the CPU path (only single tokens run whole on the GPU) |
+| `PITHOS_DX_MIN=N` | Direct3D 12, matmuls-only path: batches of fewer than N tokens stay on the CPU (default 1) |
+| `PITHOS_DX_DEBUG=1` | enable the Direct3D 12 debug layer and print its messages |
 
 ## Limitations
 Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
 
 - Only the `lfm2` / `lfm2moe` / `lfm3` architectures. Formats Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16
-  and F32; on the GPU only Q4_K and Q6_K. On the GPU only decoding runs; the prompt is read on the
-  CPU.
+  and F32; on the GPU only Q4_K and Q6_K. With OpenCL only decoding runs on the GPU, and the prompt
+  is read on the CPU. Direct3D 12 runs the whole forward pass of dense models only: for MoE models
+  it takes just the prompt matmuls. `--ppl` (logits of every token) uses its matmuls-only path.
+- The Xbox app has been tested on an Xbox One S only, with LFM3-1.7B. It needs the app type set to
+  Game again after every reinstall.
 - LFM3's sliding-window layers keep the whole KV cache like the others (simpler; a ring buffer
   would save almost half of it at long contexts).
 - The NEON kernels and the GPU f32 path are written for ARM64/AMD/Intel, but have only been tested
