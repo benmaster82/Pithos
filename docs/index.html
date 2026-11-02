@@ -63,7 +63,7 @@
         <h1 id="hero-title">The engine.<br><em>For local AI.</em></h1>
         <p class="hero-description">Pithos runs Liquid AI's LFM2, LFM2.5 and LFM3 GGUF models locally. Written in C11, with SIMD CPU kernels and optional OpenCL acceleration. Chat, tools, and APIs share the same engine.</p>
         <div class="hero-actions"><a class="button button-dark" href="#get-started">Get started <svg aria-hidden="true" class="icon"><use href="#i-arrow"/></svg></a><a class="text-link" href="#architecture">See the architecture <span>↗</span></a></div>
-        <p class="hero-note"><svg aria-hidden="true" class="icon"><use href="#i-check"/></svg> Open source <span>·</span> Windows and Linux <span>·</span> No GPU required</p>
+        <p class="hero-note"><svg aria-hidden="true" class="icon"><use href="#i-check"/></svg> Open source <span>·</span> Windows, Linux and Xbox One <span>·</span> No GPU required</p>
       </div>
       <div class="hero-visual model-hero">
         <div class="terminal-stage">
@@ -123,7 +123,7 @@
             </div>
             <figcaption id="flow-caption"><strong id="execution-summary">CPU-only execution.</strong><span id="execution-detail">All model compute stays on the CPU. OS-backed paging, read-ahead, and expert prediction help with cold weights.</span></figcaption>
           </figure>
-          <div class="architecture-notes"><p><strong>The model is data.</strong> The GGUF file contains the weights. Pithos is the program that executes them.</p><p><strong>GPU offload is optional.</strong> Hybrid execution requires compatible OpenCL hardware and drivers. This diagram describes the engine, not your current hardware.</p><p><strong>Implementation and validation differ.</strong> ARM64 NEON is implemented; the published CPU validation here is x86-64. GPU acceleration was validated on native Windows (NVIDIA, Intel, AMD), not in our WSL2 environment.</p></div>
+          <div class="architecture-notes"><p><strong>The model is data.</strong> The GGUF file contains the weights. Pithos is the program that executes them.</p><p><strong>GPU offload is optional.</strong> Hybrid execution requires compatible OpenCL hardware and drivers. This diagram describes the engine, not your current hardware.</p><p><strong>Implementation and validation differ.</strong> ARM64 NEON kernel tests pass under emulation (qemu); the published CPU validation on real hardware is x86-64. GPU acceleration was validated on native Windows (NVIDIA, Intel, AMD), not in our WSL2 environment.</p></div>
         </div>
       </div>
     </section>
@@ -135,14 +135,14 @@
           <tr><th scope="row">Model architectures</th><td><code>lfm2</code> dense, <code>lfm2moe</code> and <code>lfm3</code> (sliding-window and gated attention), loaded from GGUF.</td></tr>
           <tr><th scope="row">CPU weight formats</th><td>Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16, F32.</td></tr>
           <tr><th scope="row">CPU kernels</th><td>Scalar fallback; runtime-selected AVX2 / FMA / F16C on x86-64. NEON implemented for ARM64.</td></tr>
-          <tr><th scope="row">GPU backend</th><td>Optional, runtime-loaded OpenCL, Q4_K and Q6_K weights. MoE models: hot experts and dense layers in VRAM. Dense models: every layer in VRAM.</td></tr>
+          <tr><th scope="row">GPU backend</th><td>Optional, runtime-loaded OpenCL, Q4_K and Q6_K weights. MoE models: hot experts and dense layers in VRAM. Dense models: every layer in VRAM. On Windows and Xbox, <code>--d3d12</code> runs dense models on Direct3D 12, prompt included.</td></tr>
           <tr><th scope="row">Prompt processing</th><td>CPU batch path with expert grouping. VRAM-resident experts may still be offloaded to GPU.</td></tr>
           <tr><th scope="row">Hybrid generation</th><td>GPU-resident dense decode and cached experts; CPU workers compute non-resident experts in parallel. Expert-only offload is also available.</td></tr>
           <tr><th scope="row">Memory and reuse</th><td>Mapped weights, Q8_K activations for CPU quantized matmuls, asynchronous read-ahead, expert prediction, and KV/convolution checkpoints. Prompt reuse can persist to disk.</td></tr>
           <tr><th scope="row">Threads / batches</th><td>Configurable worker pool. Defaults: physical-core count; 64-token prompt batch.</td></tr>
           <tr><th scope="row">Context</th><td>8,192 tokens for CLI by default; 16,384 for server/agent. Configurable up to the model limit; reference documentation lists 131,072. Actual capacity depends on memory.</td></tr>
           <tr><th scope="row">Interfaces</th><td>CLI, embedded Pandora UI, terminal/web agents, MCP client, and OpenAI-compatible HTTP endpoints. Inference requests share one context and are serialized.</td></tr>
-          <tr><th scope="row">Platforms / license</th><td>Windows native and Linux. macOS / ARM64 paths remain unverified here. Engine code: MIT.</td></tr>
+          <tr><th scope="row">Platforms / license</th><td>Windows native, Linux, and <a href="xbox.html">Xbox One</a> in Developer Mode. ARM64 Linux checked under emulation (qemu); macOS unverified here. Engine code: MIT.</td></tr>
         </tbody></table></div>
         <div class="spec-card"><div class="spec-card-heading"><span>02</span><h3>Validated models</h3></div><table><caption>The reference: LFM2.5-24B-A2B, a 24B MoE</caption><tbody>
           <tr><th scope="row">GGUF file</th><td><code>LFM2.5-24B-A2B-Q4_K_M.gguf</code></td></tr>
@@ -196,7 +196,7 @@
             <dt>Configuration</dt><dd>Add servers to <code>mcp.json</code>, or pass <code>--mcp PATH</code>. Pithos discovers their tools and lists them as <code>server__toolname</code>.</dd>
             <dt>Compatibility limits</dt><dd>Remote HTTP MCP connections are not supported. No third-party MCP server is bundled. A server must expose tools over stdio; individual integrations need their own configuration and testing.</dd>
           </dl>
-          <p>Find integrations in the <a href="https://registry.modelcontextprotocol.io" target="_blank" rel="noopener noreferrer">official MCP registry ?</a>. Check the server's transport, required runtime, credentials, and installation instructions.</p>
+          <p>Find integrations in the <a href="https://registry.modelcontextprotocol.io" target="_blank" rel="noopener noreferrer">official MCP registry ↗</a>. Check the server's transport, required runtime, credentials, and installation instructions.</p>
         </article>
       </div>
       <article class="mcp-example"><h3>Try the included MCP test server</h3>
@@ -207,16 +207,16 @@
         </div>
         <p>To use the configured server in an agent, replace <code>--tools-list</code> with <code>--agent</code> and provide your model path with <code>-m</code>. Use <code>--server --shell</code> for the browser interface. Pithos stops its MCP processes when it exits.</p>
         <p>For application integrations, <code>GET /v1/tools</code> lists tools and MCP server states; <code>POST /v1/tools/call</code> invokes a tool. These are Pithos HTTP endpoints, not an MCP server transport.</p>
-        <a class="text-link" href="https://github.com/benmaster82/Pithos#adding-mcp-servers" target="_blank" rel="noopener noreferrer">MCP configuration and examples ?</a>
+        <a class="text-link" href="https://github.com/benmaster82/Pithos#adding-mcp-servers" target="_blank" rel="noopener noreferrer">MCP configuration and examples ↗</a>
       </article>
     </section>
     <section class="faq-section section-space wrap" id="faq" aria-labelledby="faq-title"><div class="faq-intro"><span class="eyebrow">06 — A FEW THINGS TO KNOW</span><h2 id="faq-title">Frequently asked questions</h2><p>A technical project, explained without assuming you know the jargon.</p><a class="text-link" href="https://github.com/benmaster82/Pithos/issues" target="_blank" rel="noopener noreferrer">Ask the community <svg aria-hidden="true" class="icon"><use href="#i-external"/></svg></a></div><div class="faq-list">
       <details open><summary>What is the difference between Pithos and the model?<span>+</span></summary><p>Pithos is the program that runs the AI. The model contains the data and weights needed to generate answers. Pandora is the built-in web chat. On Linux, <code>build.sh --download-model</code> can build the program and download the reference model, or <code>--download-model=lfm3-1.7b</code> the small one.</p></details>
       <details><summary>Do I need WSL2 on Windows?<span>+</span></summary><p>No. Pithos builds and runs natively on Windows with <code>build.cmd</code>. You need a compiler: GCC from MSYS2 or MSVC from Visual Studio/Build Tools. The Windows guide uses MSYS2. Ubuntu through WSL2 is an alternative, not a requirement.</p></details>
-      <details><summary>Do I need a dedicated graphics card?<span>+</span></summary><p>No. You can start with the CPU. A compatible GPU can speed things up, but needs suitable OpenCL hardware and drivers: LFM3-1.7B goes from about 20 to about 55 tokens per second on a 4 GB laptop GPU. Our Ubuntu/WSL2 testing covered CPU inference; GPU acceleration was not verified in that environment.</p></details>
+      <details><summary>Do I need a dedicated graphics card?<span>+</span></summary><p>No. You can start with the CPU. A compatible GPU can speed things up, but needs suitable OpenCL hardware and drivers: LFM3-1.7B goes from about 20 to about 55 tokens per second on a 4 GB laptop GPU. On Windows, <code>--no-gpu --d3d12</code> uses Direct3D 12 instead of OpenCL (about 69 on the same laptop). Our Ubuntu/WSL2 testing covered CPU inference; GPU acceleration was not verified in that environment.</p></details>
       <details><summary>Can I chat without an Internet connection?<span>+</span></summary><p>Yes. Once you have downloaded the program, prerequisites, and model, you can chat locally offline. Web searches, URLs, and connected external services need Internet access and may send data to those services.</p></details>
       <details><summary>Is it free? Can I use any model?<span>+</span></summary><p>The Pithos code is open source under the MIT license. Model weights have a separate license, available in the Liquid AI repository. Not every GGUF file is compatible. Two are validated: <code>LFM2.5-24B-A2B-Q4_K_M.gguf</code>, the reference model, and the small <code>LFM3-1.7B-Q4_K_M.gguf</code>. On Linux, <code>bash build.sh --list-models</code> shows them.</p></details>
-      <details><summary>How do I open the chat again tomorrow?<span>+</span></summary><p>Open a terminal in the Pithos folder. On Windows run <code>.\build\pithos.exe --server --no-gpu</code>; on Linux run <code>./build/pithos --server --no-gpu</code>. With LFM3-1.7B, add <code>-m models/LFM3-1.7B-Q4_K_M.gguf</code>. Open <code>http://127.0.0.1:8080</code> in your browser and keep the terminal open. There is no need to build or download everything again.</p></details>
+      <details><summary>How do I open the chat again tomorrow?<span>+</span></summary><p>Open a terminal in the Pithos folder. On Windows run <code>.\build\pithos.exe --server</code>; on Linux run <code>./build/pithos --server</code> (add <code>--no-gpu</code> to stay on the CPU). With LFM3-1.7B, add <code>-m models/LFM3-1.7B-Q4_K_M.gguf</code>. Open <code>http://127.0.0.1:8080</code> in your browser and keep the terminal open. There is no need to build or download everything again.</p></details>
       <details><summary>The download stopped. Do I have to start over?<span>+</span></summary><p>With the Linux script, run the same <code>bash build.sh --download-model</code> command again (with <code>=lfm3-1.7b</code> if you chose the small model). Partial data is kept and the transfer resumes when possible. The model becomes available only after size and SHA-256 checks pass. On Windows, resuming depends on your browser or download tool.</p></details>
     </div></section>
     <section class="closing-cta wrap"><div><span class="eyebrow">MAKE IT YOUR NEXT EXPERIMENT.</span><h2>Make room for your <em>AI.</em></h2><p>Your first step is choosing where to begin.</p></div><a class="button button-dark" href="#get-started">Set up Pithos <svg aria-hidden="true" class="icon"><use href="#i-arrow"/></svg></a><span class="closing-decoration" aria-hidden="true">↗</span></section>

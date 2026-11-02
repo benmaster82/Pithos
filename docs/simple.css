@@ -97,3 +97,4 @@ nav a{font-weight:500}
 .mcp-section .inline-command code{white-space:pre-wrap;word-break:break-word}
 .mcp-small{font-size:13px;margin-top:12px}
 @media(max-width:850px){.mcp-grid{grid-template-columns:1fr;gap:28px}}
+.faq-list code,.mcp-grid p code{white-space:nowrap;overflow-wrap:normal}
