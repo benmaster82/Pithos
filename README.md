@@ -365,8 +365,10 @@ On macOS / MinGW, use `make` (or `make NATIVE=1` to tune for the local CPU).
 
 The x86-64 binary contains the portable scalar kernels, the AVX2/FMA/F16C ones and 128-bit
 AVX/F16C ones for CPUs without AVX2 (Intel Ivy Bridge, AMD Jaguar as in the Xbox One), and picks
-at runtime (`--kernels avx` forces the AVX set). On ARM64 the NEON kernels are used (with
-`dotprod` when available).
+at runtime (`--kernels avx` forces the AVX set). On ARM64 the NEON kernels are used, with
+`dotprod` when the build machine has it (Raspberry Pi 5, RK3588, Graviton 2+, Apple M); on CPUs
+without it (Raspberry Pi 3 / 4) the Makefile builds for plain ARMv8. A binary built with
+`dotprod` stops with "Illegal instruction" on those CPUs, so build on the machine that runs it.
 
 The GPU is optional: `OpenCL.dll` / `libOpenCL.so` is loaded at runtime, so no SDK is needed to
 build. The web interface and the GPU kernels are embedded in the executable as generated headers

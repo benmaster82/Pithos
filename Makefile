@@ -32,8 +32,11 @@ endif
 ifneq (,$(filter aarch64 arm64,$(UNAME_M)))
   ifeq ($(UNAME_S),Darwin)
     ARCHFLAGS = -mcpu=apple-m1
-  else
+  else ifneq (,$(shell grep -qw asimddp /proc/cpuinfo 2>/dev/null && grep -qw asimdhp /proc/cpuinfo && echo y))
     ARCHFLAGS = -march=armv8.2-a+dotprod+fp16
+  else
+    # no dotprod (Raspberry Pi 3 / 4, Cortex-A53 / A72...): plain ARMv8 NEON
+    ARCHFLAGS = -march=armv8-a
   endif
 endif
 ifdef NATIVE

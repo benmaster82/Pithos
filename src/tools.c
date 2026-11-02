@@ -1134,7 +1134,6 @@ static int ps_script(const char *script, char *path, int cap) {
     fclose(f);
     return w == n;
 }
-#endif
 
 /* Windows PowerShell 5.1 has no '&&' / '||', and models write them all the time: outside
  * quotes, braces and parentheses "a && b" becomes "a; if (-not $?) { exit <code> }; b" (the
@@ -1176,6 +1175,7 @@ static int ps_rewrite_chains(const char *cmd, Buf *out) {
     buf_free(&b);
     return rewrites;
 }
+#endif
 
 static int is_abs_path(const char *p) {
     return p[0] == '/' || p[0] == '\\' || (isalpha((unsigned char)p[0]) && p[1] == ':');
