@@ -240,9 +240,9 @@ machine's free RAM).
 
 ## Building
 
-**Windows**: `build.cmd` uses gcc from MSYS2 (`C:\msys64\mingw64` or `ucrt64`) when present,
-otherwise MSVC (Visual Studio or Build Tools, found automatically). `build.cmd test` also builds
-the tests. The Direct3D 12 backend is always included: `d3d12.dll` is loaded at runtime and the
+**Windows**: `build.cmd` uses gcc when present (on the `PATH`, or from MSYS2 in `C:\msys64\mingw64`
+or `ucrt64`), otherwise MSVC (Visual Studio or Build Tools, found automatically); `build.cmd msvc`
+forces MSVC. `build.cmd test` (or `build.cmd msvc test`) also builds the tests. The Direct3D 12 backend is always included: `d3d12.dll` is loaded at runtime and the
 shaders are precompiled in `src/kernels_dx.h`, so no extra SDK is needed. The Xbox app has its own
 build, described in [Xbox One](#xbox-one).
 
