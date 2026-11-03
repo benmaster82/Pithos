@@ -53,6 +53,8 @@ model). **Pandora** is the agent in the web interface.
   on the TV.
 - Works with models larger than the free RAM (asynchronous read-ahead, expert prediction).
 - OpenAI-compatible HTTP server with prompt reuse across turns, also after a restart.
+- [Reasoning levels](#server-and-web-chat): high, medium, low or off, from the command line,
+  the API or a selector in Pandora.
 - **Pandora**, a single-file web chat with an agent mode: web search, files, calculator and any
   MCP server.
 - **A terminal agent** that works on tasks with shell commands, background processes, files and
@@ -471,6 +473,8 @@ are added after these, so they can also override them. Upload the file, then res
 - **Context**: the server uses 16,384 tokens by default (352 MB of KV cache on the GPU). `-c 8192`
   halves it.
 - **Batch**: `-b 256` gains only ~4% on long prompts over the default 64.
+- **Reasoning**: Pandora and the API choose the level per request; the TV chat uses the default,
+  which `--reasoning low` or `--reasoning off` in `pithos.args` changes.
 - **Access**: the server listens on the whole local network without a key. Add `--api-key KEY`
   to require one on `/v1`.
 - **Prompt reuse** works as on the PC: conversations are saved in `LocalState` and continue after
