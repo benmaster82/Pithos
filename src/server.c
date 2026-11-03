@@ -1389,17 +1389,24 @@ static void handle_chat(Conn *c, const Json *body) {
     if (lg) {
         /* rewrite the answer as the template renders past turns, then persist the session */
         double t0 = time_sec();
-        Buf a = { 0 };
-        Json *calls = NULL;
+        Buf a = { 0 }, mj = { 0 };
+        buf_add(&mj, "{\"role\":\"assistant\",\"content\":", -1);
+        buf_json_str(&mj, g.content.s ? g.content.s : "", g.content.n);
+        buf_add(&mj, ",\"reasoning_content\":", -1);
+        buf_json_str(&mj, g.reasoning.s ? g.reasoning.s : "", g.reasoning.n);
         if (g.ncalls) {
-            Buf arr = { 0 };
-            buf_add(&arr, "[", 1);
-            buf_add(&arr, g.calls.s, g.calls.n);
-            buf_add(&arr, "]", 1);
-            calls = json_parse(arr.s, arr.n, NULL, 0);
-            buf_free(&arr);
+            buf_add(&mj, ",\"tool_calls\":[", -1);
+            buf_add(&mj, g.calls.s, g.calls.n);
+            buf_add(&mj, "]", 1);
         }
-        if (render_assistant(&a, g.reasoning.s, g.reasoning.n, g.content.s, g.content.n, preserve, calls, err, sizeof(err))) {
+        buf_add(&mj, "}", 1);
+        /* the answer as the next request will send it back */
+        Json *msg = json_parse(mj.s, mj.n, NULL, 0);
+        int ok = msg != NULL;
+        if (ok && S.lfm3) ok = render_assistant_lfm3(&a, msg, preserve, err, sizeof(err));
+        else if (ok) ok = render_assistant(&a, g.reasoning.s, g.reasoning.n, g.content.s, g.content.n, preserve,
+                                           json_get(msg, "tool_calls"), err, sizeof(err));
+        if (ok) {
             int gp = bounds[nb - 1];
             t.n = gp;
             toks_text(&t, a.s, a.n);
@@ -1411,7 +1418,8 @@ static void handle_chat(Conn *c, const Json *body) {
                 fprintf(stderr, "  context realigned: %d tokens reprocessed in %.2f s, %d sessions on disk\n", t.n - r,
                         time_sec() - t0, pcache_n_files(S.pc));
         }
-        json_free(calls);
+        json_free(msg);
+        buf_free(&mj);
         buf_free(&a);
     }
     S.busy = 0;
