@@ -37,6 +37,7 @@ typedef struct {
     int interactive, raw, bench, show_think, keep_think, prefetch, mlock, stats, verbose, ids;
     int gpu, gpu_device, gpu_mem, gpu_dense, d3d12;
     int bench_pp, bench_tg;
+    int think_budget;           /* THINK_FULL / THINK_OFF / reasoning tokens (--reasoning) */
     SamplerParams sp;
 } Args;
 
@@ -183,6 +184,8 @@ static void usage(void) {
         "      --repeat-penalty F  repetition penalty (default 1.05)\n"
         "      --repeat-last-n N   penalty window (default 64)\n"
         "      --seed N            RNG seed (default 42)\n"
+        "      --reasoning R       how much the model reasons before answering: high (default, no limit),\n"
+        "                          medium, low, off, or a number of tokens; server requests can override it\n"
         "      --hide-think        do not print the reasoning section\n"
         "      --keep-think        keep past reasoning in context (template preserve_thinking)\n"
         "      --prefetch, --no-prefetch\n"
@@ -250,6 +253,7 @@ static int parse_args(int argc, char **argv, Args *a) {
     a->show_think = 1;
     a->bench_pp = 128;
     a->bench_tg = 64;
+    a->think_budget = THINK_FULL;
     a->sp.temp = 0.1f;
     a->sp.top_k = 50;
     a->sp.top_p = 1.0f;
@@ -289,6 +293,13 @@ static int parse_args(int argc, char **argv, Args *a) {
         else if (!strcmp(s, "--repeat-penalty")) a->sp.repeat_penalty = (float)atof(NEXT());
         else if (!strcmp(s, "--repeat-last-n")) a->sp.repeat_last_n = atoi(NEXT());
         else if (!strcmp(s, "--seed")) a->sp.seed = (uint64_t)strtoull(NEXT(), NULL, 10);
+        else if (!strcmp(s, "--reasoning")) {
+            const char *v = NEXT();
+            if (!think_parse(v, &a->think_budget)) {
+                fprintf(stderr, "--reasoning: use high, medium, low, off or a number of tokens (got %s)\n", v);
+                return 0;
+            }
+        }
         else if (!strcmp(s, "--hide-think")) a->show_think = 0;
         else if (!strcmp(s, "--keep-think")) a->keep_think = 1;
         else if (!strcmp(s, "--prefetch")) a->prefetch = 1;
@@ -402,9 +413,10 @@ static char *generate(Engine *e, int in_think, int *last) {
     if (thinking && !e->a->show_think) { color("\x1b[90m"); out_str("[thinking..."); color("\x1b[0m"); }
     *last = -1;
     double t0 = time_sec();
-    int n = 0, skip_ws = 0;
+    int n = 0, skip_ws = !in_think, n_think = 0; /* reasoning off: drop the newline after <think></think> */
+    int *forced = NULL, nforced = 0, fi = 0; /* the reasoning close, once the budget is spent */
     for (; n < e->a->n_predict; n++) {
-        int tok = sampler_sample(&e->smp, logits);
+        int tok = fi < nforced ? forced[fi++] : sampler_sample(&e->smp, logits);
         if (tok == e->tok_im_end || tok == e->tok_eot || tok == tok_eos(e->tk)) { *last = tok; break; }
         int pl;
         const char *piece = tok_piece(e->tk, tok, &pl);
@@ -415,6 +427,11 @@ static char *generate(Engine *e, int in_think, int *last) {
             skip_ws = 1;
             if (e->a->show_think) { out_bytes(&uo, piece, pl); color("\x1b[0m"); out_str("\n\n"); }
             else { color("\x1b[90m"); out_str(" done]\n\n"); color("\x1b[0m"); }
+        } else if (tok == e->tok_think_end) {
+            /* the model reasoned inside the answer and closed it: the answer starts again below
+             * (chat_turn keeps only what follows </think>, like the template) */
+            out_str("\n\n");
+            skip_ws = 1;
         } else if (!thinking || e->a->show_think) {
             if (skip_ws) {
                 /* the answer usually starts with blank lines after </think>: drop them */
@@ -430,7 +447,10 @@ static char *generate(Engine *e, int in_think, int *last) {
         }
         logits = ctx_forward(e->ctx, &tok, 1);
         if (!logits) break;
+        if (thinking && !forced && e->a->think_budget > 0 && ++n_think >= e->a->think_budget)
+            forced = encode(e->tk, think_close(), &nforced);
     }
+    free(forced);
     if (thinking) color("\x1b[0m");
     e->t_gen += time_sec() - t0;
     e->n_gen += n;
@@ -520,9 +540,13 @@ static int chat_turn(Engine *e, const char *user, int first) {
     free(p.s);
     CtxSnapshot snap;
     ctx_snapshot(e->ctx, &snap);
-    if (!feed_text(e, "<|im_start|>assistant\n<think>")) { ctx_snapshot_free(&snap); return 0; }
+    const int think = e->a->think_budget != THINK_OFF;
+    if (!feed_text(e, think ? "<|im_start|>assistant\n<think>" : think_off_prompt(!strcmp(e->m->arch, "lfm3")))) {
+        ctx_snapshot_free(&snap);
+        return 0;
+    }
     int last;
-    char *gen = generate(e, 1, &last);
+    char *gen = generate(e, think, &last);
     double tp = e->t_prompt - tp0;
     int npr = e->n_prompt - np0;
     print_stats(e, tp, npr, e->t_gen - tg0, e->n_gen - ng0);
@@ -536,8 +560,9 @@ static int chat_turn(Engine *e, const char *user, int first) {
         free(ids);
         ok = feed(e, close, 2);
     } else {
-        /* template default: past turns keep only the final answer */
-        const char *c = strstr(gen, "</think>");
+        /* template default: past turns keep only the final answer, content.split("</think>")[-1] */
+        const char *c = NULL;
+        for (const char *p = gen; (p = strstr(p, "</think>")) != NULL; p += 8) c = p;
         char *content = trim_dup(c ? c + 8 : gen);
         ctx_restore(e->ctx, &snap);
         Str a = { 0 };
@@ -757,6 +782,7 @@ static int real_main(int argc, char **argv) {
         sc.info = info;
         sc.verbose = a.verbose || a.stats;
         sc.open_browser = a.open_browser;
+        sc.think_budget = a.think_budget;
         Tools *tools = NULL;
         if (a.tools || a.agent) {
             ToolsConfig tc = tools_config(&a);

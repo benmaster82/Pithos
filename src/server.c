@@ -565,8 +565,8 @@ static int render_assistant_lfm3(Buf *b, const Json *m, int keep, char *err, int
 
 /* Renders the conversation into tokens; bounds[] receives the token position where each
  * message starts (the last one is the start of the generation prompt). */
-static int render_chat(const Json *messages, const Json *tools, int preserve_thinking, Toks *out, int **bounds,
-                       int *nbounds, Buf *text, char *err, int errlen) {
+static int render_chat(const Json *messages, const Json *tools, int preserve_thinking, int think, Toks *out,
+                       int **bounds, int *nbounds, Buf *text, char *err, int errlen) {
     const Json *msg = messages->child;
     Buf sys = { 0 }, seg = { 0 };
     int nb = 0, cap = messages->n + 2;
@@ -638,8 +638,9 @@ static int render_chat(const Json *messages, const Json *tools, int preserve_thi
     }
     if (nb == cap) { cap++; *bounds = (int *)realloc(*bounds, sizeof(int) * (size_t)cap); }
     (*bounds)[nb++] = out->n;
-    toks_text(out, "<|im_start|>assistant\n<think>", -1);
-    if (text) buf_add(text, "<|im_start|>assistant\n<think>", -1);
+    const char *gp = think ? "<|im_start|>assistant\n<think>" : think_off_prompt(S.lfm3);
+    toks_text(out, gp, -1);
+    if (text) buf_add(text, gp, -1);
     *nbounds = nb;
     buf_free(&sys);
     buf_free(&seg);
@@ -914,6 +915,31 @@ static int parse_tool_call_xml(const char *s, int n, Buf *out, int *count) {
 
 /* ------------------------------------------------------------------ generation */
 
+int think_parse(const char *s, int *budget) {
+    if (!strcmp(s, "off") || !strcmp(s, "none")) *budget = THINK_OFF;
+    else if (!strcmp(s, "low") || !strcmp(s, "minimal")) *budget = 512;
+    else if (!strcmp(s, "medium")) *budget = 2048;
+    else if (!strcmp(s, "high")) *budget = THINK_FULL;
+    else if (isdigit((unsigned char)s[0])) *budget = atoi(s) > 0 ? atoi(s) : THINK_OFF;
+    else return 0;
+    return 1;
+}
+
+/* The generation prompt with the reasoning off. LFM3's template writes "<think></think>"
+ * (enable_thinking=false), but with it LFM3 often reasons anyway inside the answer; one newline
+ * inside the block avoids most of that (measured: 13 of 30 GSM8K answers reasoned, then 3).
+ * LFM2.5 has no switch in its template; the plain empty block works best for it. */
+const char *think_off_prompt(int lfm3) {
+    return lfm3 ? "<|im_start|>assistant\n<think>\n</think>\n" : "<|im_start|>assistant\n<think></think>";
+}
+
+/* Closing with a sentence (the budget-forcing one from Qwen3) or with a bare </think> measured the
+ * same on MATH; the sentence gives the answer a cleaner start. */
+const char *think_close(void) {
+    return "\n\nConsidering the limited time, I have to give the solution based on the thinking directly now.\n"
+           "</think>\n\n";
+}
+
 enum { ST_THINK, ST_CONTENT, ST_TOOL };
 enum { FIN_NONE, FIN_STOP, FIN_LENGTH, FIN_TOOLS, FIN_ABORT };
 
@@ -931,6 +957,7 @@ typedef struct {
     Buf reasoning, content, toolraw, calls;
     int rsent, csent, ncalls, calls_sent, calls_off;
     int n_prompt, n_reused, n_gen;
+    int think_budget, n_think;  /* THINK_FULL / THINK_OFF / tokens; reasoning tokens so far */
     double t_prompt, t_gen;
 } Gen;
 
@@ -1042,6 +1069,20 @@ static int on_token(Gen *g, int tok) {
         g->skip_ws = 1;
         return 0;
     }
+    if (g->chat && tok == S.t_think_end && g->state == ST_CONTENT) {
+        /* The model reasoned inside the answer (reasoning off, or past its budget) and closed it
+         * now: what it wrote so far was reasoning, as the template's split("</think>")[-1] reads
+         * it. Streaming clients already have that text as content: content_to_reasoning tells them. */
+        flush_text(g, 0);
+        const int unsent = g->content.n - g->csent; /* held back: it goes out as reasoning */
+        buf_add(&g->reasoning, g->content.s ? g->content.s : "", g->content.n);
+        g->rsent = g->reasoning.n - unsent;
+        g->content.n = 0;
+        g->csent = 0;
+        g->skip_ws = 1;
+        if (g->stream) send_delta(g, "content_to_reasoning", "", 0);
+        return 0;
+    }
     if (g->chat && tok == S.t_tc_start && g->state != ST_TOOL) {
         g->state = ST_TOOL;
         g->toolraw.n = 0;
@@ -1139,6 +1180,22 @@ static void generate(Gen *g, float *lg, const Toks *prompt) {
         if (ctx_pos(S.ctx) + 1 >= ctx_n_ctx(S.ctx)) break;
         lg = pcache_feed(S.pc, &tok, 1);
         if (!lg) break;
+        if (g->state == ST_THINK && g->think_budget > 0 && ++g->n_think >= g->think_budget) {
+            /* reasoning budget spent: close the reasoning ourselves, the model continues with the answer */
+            Toks close = { 0 };
+            toks_text(&close, think_close(), -1);
+            if (ctx_pos(S.ctx) + close.n + 1 >= ctx_n_ctx(S.ctx)) { free(close.v); break; }
+            for (int k = 0; k < close.n; k++) {
+                on_token(g, close.v[k]);
+                sampler_accept(&smp, close.v[k]);
+            }
+            flush_text(g, 0);
+            g->n_gen += close.n;
+            i += close.n;
+            lg = pcache_feed(S.pc, close.v, close.n);
+            free(close.v);
+            if (!lg) break;
+        }
     }
     if (g->state == ST_TOOL) {
         /* unterminated tool call block: show it as text */
@@ -1234,6 +1291,21 @@ static int parse_params(Gen *g, const Json *body, char *err, int errlen) {
     return 1;
 }
 
+/* Reasoning for this request: "thinking_budget" (tokens, 0 = off), then
+ * chat_template_kwargs.enable_thinking=false, then "reasoning_effort" or "reasoning":{"effort"},
+ * else the server default. */
+static int request_think(const Json *body) {
+    const Json *v = json_get(body, "thinking_budget");
+    if (v && v->t == J_NUM) return v->num > 0 ? (int)v->num : THINK_OFF;
+    const Json *kw = json_get(json_get(body, "chat_template_kwargs"), "enable_thinking");
+    if (kw && !json_bool(kw, 1)) return THINK_OFF;
+    const char *effort = json_str(json_get(body, "reasoning_effort"), NULL);
+    if (!effort) effort = json_str(json_get(json_get(body, "reasoning"), "effort"), NULL);
+    int budget;
+    if (effort && think_parse(effort, &budget)) return budget;
+    return S.cfg.think_budget;
+}
+
 static void gen_free(Gen *g) {
     buf_free(&g->reasoning);
     buf_free(&g->content);
@@ -1271,9 +1343,15 @@ static void handle_chat(Conn *c, const Json *body) {
     parse_params(&g, body, err, sizeof(err));
     const Json *kw = json_get(body, "chat_template_kwargs");
     int preserve = json_bool(json_get(kw, "preserve_thinking"), 0);
+    g.think_budget = request_think(body);
+    if (g.think_budget == THINK_OFF) {
+        g.state = ST_CONTENT;
+        g.skip_ws = 1; /* the answer usually starts with a newline after the empty block */
+    }
     Toks t = { 0 };
     int *bounds = NULL, nb = 0;
-    if (!render_chat(messages, json_get(body, "tools"), preserve, &t, &bounds, &nb, NULL, err, sizeof(err))) {
+    if (!render_chat(messages, json_get(body, "tools"), preserve, g.think_budget != THINK_OFF, &t, &bounds, &nb, NULL,
+                     err, sizeof(err))) {
         send_error(c, 400, "invalid_request_error", err[0] ? err : "cannot render the conversation");
         free(t.v); free(bounds);
         return;
@@ -1411,6 +1489,14 @@ static void handle_props(Conn *c) {
                    "\"top_p\":%g,\"min_p\":%g,\"repeat_penalty\":%g,\"repeat_last_n\":%d,\"seed\":%llu,\"n_predict\":%d}}",
                ctx_n_ctx(S.ctx), sp->temp, sp->top_k, sp->top_p, sp->min_p, sp->repeat_penalty, sp->repeat_last_n,
                (unsigned long long)sp->seed, S.cfg.n_predict);
+    /* the reasoning levels this model offers, and the one requests get without reasoning_effort */
+    const char *def = "custom";
+    int budget;
+    static const char *const levels[] = { "high", "medium", "low", "off" };
+    for (int i = 0; i < 4; i++)
+        if (think_parse(levels[i], &budget) && budget == S.cfg.think_budget) { def = levels[i]; break; }
+    buf_printf(&b, ",\"reasoning\":{\"default\":\"%s\",\"levels\":[%s\"high\",\"medium\",\"low\",\"off\"]}", def,
+               strcmp(def, "custom") ? "" : "\"custom\",");
     uint64_t tl;
     const char *tpl = gguf_get_str(&S.m->gguf, "tokenizer.chat_template", &tl);
     if (tpl) {
@@ -1445,7 +1531,8 @@ static void handle_apply_template(Conn *c, const Json *body) {
     Buf text = { 0 };
     int *bounds = NULL, nb = 0;
     int preserve = json_bool(json_get(json_get(body, "chat_template_kwargs"), "preserve_thinking"), 0);
-    if (!render_chat(messages, json_get(body, "tools"), preserve, &t, &bounds, &nb, &text, err, sizeof(err))) {
+    if (!render_chat(messages, json_get(body, "tools"), preserve, request_think(body) != THINK_OFF, &t, &bounds, &nb,
+                     &text, err, sizeof(err))) {
         send_error(c, 400, "invalid_request_error", err);
     } else {
         Buf b = { 0 };

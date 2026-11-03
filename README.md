@@ -489,6 +489,7 @@ dependency-free HTTP server (Winsock / POSIX sockets) with:
 - **the Pandora web interface** at `http://127.0.0.1:8080`:
   - multi-turn conversations saved in the browser;
   - streaming answers with Markdown (tables, code with a Copy button) and a collapsible reasoning section;
+  - a reasoning level selector next to the message box (High, Medium, Low, Off);
   - prompt-processing progress, stop, regenerate, edit the last message;
   - system prompt and sampling parameters, light/dark theme.
 
@@ -496,7 +497,7 @@ dependency-free HTTP server (Winsock / POSIX sockets) with:
 - **an OpenAI-compatible API**:
   - `POST /v1/chat/completions` with SSE streaming, `reasoning_content` separate from the answer,
     `tools` / `tool_calls`, `stop`, `stream_options.include_usage` and
-    `chat_template_kwargs.preserve_thinking`;
+    `chat_template_kwargs.preserve_thinking`, the reasoning controls described below;
   - `POST /v1/completions` and `GET /v1/models`;
   - like llama-server, also `GET /health`, `GET /props`, `POST /tokenize`, `POST /apply-template`
     and the `timings` / `prompt_progress` fields (`return_progress: true`).
@@ -505,6 +506,25 @@ dependency-free HTTP server (Winsock / POSIX sockets) with:
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
      -d '{"messages":[{"role":"user","content":"Hello!"}]}'
 ```
+
+**Reasoning levels.** Neither model has official effort levels: LFM3 has an on/off switch in its
+template (`enable_thinking`), LFM2.5-24B always reasons. Pithos adds the levels as reasoning budgets:
+
+| Level | Behaviour |
+|---|---|
+| `high` (default) | the model reasons as long as it needs |
+| `medium` | the reasoning is closed after 2048 tokens and the model moves on to the answer |
+| `low` (`minimal`) | the same after 512 tokens |
+| `off` (`none`) | the answer starts right away, after an empty `<think></think>` |
+
+On the server, a request picks it with `reasoning_effort` (or `reasoning: {"effort": …}`), `thinking_budget`
+(tokens, 0 = off) or `chat_template_kwargs.enable_thinking: false`; `--reasoning` sets the default for
+requests without them (also in the terminal chat), and `GET /props` lists the levels under `reasoning`.
+Measured on 30 GSM8K problems, `off` keeps the accuracy (LFM3 93%, LFM2.5-24B 97%) with 2–4 times shorter
+answers; on harder problems (20 from MATH, LFM3) `low` cut the time by a third without losing accuracy. With the
+reasoning off the models sometimes reason inside the answer anyway: when a `</think>` arrives there, the text
+before it is moved to `reasoning_content` (in streaming, a delta with `content_to_reasoning` tells the
+client to do the same).
 
 The chat template is implemented in C following the Jinja template in the GGUF: system prompt, tools,
 call arguments in the `f(arg='v')` format, and reasoning removed from past turns. `tests/test_server.py`
@@ -691,6 +711,7 @@ checkpoint and only processes the rest:
 | `-t N` | threads (default: physical cores) |
 | `-b N` | prompt-processing batch (default 64) |
 | `--temp --top-k --top-p --min-p --repeat-penalty --seed` | sampling (defaults from the model card: 0.1 / 50 / 1.05) |
+| `--reasoning R` | reasoning level: `high` (default), `medium`, `low`, `off`, or a budget in tokens |
 | `--hide-think` | do not print the reasoning (`<think>…</think>`) |
 | `--keep-think` | keep the reasoning of past turns in the context |
 | `--no-gpu`, `--gpu-device N`, `--gpu-mem MB`, `--list-gpus` | GPU control |

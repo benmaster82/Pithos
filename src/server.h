@@ -21,7 +21,21 @@ typedef struct {
     int verbose;
     int open_browser;           /* open the web UI once the server is listening */
     Tools *tools;               /* agent tools served on /v1/tools (NULL = none) */
+    int think_budget;           /* default reasoning: THINK_FULL, THINK_OFF or a token budget */
 } ServerConfig;
+
+/* Reasoning control. THINK_FULL: the model reasons as long as it wants (the template default);
+ * THINK_OFF: the answer starts after an empty <think></think>; N > 0: after N reasoning tokens
+ * the reasoning is closed and the model moves on to the answer. */
+enum { THINK_FULL = -1, THINK_OFF = 0 };
+
+/* "off" / "none", "low" / "minimal", "medium", "high", or a number of tokens. Returns 0 if the
+ * text is none of these. */
+int think_parse(const char *s, int *budget);
+/* The text that closes the reasoning when the budget runs out. */
+const char *think_close(void);
+/* The assistant turn opening with the reasoning off (lfm3: the LFM3 architecture). */
+const char *think_off_prompt(int lfm3);
 
 /* Serves until the process is terminated. Returns non-zero if the socket cannot be opened. */
 int server_run(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *tk, PCache *pc);

@@ -289,6 +289,12 @@ static void on_event(Stream *s, const char *data, int n) {
                 out(m);
             }
         }
+        if (json_get(d, "content_to_reasoning")) {
+            /* the model reasoned inside the answer: the text so far was reasoning (already on screen) */
+            buf_add(&s->reasoning, s->content.s ? s->content.s : "", s->content.n);
+            s->content.n = 0;
+            if (s->content_started) out("\n\n");
+        }
         const Json *c = json_get(d, "content");
         if (c && c->t == J_STR && c->len) {
             if (!s->content_started) {
