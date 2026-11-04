@@ -37,6 +37,7 @@ if defined TEST (
     gcc %CFLAGS% tests\test_kernels.c src\gguf.c src\quant.c src\platform.c build\quant_avx2.o build\quant_avx.o -o build\test_kernels.exe -lm || goto fail
     gcc %CFLAGS% tests\test_gpu.c src\model.c src\gguf.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c build\quant_avx2.o build\quant_avx.o -o build\test_gpu.exe -lm || goto fail
     gcc %CFLAGS% tests\test_dx.c src\model.c src\gguf.c src\tokenizer.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c build\quant_avx2.o build\quant_avx.o -o build\test_dx.exe -lm || goto fail
+    gcc %CFLAGS% tests\test_vk.c src\gpu_vulkan.c src\model.c src\gguf.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c build\quant_avx2.o build\quant_avx.o -o build\test_vk.exe -lm || goto fail
     gcc %CFLAGS% tests\test_shell.c src\tools.c src\proc.c src\platform.c src\json.c -o build\test_shell.exe -lm || goto fail
 )
 goto ok
@@ -58,6 +59,7 @@ if defined TEST (
     cl %CLFLAGS% tests\test_kernels.c src\gguf.c src\quant.c src\platform.c build\quant_avx2.obj build\quant_avx.obj /Fobuild\ /Febuild\test_kernels.exe /link /LTCG || goto fail
     cl %CLFLAGS% tests\test_gpu.c src\model.c src\gguf.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c build\quant_avx2.obj build\quant_avx.obj /Fobuild\ /Febuild\test_gpu.exe /link /LTCG || goto fail
     cl %CLFLAGS% tests\test_dx.c src\model.c src\gguf.c src\tokenizer.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c build\quant_avx2.obj build\quant_avx.obj /Fobuild\ /Febuild\test_dx.exe /link /LTCG || goto fail
+    cl %CLFLAGS% tests\test_vk.c src\gpu_vulkan.c src\model.c src\gguf.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c build\quant_avx2.obj build\quant_avx.obj /Fobuild\ /Febuild\test_vk.exe /link /LTCG || goto fail
     cl %CLFLAGS% tests\test_shell.c src\tools.c src\proc.c src\platform.c src\json.c /Fobuild\ /Febuild\test_shell.exe /link /LTCG || goto fail
 )
 goto ok

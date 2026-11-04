@@ -60,6 +60,7 @@ $(BUILD)/pithos$(EXE): $(SRC) $(EXTRA_OBJ) src/*.h | $(BUILD)
 test: all
 	$(CC) $(CFLAGS) $(ARCHFLAGS) tests/test_kernels.c src/gguf.c src/quant.c src/platform.c src/quant_neon.c $(EXTRA_OBJ) -o $(BUILD)/test_kernels$(EXE) $(LDLIBS)
 	$(CC) $(CFLAGS) $(ARCHFLAGS) tests/test_gpu.c src/model.c src/gguf.c src/quant.c src/platform.c src/quant_neon.c src/gpu_opencl.c src/gpu_d3d12.c $(EXTRA_OBJ) -o $(BUILD)/test_gpu$(EXE) $(LDLIBS)
+	$(CC) $(CFLAGS) $(ARCHFLAGS) tests/test_vk.c src/gpu_vulkan.c src/model.c src/gguf.c src/quant.c src/platform.c src/quant_neon.c src/gpu_opencl.c src/gpu_d3d12.c $(EXTRA_OBJ) -o $(BUILD)/test_vk$(EXE) $(LDLIBS)
 	$(CC) $(CFLAGS) tests/test_shell.c src/tools.c src/proc.c src/platform.c src/json.c -o $(BUILD)/test_shell$(EXE) $(LDLIBS)
 
 # regenerate embedded sources (needs Python; outputs are committed)
