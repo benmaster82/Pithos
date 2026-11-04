@@ -385,11 +385,14 @@ typedef struct {
     uint8_t *map;                   /* host-visible buffers stay mapped */
 } VBuf;
 
+#define MAX_PARTS 8         /* buffers of one matrix, when it is over the device's buffer size limit */
+
 typedef struct {
     const uint8_t *host;
     int kernel, rows, K;
     size_t row_bytes, gpu_row;      /* bytes per row in the file / on the GPU */
-    VBuf b;
+    int nparts, part_rows;          /* rows [p * part_rows, ...) in part[p]; nparts 0: not on the GPU */
+    VBuf part[MAX_PARTS];
 } VMat;
 
 enum { HOST_NONE, HOST_UPLOAD, HOST_READBACK };
@@ -417,8 +420,8 @@ struct Vulkan {
     VkPipeline pso[N_KERNELS], pso_mv[N_KERNELS], pso_tok[N_TOKEN_KERNELS];
     int recording, nsets, broken;
     VBuf consts, dummy;             /* the constants ring (MAX_SETS slots); a stand-in for unused bindings */
-    VMat *mats;                     /* sorted by host address; b.buf 0: not on the GPU */
-    int nmats, n_big;               /* n_big: matrices over the device's buffer size limit */
+    VMat *mats;                     /* sorted by host address */
+    int nmats, n_big, n_split;      /* matrices too large for the GPU / split into parts */
     VBuf up, x, o, rb;              /* upload, activations, results, readback */
     struct VDense *dense;           /* whole forward pass, or NULL */
 };
@@ -750,26 +753,39 @@ static int upload_weights(Vulkan *v, char *err, int errlen) {
     size_t used = 0;
     for (int i = 0; i < v->nmats; i++) {
         VMat *x = &v->mats[i];
-        const VkDeviceSize bytes_all = (VkDeviceSize)x->gpu_row * (VkDeviceSize)x->rows;
-        if (bytes_all > max_buf) {   /* larger than one buffer can be here: this matrix stays on the CPU */
-            v->n_big++;
-            continue;
+        /* over the limit of one buffer: parts of whole 64-row tiles (their outputs, 256 bytes apart,
+         * stay bindable) */
+        x->part_rows = x->rows;
+        if ((VkDeviceSize)x->gpu_row * (VkDeviceSize)x->rows > max_buf) {
+            x->part_rows = (int)(max_buf / x->gpu_row) & ~63;
+            if (x->part_rows < 64 || (x->rows + x->part_rows - 1) / x->part_rows > MAX_PARTS) {
+                v->n_big++;   /* stays on the CPU */
+                continue;
+            }
+            v->n_split++;
         }
-        if (!vbuf_create(v, &x->b, bytes_all, HOST_NONE)) {
-            snprintf(err, (size_t)errlen, "out of GPU memory after %d of %d matrices", i, v->nmats);
-            return 0;
+        for (int p = 0; p * x->part_rows < x->rows; p++) {
+            const int n = x->rows - p * x->part_rows < x->part_rows ? x->rows - p * x->part_rows : x->part_rows;
+            if (!vbuf_create(v, &x->part[p], (VkDeviceSize)x->gpu_row * (VkDeviceSize)n, HOST_NONE)) {
+                snprintf(err, (size_t)errlen, "out of GPU memory after %d of %d matrices", i, v->nmats);
+                return 0;
+            }
+            x->nparts = p + 1;
         }
         for (int r0 = 0; r0 < x->rows;) {
             int n = (int)((v->up.size - used) / x->gpu_row);
-            if (n > x->rows - r0) n = x->rows - r0;
-            if (n < 1 || (n < x->rows - r0 && used)) {   /* full: send what is staged */
+            const int p = r0 / x->part_rows, end = p * x->part_rows + x->part_rows < x->rows
+                                                     ? p * x->part_rows + x->part_rows : x->rows;
+            if (n > end - r0) n = end - r0;
+            if (n < 1 || (n < end - r0 && used)) {   /* full: send what is staged */
                 if (!submit(v)) { snprintf(err, (size_t)errlen, "weight upload failed"); return 0; }
                 used = 0;
                 continue;
             }
             const size_t bytes = x->gpu_row * (size_t)n;
             pack_rows(x, r0, r0 + n, v->up.map + used);
-            copy(v, &x->b, (VkDeviceSize)x->gpu_row * (VkDeviceSize)r0, &v->up, used, bytes);
+            copy(v, &x->part[p], (VkDeviceSize)x->gpu_row * (VkDeviceSize)(r0 - p * x->part_rows), &v->up, used,
+                 bytes);
             used = (used + bytes + 255) & ~(size_t)255;
             r0 += n;
         }
@@ -809,6 +825,9 @@ static int pick_device(Vulkan *v, int want, char *info, int infolen) {
     v->vk.GetPhysicalDeviceQueueFamilyProperties(v->pd, &nq, qf);
     for (v->family = 0; v->family < nq && !(qf[v->family].queueFlags & QUEUE_COMPUTE); v->family++) {}
     if (v->family == nq) { snprintf(info, (size_t)infolen, "%s has no compute queue", v->props.deviceName); return 0; }
+    /* PITHOS_VK_MAXBUF=MB: a lower buffer size limit, to test the splitting of large matrices */
+    const double lim = getenv("PITHOS_VK_MAXBUF") ? atof(getenv("PITHOS_VK_MAXBUF")) * 1048576.0 : 0;
+    if (lim >= 1048576.0 && lim < v->props.limits.maxStorageBufferRange) v->props.limits.maxStorageBufferRange = (uint32_t)lim;
     return 1;
 }
 
@@ -878,11 +897,13 @@ Vulkan *vk_create(const Model *m, int device, char *info, int infolen) {
     }
     size_t total = 0;
     for (int i = 0; i < v->nmats; i++)
-        if (v->mats[i].b.buf) total += v->mats[i].gpu_row * (size_t)v->mats[i].rows;
-    char big[96] = "";
+        if (v->mats[i].nparts) total += v->mats[i].gpu_row * (size_t)v->mats[i].rows;
+    char big[128] = "";
+    const unsigned lim = (unsigned)(v->props.limits.maxStorageBufferRange >> 20);
     if (v->n_big)
-        snprintf(big, sizeof(big), " (%d over the %u MB buffer limit stay on the CPU)", v->n_big,
-                 (unsigned)(v->props.limits.maxStorageBufferRange >> 20));
+        snprintf(big, sizeof(big), " (%d over the %u MB buffer limit stay on the CPU)", v->n_big, lim);
+    else if (v->n_split)
+        snprintf(big, sizeof(big), " (%d split at the %u MB buffer limit)", v->n_split, lim);
     snprintf(info, (size_t)infolen, "%s (%s) | %d matrices%s, %.0f MB of weights", name, type_name(v->props.deviceType),
              v->nmats - v->n_big, big, total / 1048576.0);
     return v;
@@ -892,7 +913,8 @@ void vk_destroy(Vulkan *v) {
     if (!v) return;
     if (v->dev && v->vk.DeviceWaitIdle) {   /* every device entry point was loaded */
         v->vk.DeviceWaitIdle(v->dev);
-        for (int i = 0; i < v->nmats; i++) vbuf_free(v, &v->mats[i].b);
+        for (int i = 0; i < v->nmats; i++)
+            for (int p = 0; p < v->mats[i].nparts; p++) vbuf_free(v, &v->mats[i].part[p]);
         dense_free(v);
         VBuf *bufs[] = {&v->up, &v->x, &v->o, &v->rb, &v->consts, &v->dummy};
         for (size_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) vbuf_free(v, bufs[i]);
@@ -915,9 +937,26 @@ void vk_destroy(Vulkan *v) {
     free(v);
 }
 
+/* out[t][r] (rows orow floats apart) = matrix x . the Q8_K rows of n tokens, one dispatch per part */
+static int mm_dispatch(Vulkan *v, const VMat *x, Bind o, Bind in, int n, int orow, int cached) {
+    const uint32_t nb = (uint32_t)(x->K / QK_K);
+    const Bind none = {NULL, 0};
+    int ok = 1;
+    for (int p = 0; p < x->nparts && ok; p++) {
+        const int r0 = p * x->part_rows, rows = x->rows - r0 < x->part_rows ? x->rows - r0 : x->part_rows;
+        const uint32_t c[6] = {(uint32_t)rows, nb, (uint32_t)n, (uint32_t)x->gpu_row, nb * Q8_BYTES, (uint32_t)orow};
+        const Bind op = {o.b, o.off + (VkDeviceSize)r0 * 4}, w = {&x->part[p], 0};
+        ok = n < VK_MV_TOKENS
+           ? dispatch(v, v->pso_mv[x->kernel], c, 6, op, in, none, w, none, (uint32_t)(rows + 7) / 8, (uint32_t)n, cached)
+           : dispatch(v, v->pso[x->kernel], c, 6, op, in, none, w, none, (uint32_t)(rows + 63) / 64,
+                      (uint32_t)(n + 63) / 64, cached);
+    }
+    return ok;
+}
+
 int vk_has(const Vulkan *v, const uint8_t *w) {
     const VMat *x = v && !v->broken ? find_mat(v, w) : NULL;
-    return x && x->b.buf;
+    return x && x->nparts;
 }
 
 #define MAX_VK_JOBS 16
@@ -930,7 +969,7 @@ int vk_matmul(Vulkan *v, const VulkanJob *jobs, int n) {
     size_t xbytes = 0, obytes = 0;
     for (int i = 0; i < n; i++) {
         mat[i] = find_mat(v, jobs[i].w);
-        if (!mat[i] || !mat[i]->b.buf) return 0;
+        if (!mat[i] || !mat[i]->nparts) return 0;
         /* jobs that read the same activations share one copy */
         fresh[i] = 1;
         for (int k = 0; k < i && fresh[i]; k++)
@@ -957,19 +996,10 @@ int vk_matmul(Vulkan *v, const VulkanJob *jobs, int n) {
 
     copy(v, &v->x, 0, &v->up, 0, xbytes);
     barrier(v, PS_TRANSFER, AC_TRANSFER_WRITE, PS_COMPUTE, AC_SHADER_READ | AC_SHADER_WRITE);
-    const Bind none = {NULL, 0};
     int ok = 1;
     for (int i = 0; i < n && ok; i++) {
-        const VMat *x = mat[i];
-        const uint32_t nb = (uint32_t)(x->K / QK_K);
-        const uint32_t p[6] = {(uint32_t)x->rows, nb, (uint32_t)jobs[i].nt, (uint32_t)x->gpu_row, nb * Q8_BYTES,
-                               (uint32_t)x->rows};
-        const int mv = jobs[i].nt < VK_MV_TOKENS;
-        const Bind o = {&v->o, ooff[i]}, xb = {&v->x, xoff[i]}, w = {&x->b, 0};
-        ok = mv ? dispatch(v, v->pso_mv[x->kernel], p, 6, o, xb, none, w, none, (uint32_t)(x->rows + 7) / 8,
-                           (uint32_t)jobs[i].nt, 0)
-                : dispatch(v, v->pso[x->kernel], p, 6, o, xb, none, w, none, (uint32_t)(x->rows + 63) / 64,
-                           (uint32_t)(jobs[i].nt + 63) / 64, 0);
+        const Bind o = {&v->o, ooff[i]}, xb = {&v->x, xoff[i]};
+        ok = mm_dispatch(v, mat[i], o, xb, jobs[i].nt, mat[i]->rows, 0);
     }
     barrier(v, PS_COMPUTE, AC_SHADER_WRITE, PS_TRANSFER, AC_TRANSFER_READ);
     copy(v, &v->rb, 0, &v->o, 0, obytes);
@@ -1052,9 +1082,8 @@ int vk_dense_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *info,
     const int D = m->dim, hd = m->head_dim;
     int F = 0, ok = D % QK_K == 0 && hd % 2 == 0 && hd <= 512 && 256 % (hd / 2) == 0 && m->l_cache >= 2;
     const VMat *output = find_mat(v, m->output.data);
-    if (output && !output->b.buf) {
-        snprintf(info, (size_t)infolen, "the output matrix is over the %u MB buffer limit of this GPU",
-                 (unsigned)(v->props.limits.maxStorageBufferRange >> 20));
+    if (output && !output->nparts) {
+        snprintf(info, (size_t)infolen, "the output matrix is too large for the buffers of this GPU");
         return 0;
     }
     ok = ok && output;
@@ -1119,7 +1148,7 @@ int vk_dense_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *info,
         X->w_down = find_mat(v, L->w_down.data);
         ok = ok && X->w_gate && X->w_up && X->w_down && L->attn_norm && L->ffn_norm;
         const VMat *ms[] = {X->wq, X->wk, X->wv, X->wo, X->gate, X->in_proj, X->out_proj, X->w_gate, X->w_up, X->w_down};
-        for (size_t i = 0; i < sizeof(ms) / sizeof(ms[0]) && ok; i++) ok = !ms[i] || ms[i]->b.buf;
+        for (size_t i = 0; i < sizeof(ms) / sizeof(ms[0]) && ok; i++) ok = !ms[i] || ms[i]->nparts;
     }
     t->final_norm = add_vec(&sw, &len, &cap, m->final_norm, (size_t)D);
     if (!ok || !m->final_norm) {
@@ -1179,14 +1208,8 @@ static void compute_barrier(Vulkan *v) {
 
 /* out[t][r] (scratch offset oo, rows orow floats apart) = matrix x . the Q8_K rows of n tokens at xo */
 static int tok_mm(Vulkan *v, const VMat *x, size_t xo, size_t oo, int n, int orow) {
-    VDense *t = v->dense;
-    const uint32_t nb = (uint32_t)(x->K / QK_K);
-    const uint32_t p[6] = {(uint32_t)x->rows, nb, (uint32_t)n, (uint32_t)x->gpu_row, nb * Q8_BYTES, (uint32_t)orow};
-    const Bind none = {NULL, 0}, o = {&t->scratch, oo}, in = {&t->scratch, xo}, w = {&x->b, 0};
-    if (n < VK_MV_TOKENS)
-        return dispatch(v, v->pso_mv[x->kernel], p, 6, o, in, none, w, none, (uint32_t)(x->rows + 7) / 8, (uint32_t)n, 1);
-    return dispatch(v, v->pso[x->kernel], p, 6, o, in, none, w, none, (uint32_t)(x->rows + 63) / 64,
-                    (uint32_t)(n + 63) / 64, 1);
+    const Bind o = {&v->dense->scratch, oo}, in = {&v->dense->scratch, xo};
+    return mm_dispatch(v, x, o, in, n, orow, 1);
 }
 
 static int tok_run(Vulkan *v, int k, const uint32_t c[16], uint32_t groups, uint32_t tokens) {

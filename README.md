@@ -49,6 +49,8 @@ model). **Pandora** is the agent in the web interface.
   computed on the CPU in parallel.
 - Optional Direct3D 12 GPU acceleration (`--d3d12`, Windows and Xbox): for dense models such as
   LFM3, the whole forward pass, prompt included, runs on the GPU.
+- Optional Vulkan GPU acceleration (`--vulkan`, Windows and Linux; experimental): the same kernels
+  and the same whole forward pass as Direct3D 12, on any GPU with a Vulkan 1.1 driver.
 - **An Xbox One app**: the server runs on a console in Developer Mode, with a status and chat screen
   on the TV.
 - Works with models larger than the free RAM (asynchronous read-ahead, expert prediction).
@@ -170,8 +172,9 @@ lives in VRAM (1.2 GB with a 8k context) and decoding runs there: about 55 token
 reference laptop (GTX 1650), against about 20 on the CPU alone. With OpenCL the prompt is read on
 the CPU (45-75 tokens per second). On Windows, **`--no-gpu --d3d12`** runs everything on the GPU
 through Direct3D 12 instead, which is faster on both counts: about 330 tokens per second of prompt
-and 69 of generation on the same laptop. This is also the model that runs on the
-[Xbox One](#xbox-one).
+and 69 of generation on the same laptop. **`--no-gpu --vulkan`** does the same through Vulkan, on
+Windows and on Linux (experimental), at nearly the same speed. This is also the model that runs on
+the [Xbox One](#xbox-one).
 
 | LFM3-1.7B on the reference laptop | Prompt | Generation |
 |---|---:|---:|
@@ -179,6 +182,7 @@ and 69 of generation on the same laptop. This is also the model that runs on the
 | OpenCL (default) | 67–103 tok/s | 56 tok/s |
 | OpenCL, with prompt matmuls on Direct3D 12 (`--d3d12`) | 190 tok/s | 56 tok/s |
 | **Direct3D 12 only (`--no-gpu --d3d12`)** | **330 tok/s** | **69 tok/s** |
+| Vulkan only (`--no-gpu --vulkan`, experimental) | 330 tok/s | 67 tok/s |
 
 ```
 build\pithos.exe -m models\LFM3-1.7B-Q4_K_M.gguf --no-gpu --d3d12 --server --open
@@ -245,8 +249,9 @@ machine's free RAM).
 **Windows**: `build.cmd` uses gcc when present (on the `PATH`, or from MSYS2 in `C:\msys64\mingw64`
 or `ucrt64`), otherwise MSVC (Visual Studio or Build Tools, found automatically); `build.cmd msvc`
 forces MSVC. `build.cmd test` (or `build.cmd msvc test`) also builds the tests. The Direct3D 12 backend is always included: `d3d12.dll` is loaded at runtime and the
-shaders are precompiled in `src/kernels_dx.h`, so no extra SDK is needed. The Xbox app has its own
-build, described in [Xbox One](#xbox-one).
+shaders are precompiled in `src/kernels_dx.h`, so no extra SDK is needed. The same goes for the
+Vulkan backend (`vulkan-1.dll` on Windows, `libvulkan.so.1` on Linux, shaders in
+`src/kernels_vk.h`). The Xbox app has its own build, described in [Xbox One](#xbox-one).
 
 ### Linux / WSL
 
@@ -351,6 +356,15 @@ With `--server`, open **http://127.0.0.1:8080** in your browser; the API base UR
 `http://127.0.0.1:8080/v1`. Add `--no-gpu` to explicitly use the CPU, for example
 `./build/pithos --server --no-gpu`. Autonomous mode still asks before commands it
 recognizes as destructive; see [Terminal agent](#terminal-agent) for details.
+
+**GPU on Linux (Vulkan, experimental).** With a Vulkan driver installed (NVIDIA's own driver, or
+Mesa's RADV / ANV for AMD and Intel: `sudo apt install libvulkan1 mesa-vulkan-drivers`),
+`./build/pithos --list-gpus` lists the devices, and `--no-gpu --vulkan` runs LFM3 entirely on the
+GPU. For MoE models Vulkan takes the prompt matmuls. Mesa's software driver (llvmpipe, a "CPU"
+device) is used only when chosen by number with `--vulkan-device N`: it is useful for testing, not
+for speed. Where a GPU's buffers are small (llvmpipe: 128 MB), larger matrices are split over
+several, and a KV cache that does not fit makes Pithos fall back to the matmuls only, with a
+message suggesting a smaller `-c`.
 
 To work on another project, run the agent from that project's folder and give
 absolute paths to the executable and model (replace `/path/to/Pithos`):
@@ -721,6 +735,7 @@ checkpoint and only processes the rest:
 | `--no-gpu`, `--gpu-device N`, `--gpu-mem MB`, `--list-gpus` | GPU control |
 | `--no-gpu-dense` | in generation, use the GPU only for experts (attention, convolutions and output on the CPU) |
 | `--d3d12` | Direct3D 12 GPU (Windows, Xbox in Game mode). With `--no-gpu`, dense models (LFM3) run the whole forward pass on it, the fastest choice for them. With the OpenCL GPU also active, or for MoE models, only the prompt matmuls run there |
+| `--vulkan`, `--vulkan-device N` | Vulkan GPU (Windows, Linux; experimental): the same roles as `--d3d12`, which it cannot be combined with. Without a number the discrete GPU with the most memory is chosen; software drivers only by number (see `--list-gpus`) |
 | `--kernels K` | force the CPU kernels: `auto`, `scalar` or `avx` (the set for CPUs without AVX2) |
 | `--prefetch` / `--no-prefetch` | expert read-ahead (default: on when the model exceeds the free RAM) |
 | `--mlock` | try to lock the model in RAM |
@@ -783,6 +798,7 @@ for each of the 30 convolution layers.
 | `src/quant.c`, `quant_avx2.c`, `quant_neon.c` | Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/F16/F32 formats; scalar, AVX2 and NEON kernels |
 | `src/gpu_opencl.c`, `src/kernels.cl` | expert cache and dense layers in VRAM through OpenCL loaded at runtime |
 | `src/gpu_d3d12.c`, `src/kernels_dx.hlsl`, `src/kernels_dx_token.hlsl` | Direct3D 12 backend: matmul kernels and the other steps of the forward pass (compiled into `src/kernels_dx.h` by `tools\dx_shaders.cmd`, which needs `fxc` from the Windows SDK) |
+| `src/gpu_vulkan.c`, `src/kernels_vk.h` | Vulkan backend: the Direct3D 12 HLSL kernels compiled to SPIR-V (`tools\vk_shaders.cmd` or `tools/vk_shaders.sh`, which need `dxc` with SPIR-V support) |
 | `src/quant_avx.c` | 128-bit AVX/F16C kernels for CPUs without AVX2 |
 | `xbox/` | Xbox app: shell with the TV screen (`app.cpp`), manifest, build, signing and deployment scripts, GPU probe |
 | `src/platform.c` | mmap, thread pool, prefetch, system info (Win32 / POSIX) |
@@ -858,6 +874,19 @@ for each of the 30 convolution layers.
 - **State:** the GPU keeps its own KV cache and convolution state, synced with the CPU copies only
   when a request needs the other path (for example, a snapshot for prompt reuse).
 
+### GPU through Vulkan (Windows and Linux, experimental)
+- **Same kernels:** the Direct3D 12 HLSL is compiled to SPIR-V with DXC, so both backends compute
+  the same thing: on the same GPU their results are bit-identical. The D3D12 root signature becomes
+  one descriptor set (UAVs at bindings 0-2, SRVs at 8-9, the constants at 16, from a ring of
+  uniform buffer slots).
+- **Runtime loading:** `vulkan-1.dll` / `libvulkan.so.1` is loaded at runtime, with its own minimal
+  declarations (no Vulkan SDK). Each command buffer is submitted once per token or prompt chunk, as
+  with Direct3D 12, and the CPU polls its fence for up to 50 ms: the driver's wait wakes up about
+  1 ms late, 5% of a token.
+- **Buffer limits:** a matrix larger than the device's largest storage buffer is split by rows over
+  up to 8 buffers, one dispatch each. Bindings that are not at a multiple of the device's offset
+  alignment (64 bytes on Intel) are copied to an aligned place first.
+
 ## Validation
 - `build\test_kernels.exe MODEL`: every kernel (scalar and AVX2) against the reference dequantization on real model rows (relative error ~1e-8).
 - `build\test_gpu.exe MODEL`: experts computed in VRAM against an f32 reference (f32: 3e-7; int8: ~9e-3, like the activation quantization on the CPU).
@@ -866,6 +895,8 @@ for each of the 30 convolution layers.
   tokens with single tokens. The mean probability of the actual next token matches the CPU (NLL
   2.678 vs 2.692), and so does the top choice (93%, the level of int8 rounding noise; the CPU
   kernels differ among themselves in the same way).
+- `build\test_vk.exe MODEL [DEVICE]` (Windows and Linux): the same checks for Vulkan. Results match
+  Direct3D 12 exactly on the GTX 1650, and pass on Intel UHD and on Mesa's llvmpipe (WSL).
 - Tokenizer identical to Hugging Face `tokenizers` (each model's `tokenizer.json`) and to
   `llama-tokenize`, on texts with accents, numbers, spaces, code, CJK, emoji and special tokens.
 - Perplexity compared with `llama-perplexity` (table above).
@@ -900,6 +931,9 @@ for each of the 30 convolution layers.
 | `PITHOS_DX_CHUNKS=0` | Direct3D 12: prompt chunks go through the CPU path (only single tokens run whole on the GPU) |
 | `PITHOS_DX_MIN=N` | Direct3D 12, matmuls-only path: batches of fewer than N tokens stay on the CPU (default 1) |
 | `PITHOS_DX_DEBUG=1` | enable the Direct3D 12 debug layer and print its messages |
+| `PITHOS_VK_DENSE=0`, `PITHOS_VK_CHUNKS=0`, `PITHOS_VK_MIN=N` | Vulkan: as the three `PITHOS_DX_*` above |
+| `PITHOS_VK_SPIN=MS` | Vulkan: how long the CPU polls a submit before waiting in the driver (default 50) |
+| `PITHOS_VK_MAXBUF=MB` | Vulkan: a lower buffer size limit, to test the splitting of large matrices |
 
 ## Limitations
 Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
@@ -908,6 +942,9 @@ Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
   and F32; on the GPU only Q4_K and Q6_K. With OpenCL only decoding runs on the GPU, and the prompt
   is read on the CPU. Direct3D 12 runs the whole forward pass of dense models only: for MoE models
   it takes just the prompt matmuls. `--ppl` (logits of every token) uses its matmuls-only path.
+  Vulkan, the same.
+- Vulkan is experimental: tested on an NVIDIA GTX 1650 and an Intel UHD (Windows) and on llvmpipe
+  (Linux, WSL). On the Intel UHD it is correct but slower than the CPU.
 - The Xbox app has been tested on an Xbox One S only, with LFM3-1.7B. It needs the app type set to
   Game again after every reinstall.
 - LFM3's sliding-window layers keep the whole KV cache like the others (simpler; a ring buffer
