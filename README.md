@@ -13,7 +13,7 @@
   <img alt="C11, no dependencies" src="https://img.shields.io/badge/C11-no%20dependencies-7c5cf6">
   <img alt="Windows, Linux, macOS" src="https://img.shields.io/badge/Windows%20%7C%20Linux%20%7C%20macOS-x86--64%20%26%20ARM64-ec5c8c">
   <img alt="Xbox One in Developer Mode" src="https://img.shields.io/badge/Xbox%20One-Developer%20Mode-107c10">
-  <img alt="GPU: OpenCL or Direct3D 12, optional" src="https://img.shields.io/badge/GPU-OpenCL%20%7C%20Direct3D%2012%2C%20optional-f5a05a">
+  <img alt="GPU: OpenCL, Direct3D 12 or Vulkan, optional" src="https://img.shields.io/badge/GPU-OpenCL%20%7C%20Direct3D%2012%20%7C%20Vulkan%2C%20optional-f5a05a">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-2ea043"></a>
 </p>
 
