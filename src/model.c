@@ -225,6 +225,7 @@ struct Context {
     Vulkan *vk;                 /* optional Vulkan GPU for matmuls (instead of dx) */
     int vk_min;                 /* tokens per batch from which matmuls go to vk */
     int vk_dense, vk_chunks;    /* as dx_dense / dx_chunks, on vk */
+    int gpu_lost;               /* the whole-pass GPU failed with the KV cache and state on it */
     float *rope;                /* [2][n_batch][head_dim] RoPE tables of a chunk's positions */
     /* dense decode path: single tokens run on the GPU, which keeps its own copy of the KV cache
      * and of the convolution state. Rows [0, kv_cpu_n) / [0, kv_gpu_n) are valid on each side. */
@@ -991,8 +992,11 @@ static void forward_dx(Context *c, const int *tokens, int n, float *logits) {
         dequant_row(m->embed.type, m->embed.data + (size_t)id * m->embed.row_bytes, c->x + (size_t)t * D, D);
         rope_tables(c, pos0 + t, rope + (size_t)t * hd, rope_swa + (size_t)t * hd);
     }
-    if (!dx_dense_forward(c->dx, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL))
+    if (!dx_dense_forward(c->dx, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL)) {
         memset(c->logits, 0, sizeof(float) * (size_t)m->n_vocab);   /* the GPU failed: the message says so */
+        c->dx_dense = 0;
+        c->gpu_lost = 1;
+    }
     if (logits && logits != c->logits) memcpy(logits, c->logits, sizeof(float) * (size_t)m->n_vocab);
     c->pos += n;
     c->tok_counter += (uint32_t)n;
@@ -1020,8 +1024,11 @@ static void forward_vk(Context *c, const int *tokens, int n, float *logits) {
         dequant_row(m->embed.type, m->embed.data + (size_t)id * m->embed.row_bytes, c->x + (size_t)t * D, D);
         rope_tables(c, pos0 + t, rope + (size_t)t * hd, rope_swa + (size_t)t * hd);
     }
-    if (!vk_dense_forward(c->vk, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL))
+    if (!vk_dense_forward(c->vk, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL)) {
         memset(c->logits, 0, sizeof(float) * (size_t)m->n_vocab);   /* the GPU failed: the message says so */
+        c->vk_dense = 0;
+        c->gpu_lost = 1;
+    }
     if (logits && logits != c->logits) memcpy(logits, c->logits, sizeof(float) * (size_t)m->n_vocab);
     c->pos += n;
     c->tok_counter += (uint32_t)n;
@@ -1177,6 +1184,16 @@ static void forward_chunk(Context *c, const int *tokens, int n, int want_logits,
     }
 }
 
+/* after a failure of the whole-pass GPU its KV cache and state are gone: the context starts
+ * again from position 0 on the CPU, and the caller sees the failure (NULL / 0) */
+static int lost_state(Context *c) {
+    if (!c->gpu_lost) return 0;
+    c->gpu_lost = 0;
+    ctx_reset(c);
+    fprintf(stderr, "the context was lost with the GPU: continuing on the CPU from an empty context\n");
+    return 1;
+}
+
 float *ctx_forward(Context *c, const int *tokens, int n) {
     if (n <= 0) return c->logits;
     if (c->pos + n > c->n_ctx) return NULL;
@@ -1186,6 +1203,7 @@ float *ctx_forward(Context *c, const int *tokens, int n) {
         forward_chunk(c, tokens + i, nb, i + nb == n, NULL);
         c->stats.t_forward += time_sec() - t0;
         if (c->gpu) gpu_rebalance(c->gpu, nb == 1 ? 2 : 16);
+        if (lost_state(c)) return NULL;
     }
     return c->logits;
 }
@@ -1195,6 +1213,7 @@ int ctx_forward_all(Context *c, const int *tokens, int n, float *out) {
     for (int i = 0; i < n; i += c->n_batch) {
         int nb = n - i < c->n_batch ? n - i : c->n_batch;
         forward_chunk(c, tokens + i, nb, 0, out + (size_t)i * c->m->n_vocab);
+        if (lost_state(c)) return 0;
     }
     return 1;
 }

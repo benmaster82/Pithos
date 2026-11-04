@@ -262,7 +262,10 @@ int pcache_prepare(PCache *pc, const int *toks, int n, int allow_full) {
 
 float *pcache_feed(PCache *pc, const int *toks, int n) {
     float *lg = ctx_forward(pc->c, toks, n);
-    if (!lg) return NULL;
+    if (!lg) {
+        if (ctx_pos(pc->c) < pc->n) pcache_clear(pc);   /* the context lost its state (GPU failure) */
+        return NULL;
+    }
     if (pc->n + n > pc->cap) {
         pc->cap = (pc->n + n) * 2 + 256;
         pc->toks = (int *)realloc(pc->toks, sizeof(int) * (size_t)pc->cap);

@@ -86,7 +86,21 @@ generation uses about 30 of them.
 - [ ] **Merge `xbox` into `main`** after review: shared-code changes are small and measured neutral
   on Windows and Linux.
 
+## 7. Vulkan backend (`--vulkan`, experimental)
+The Direct3D 12 kernels compiled to SPIR-V; same results on the same GPU. LFM3-1.7B on the GTX 1650:
+prompt 328 tok/s, generation 82 (Direct3D 12: 336 / 70).
+
+- [ ] **Testing on AMD and on real Linux GPUs**: so far NVIDIA and Intel UHD on Windows, and only
+  Mesa's software driver (llvmpipe) on Linux.
+- [ ] **Batched matmuls on Intel**: `mm_*` compile to SIMD8 with register spills there (35 tok/s of
+  prompt against 42 with Direct3D 12). Integrated Intel GPUs stay slower than the CPU anyway.
+- [ ] **KV cache over the buffer limit**: split it like the large matrices, so that small-buffer
+  devices (llvmpipe: 128 MB) keep the whole forward pass at the default context.
+- [ ] **Vulkan by default where it is fastest**, together with the Direct3D 12 item above.
+
 ## Done
+- Branch `vulkan`: Vulkan backend (`--vulkan`, `--vulkan-device N`) on Windows and Linux, loaded at
+  runtime, with the whole forward pass of dense models and the matmuls for MoE models.
 - Branch `xbox` (not released yet): UWP app for the Xbox One in Dev Mode with a status and chat
   screen on the TV, AVX kernels for CPUs without AVX2 (Jaguar, Ivy Bridge), and a Direct3D 12
   backend (`--d3d12`) running the whole forward pass on the GPU. On the Xbox: prompt 13.9 → 146

@@ -1248,6 +1248,12 @@ int vk_dense_forward(Vulkan *v, const float *x, int n, const float *rope_cs, con
                      float *logits) {
     VDense *t = v ? v->dense : NULL;
     if (!t || v->broken || n < 1 || n > t->B || pos0 + n > t->n_ctx) return 0;
+    static int passes;   /* PITHOS_VK_FAIL=N: the GPU "fails" at pass N, to test the CPU fallback */
+    if (getenv("PITHOS_VK_FAIL") && ++passes == atoi(getenv("PITHOS_VK_FAIL"))) {
+        v->broken = 1;
+        fprintf(stderr, "Vulkan: simulated GPU failure (PITHOS_VK_FAIL)\n");
+        return 0;
+    }
     const Model *m = t->m;
     const int D = t->D, hd = t->hd, kvd = t->kvd, qkvw = D + 2 * kvd;
     const uint32_t nb = (uint32_t)(D / QK_K), un = (uint32_t)n;
