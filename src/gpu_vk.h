@@ -34,4 +34,18 @@ int vk_has(const Vulkan *v, const uint8_t *w);
  * Returns 0 if the GPU failed: nothing was written and the caller computes them on the CPU. */
 int vk_matmul(Vulkan *v, const VulkanJob *jobs, int n);
 
+/* ---- whole forward pass (models without experts), as dx_dense_* in gpu_dx.h: every step of
+ * a token or of a prompt chunk on the GPU, which keeps its own KV cache ([n_attn][n_ctx][kvd]
+ * f16, like the CPU) and convolution state. */
+/* 0 if the model or the GPU does not allow it; info says why, or what was set up */
+int  vk_dense_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *info, int infolen);
+/* n (<= n_batch) tokens at positions pos0.. : x their embeddings [n][dim]; rope_cs / rope_swa
+ * cos[hd/2] | sin[hd/2] per position [n][hd] (rope_swa NULL: none). logits (NULL: not needed)
+ * receives the n_vocab floats of the last token. Returns 0 if the GPU failed. */
+int  vk_dense_forward(Vulkan *v, const float *x, int n, const float *rope_cs, const float *rope_swa, int pos0,
+                      float *logits);
+/* copy KV rows [r0, r1) / the convolution state between the host arrays and the GPU copy */
+void vk_dense_kv(Vulkan *v, uint16_t *kc, uint16_t *vc, int r0, int r1, int to_gpu);
+void vk_dense_conv(Vulkan *v, float *conv, int to_gpu);
+
 #endif

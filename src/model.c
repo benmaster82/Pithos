@@ -224,6 +224,7 @@ struct Context {
     int dx_chunks;              /* prompt chunks too */
     Vulkan *vk;                 /* optional Vulkan GPU for matmuls (instead of dx) */
     int vk_min;                 /* tokens per batch from which matmuls go to vk */
+    int vk_dense, vk_chunks;    /* as dx_dense / dx_chunks, on vk */
     float *rope;                /* [2][n_batch][head_dim] RoPE tables of a chunk's positions */
     /* dense decode path: single tokens run on the GPU, which keeps its own copy of the KV cache
      * and of the convolution state. Rows [0, kv_cpu_n) / [0, kv_gpu_n) are valid on each side. */
@@ -351,23 +352,32 @@ int ctx_set_dx(Context *c, struct Dx *d, char *info, int infolen) {
     return c->dx_dense;
 }
 
-void ctx_set_vk(Context *c, struct Vulkan *v) {
+int ctx_set_vk(Context *c, struct Vulkan *v, char *info, int infolen) {
     c->vk = v;
-    const char *env = getenv("PITHOS_VK_MIN");
+    const char *env = getenv("PITHOS_VK_MIN"), *dense = getenv("PITHOS_VK_DENSE"), *chunks = getenv("PITHOS_VK_CHUNKS");
     c->vk_min = env && atoi(env) > 0 ? atoi(env) : DX_MIN_TOKENS;
+    info[0] = 0;
+    c->vk_dense = v && !c->gpu_dense && !c->dx_dense && !(dense && dense[0] == '0') &&
+                  vk_dense_init(v, c->m, c->n_ctx, c->n_batch, info, infolen);
+    c->vk_chunks = c->vk_dense && !(chunks && chunks[0] == '0');   /* =0: prompts through the matmuls only */
+    c->kv_gpu_n = 0;
+    c->conv_gpu_ok = 0;
+    return c->vk_dense;
 }
 
 /* make the host copy of the state current (before CPU work or a snapshot) */
 static void sync_to_cpu(Context *c, int kv_rows) {
-    if (!c->gpu_dense && !c->dx_dense) return;
+    if (!c->gpu_dense && !c->dx_dense && !c->vk_dense) return;
     if (c->kv_cpu_n < kv_rows) {
         if (c->gpu_dense) gpu_dense_kv(c->gpu, c->kc, c->vc, c->kv_cpu_n, kv_rows, 0);
-        else dx_dense_kv(c->dx, c->kc, c->vc, c->kv_cpu_n, kv_rows, 0);
+        else if (c->dx_dense) dx_dense_kv(c->dx, c->kc, c->vc, c->kv_cpu_n, kv_rows, 0);
+        else vk_dense_kv(c->vk, c->kc, c->vc, c->kv_cpu_n, kv_rows, 0);
         c->kv_cpu_n = kv_rows;
     }
     if (!c->conv_cpu_ok) {
         if (c->gpu_dense) gpu_dense_conv(c->gpu, c->conv, 0);
-        else dx_dense_conv(c->dx, c->conv, 0);
+        else if (c->dx_dense) dx_dense_conv(c->dx, c->conv, 0);
+        else vk_dense_conv(c->vk, c->conv, 0);
         c->conv_cpu_ok = 1;
     }
 }
@@ -991,6 +1001,35 @@ static void forward_dx(Context *c, const int *tokens, int n, float *logits) {
     c->conv_cpu_ok = 0;
 }
 
+/* the same on the Vulkan GPU */
+static void forward_vk(Context *c, const int *tokens, int n, float *logits) {
+    const Model *m = c->m;
+    const int D = m->dim, hd = m->head_dim, pos0 = c->pos;
+    if (c->kv_gpu_n < pos0) {
+        vk_dense_kv(c->vk, c->kc, c->vc, c->kv_gpu_n, pos0, 1);
+        c->kv_gpu_n = pos0;
+    }
+    if (!c->conv_gpu_ok) {
+        vk_dense_conv(c->vk, c->conv, 1);
+        c->conv_gpu_ok = 1;
+    }
+    float *rope = c->rope, *rope_swa = c->rope + (size_t)n * hd;
+    for (int t = 0; t < n; t++) {
+        int id = tokens[t];
+        if (id < 0 || id >= m->n_vocab) id = 0;
+        dequant_row(m->embed.type, m->embed.data + (size_t)id * m->embed.row_bytes, c->x + (size_t)t * D, D);
+        rope_tables(c, pos0 + t, rope + (size_t)t * hd, rope_swa + (size_t)t * hd);
+    }
+    if (!vk_dense_forward(c->vk, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL))
+        memset(c->logits, 0, sizeof(float) * (size_t)m->n_vocab);   /* the GPU failed: the message says so */
+    if (logits && logits != c->logits) memcpy(logits, c->logits, sizeof(float) * (size_t)m->n_vocab);
+    c->pos += n;
+    c->tok_counter += (uint32_t)n;
+    c->kv_gpu_n = c->pos;
+    if (c->kv_cpu_n > pos0) c->kv_cpu_n = pos0;
+    c->conv_cpu_ok = 0;
+}
+
 static void forward_token_gpu(Context *c, int token, float *all_logits) {
     const Model *m = c->m;
     const int D = m->dim, K = m->n_expert_used, pos = c->pos;
@@ -1068,6 +1107,14 @@ static void forward_chunk(Context *c, const int *tokens, int n, int want_logits,
     }
     if (c->dx_dense && c->dx_chunks && !all_logits) {   /* logits of every token: the path below */
         forward_dx(c, tokens, n, want_logits ? c->logits : NULL);
+        return;
+    }
+    if (c->vk_dense && n == 1) {
+        forward_vk(c, tokens, 1, all_logits ? all_logits : c->logits);
+        return;
+    }
+    if (c->vk_dense && c->vk_chunks && !all_logits) {
+        forward_vk(c, tokens, n, want_logits ? c->logits : NULL);
         return;
     }
     const int pos0 = c->pos;

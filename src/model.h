@@ -84,8 +84,8 @@ struct Dx;
 /* info: whether single tokens run entirely on the GPU (returns 1), or why not */
 int      ctx_set_dx(Context *c, struct Dx *d, char *info, int infolen);
 struct Vulkan;
-/* quantized matmuls on the Vulkan GPU */
-void     ctx_set_vk(Context *c, struct Vulkan *v);
+/* matmuls on the Vulkan GPU; info: whether single tokens run entirely there (returns 1), or why not */
+int      ctx_set_vk(Context *c, struct Vulkan *v, char *info, int infolen);
 
 /* Snapshot / restore the recurrent state + position (KV entries beyond pos are ignored). */
 typedef struct { int pos; float *conv; } CtxSnapshot;

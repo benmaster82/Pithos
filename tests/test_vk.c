@@ -1,4 +1,5 @@
-/* test_vk.c - checks the Vulkan matmuls (Q4_K and Q6_K) against the CPU kernels and times them:
+/* test_vk.c - checks the Vulkan matmuls (Q4_K and Q6_K) and the whole forward pass against the
+ * CPU and times the matmuls:
  *   test_vk model.gguf [device]     (device: an index from the list it prints first) */
 #include <math.h>
 #include <stdio.h>
@@ -8,6 +9,7 @@
 #include "../src/model.h"
 #include "../src/platform.h"
 #include "../src/quant.h"
+#include "../src/tokenizer.h"
 
 static int check(Vulkan *v, const char *name, const Mat *w, int nt) {
     const int K = w->cols, nbk = K / QK_K;
@@ -87,6 +89,73 @@ static int check_batch(Vulkan *v, const Mat *a, const Mat *b, const Mat *c, int 
     return ok;
 }
 
+/* The whole forward pass against the CPU, as in test_dx: the same text read through a GPU
+ * context and a CPU-only one, mostly token by token with prompt chunks of several sizes in
+ * between (one longer than the batch, some below VK_MV_TOKENS), past the 256-token sliding
+ * window. It compares the probability of the actual next token and the top choice. */
+static const char *TEXT =
+    "The lighthouse keeper climbed the spiral stairs every evening at dusk, counting the steps as his father had "
+    "taught him. There were one hundred and twelve of them, worn smooth in the middle by a century of boots. At "
+    "the top he wiped the great lens with a soft cloth, trimmed the wick, and lit the lamp. Out on the water the "
+    "fishing boats were already turning for home, their engines a low hum beneath the cries of the gulls. He "
+    "liked this hour best: the sea grew dark before the sky did, and for a few minutes the horizon was a thin "
+    "silver line that seemed to hold the whole world together. Il guardiano del faro scendeva poi in cucina, "
+    "dove la moglie aveva preparato una zuppa di pesce con il pane del giorno prima. Parlavano del tempo, delle "
+    "reti da riparare e del figlio che studiava ingegneria in città e scriveva lettere lunghe e piene di disegni. "
+    "Nelle notti di tempesta il vento faceva vibrare i vetri e lui restava sveglio fino all'alba, controllando "
+    "che la luce non si spegnesse mai. In spring the keeper planted tomatoes in the sheltered corner behind the "
+    "tower, where the stone walls kept off the salt wind. In summer tourists came on the ferry and asked to see "
+    "the lamp; he showed them gladly, explaining how the lens bent the light into a beam that could be seen "
+    "twenty miles away. In autumn the storms returned, and in winter the island was quiet again, with only the "
+    "two of them, the radio, and the long white beam sweeping across the black water every ten seconds.";
+
+static int check_dense(Model *m, Vulkan *v) {
+    char err[256];
+    Tokenizer *tk = tok_load(&m->gguf, err, sizeof(err));
+    ThreadPool *pool = pool_create(4);
+    Context *g = ctx_create(m, pool, 1024, 64), *c = ctx_create(m, pool, 1024, 64);
+    if (!tk || !ctx_set_vk(g, v, err, sizeof(err))) {
+        printf("  whole forward pass not available: %s\n", tk ? err : "no tokenizer");
+        return 1;
+    }
+    static int toks[1024];
+    const int n = tok_encode(tk, TEXT, (int)strlen(TEXT), 0, toks, 1024);
+    double nll_g = 0, nll_c = 0;
+    int agree = 0, steps = 0;
+    for (int pos = 0; pos + 1 < n;) {
+        int k = pos == 0 ? 100 : pos % 80 == 0 ? 24 : pos % 80 == 40 ? 5 : 1;   /* prompt chunks */
+        if (pos + k >= n) k = 1;
+        const float *lg = ctx_forward(g, toks + pos, k), *lc = ctx_forward(c, toks + pos, k);
+        pos += k;
+        if (pos >= n) continue;
+        double mg = -1e30, mc = -1e30, sg = 0, sc = 0;
+        int ag = 0, ac = 0;
+        for (int i = 0; i < m->n_vocab; i++) {
+            if (lg[i] > mg) { mg = lg[i]; ag = i; }
+            if (lc[i] > mc) { mc = lc[i]; ac = i; }
+        }
+        for (int i = 0; i < m->n_vocab; i++) {
+            sg += exp(lg[i] - mg);
+            sc += exp(lc[i] - mc);
+        }
+        nll_g += mg + log(sg) - lg[toks[pos]];
+        nll_c += mc + log(sc) - lc[toks[pos]];
+        agree += ag == ac;
+        steps++;
+    }
+    nll_g /= steps;
+    nll_c /= steps;
+    /* Q8_K activations make any change of summation order flip some roundings (see test_dx) */
+    const int ok = fabs(nll_g - nll_c) < 0.02 * nll_c && agree >= steps * 85 / 100;
+    printf("  whole pass  %d tokens of text, %d predictions | top-1 agrees %d/%d | "
+           "mean NLL GPU %.4f CPU %.4f %s\n", n, steps, agree, steps, nll_g, nll_c, ok ? "ok" : "FAIL");
+    ctx_free(g);
+    ctx_free(c);
+    pool_destroy(pool);
+    tok_free(tk);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     Model m;
     char err[512];
@@ -129,6 +198,7 @@ int main(int argc, char **argv) {
         ok &= check_batch(v, qkv[0], qkv[1], qkv[2], 1);
         ok &= check_batch(v, qkv[0], qkv[1], qkv[2], 64);
     }
+    ok &= check_dense(&m, v);
     vk_destroy(v);
     printf("%s\n", ok ? "test_vk: OK" : "test_vk: FAILED");
     return ok ? 0 : 1;

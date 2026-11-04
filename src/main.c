@@ -756,7 +756,10 @@ static int real_main(int argc, char **argv) {
         char vinfo[512];
         vk = vk_create(&m, a.vk_device, vinfo, sizeof(vinfo));
         fprintf(stderr, "Vulkan: %s%s\n", vk ? "" : "not used, ", vinfo);
-        if (vk) ctx_set_vk(ctx, vk);
+        if (vk) {
+            int whole = ctx_set_vk(ctx, vk, vinfo, sizeof(vinfo));
+            if (vinfo[0]) fprintf(stderr, "        %s%s\n", whole ? "" : "matmuls only: ", vinfo);
+        }
     }
 
     Engine e;
