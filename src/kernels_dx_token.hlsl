@@ -15,7 +15,11 @@ ByteAddressBuffer IN : register(t1);     // per token: embeddings [n][dim] | rop
 cbuffer T : register(b0) { uint4 C0, C1, C2, C3; };
 
 #define NONE 0xffffffff  // absent weight; never used in an address (root views have no bounds checks)
-#define Q8_BYTES 292
+#ifndef Q8_BYTES
+#define Q8_BYTES 292                // Q8_K block: float d at Q8_D, 256 int8 at Q8_QS (see kernels_dx.hlsl)
+#define Q8_D 0
+#define Q8_QS 4
+#endif
 
 groupshared float gs[256];
 groupshared float2 g2[256];
@@ -66,8 +70,8 @@ void quant_block(uint li, float v, uint qo) {
     const float iscale = amax > 0 ? 127.0 / amax : 0;
     gq[li] = uint(clamp(int(round(v * iscale)), -127, 127)) & 255;
     GroupMemoryBarrierWithGroupSync();
-    if (li < 64) U.Store(qo + 4 + 4 * li, gq[4 * li] | (gq[4 * li + 1] << 8) | (gq[4 * li + 2] << 16) | (gq[4 * li + 3] << 24));
-    if (li == 0) stu(qo, amax > 0 ? 1.0 / iscale : 0);
+    if (li < 64) U.Store(qo + Q8_QS + 4 * li, gq[4 * li] | (gq[4 * li + 1] << 8) | (gq[4 * li + 2] << 16) | (gq[4 * li + 3] << 24));
+    if (li == 0) stu(qo + Q8_D, amax > 0 ? 1.0 / iscale : 0);
     GroupMemoryBarrierWithGroupSync();
 }
 

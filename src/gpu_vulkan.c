@@ -365,8 +365,12 @@ static VkInstance vk_instance(VkApi *vk) {
 
 /* ------------------------------------------------------------------ state */
 
-#define Q8_BYTES 292        /* sizeof(block_q8_K) */
-#define Q6K_GPU_BYTES 212   /* repacked q6_K block */
+/* GPU layouts, 16-byte aligned so that the shaders can read uint4 words (tools/vk_shaders.cmd
+ * passes the same numbers to kernels_dx.hlsl): Q8_K activations as int8 qs[256] then float d,
+ * padded to 272 bytes; q6_K as ql[128] qh[64] scales[16] then half d, padded to 224 bytes */
+#define Q8_BYTES 272
+#define Q8_GPU_D 256
+#define Q6K_GPU_BYTES 224
 #define STAGE_BYTES (64u << 20)
 #define VK_MV_TOKENS 12     /* fewer tokens: one matrix-vector product per token */
 #define CONST_SLOT 256      /* constants of one dispatch (16 uints, padded to the largest offset alignment) */
@@ -725,7 +729,7 @@ static const VMat *find_mat(const Vulkan *v, const uint8_t *w) {
     return NULL;
 }
 
-/* file layout -> GPU layout of rows [r0, r1) of a matrix (as gpu_d3d12.c) */
+/* file layout -> GPU layout of rows [r0, r1) of a matrix */
 static void pack_rows(const VMat *x, int r0, int r1, uint8_t *dst) {
     const uint8_t *src = x->host + (size_t)r0 * x->row_bytes;
     if (x->kernel != K_Q6_K) {
@@ -735,11 +739,11 @@ static void pack_rows(const VMat *x, int r0, int r1, uint8_t *dst) {
     const size_t nblk = (size_t)(r1 - r0) * (size_t)(x->K / QK_K);
     const block_q6_K *b = (const block_q6_K *)src;
     for (size_t i = 0; i < nblk; i++, dst += Q6K_GPU_BYTES) {
-        memcpy(dst, &b[i].d, 2);
-        dst[2] = dst[3] = 0;
-        memcpy(dst + 4, b[i].ql, 128);
-        memcpy(dst + 132, b[i].qh, 64);
-        memcpy(dst + 196, b[i].scales, 16);
+        memcpy(dst, b[i].ql, 128);
+        memcpy(dst + 128, b[i].qh, 64);
+        memcpy(dst + 192, b[i].scales, 16);
+        memset(dst + 208, 0, Q6K_GPU_BYTES - 208);
+        memcpy(dst + 208, &b[i].d, 2);
     }
 }
 
@@ -989,9 +993,15 @@ int vk_matmul(Vulkan *v, const VulkanJob *jobs, int n) {
         return 0;
     for (int i = 0; i < n; i++) {
         if (!fresh[i]) continue;
-        const size_t nbk = (size_t)(mat[i]->K / QK_K), row = nbk * Q8_BYTES;
-        for (int t = 0; t < jobs[i].nt; t++)
-            memcpy(v->up.map + xoff[i] + (size_t)t * row, jobs[i].xq + (size_t)t * (size_t)jobs[i].xstride, row);
+        const size_t nbk = (size_t)(mat[i]->K / QK_K);
+        for (int t = 0; t < jobs[i].nt; t++) {
+            const block_q8_K *src = jobs[i].xq + (size_t)t * (size_t)jobs[i].xstride;
+            uint8_t *dst = v->up.map + xoff[i] + (size_t)t * nbk * Q8_BYTES;
+            for (size_t b = 0; b < nbk; b++, dst += Q8_BYTES) {   /* to the GPU layout */
+                memcpy(dst, src[b].qs, QK_K);
+                memcpy(dst + Q8_GPU_D, &src[b].d, 4);
+            }
+        }
     }
 
     copy(v, &v->x, 0, &v->up, 0, xbytes);

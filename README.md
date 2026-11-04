@@ -173,8 +173,8 @@ reference laptop (GTX 1650), against about 20 on the CPU alone. With OpenCL the 
 the CPU (45-75 tokens per second). On Windows, **`--no-gpu --d3d12`** runs everything on the GPU
 through Direct3D 12 instead, which is faster on both counts: about 330 tokens per second of prompt
 and 69 of generation on the same laptop. **`--no-gpu --vulkan`** does the same through Vulkan, on
-Windows and on Linux (experimental), at nearly the same speed. This is also the model that runs on
-the [Xbox One](#xbox-one).
+Windows and on Linux (experimental): the prompt at the same speed, generation faster (about 82
+tokens per second). This is also the model that runs on the [Xbox One](#xbox-one).
 
 | LFM3-1.7B on the reference laptop | Prompt | Generation |
 |---|---:|---:|
@@ -182,7 +182,7 @@ the [Xbox One](#xbox-one).
 | OpenCL (default) | 67–103 tok/s | 56 tok/s |
 | OpenCL, with prompt matmuls on Direct3D 12 (`--d3d12`) | 190 tok/s | 56 tok/s |
 | **Direct3D 12 only (`--no-gpu --d3d12`)** | **330 tok/s** | **69 tok/s** |
-| Vulkan only (`--no-gpu --vulkan`, experimental) | 330 tok/s | 67 tok/s |
+| Vulkan only (`--no-gpu --vulkan`, experimental) | 328 tok/s | 82 tok/s |
 
 ```
 build\pithos.exe -m models\LFM3-1.7B-Q4_K_M.gguf --no-gpu --d3d12 --server --open
@@ -879,6 +879,12 @@ for each of the 30 convolution layers.
   the same thing: on the same GPU their results are bit-identical. The D3D12 root signature becomes
   one descriptor set (UAVs at bindings 0-2, SRVs at 8-9, the constants at 16, from a ring of
   uniform buffer slots).
+- **Aligned layouts:** SPIR-V has no 16-byte load from a byte-address buffer, and the four 4-byte
+  loads it gets instead made the matrix-vector kernels 1.5-2.3 times slower on the Intel UHD. So
+  Vulkan stores the Q8_K activations (qs first, then d: 272 bytes) and the Q6_K blocks (224 bytes)
+  16-byte aligned, and those kernels read them through `uint4` views of the same buffers (the
+  `PITHOS_VK` branches in `kernels_dx.hlsl`; the Direct3D 12 bytecode does not change). Generation
+  got 2.4 times faster on the Intel UHD and 20% faster on the GTX 1650, now ahead of Direct3D 12.
 - **Runtime loading:** `vulkan-1.dll` / `libvulkan.so.1` is loaded at runtime, with its own minimal
   declarations (no Vulkan SDK). Each command buffer is submitted once per token or prompt chunk, as
   with Direct3D 12, and the CPU polls its fence for up to 50 ms: the driver's wait wakes up about

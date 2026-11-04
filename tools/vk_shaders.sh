@@ -7,7 +7,8 @@ set -e
 cd "$(dirname "$0")/.."
 DXC=${DXC:-dxc}
 command -v "$DXC" >/dev/null 2>&1 || { echo "[vk] dxc with SPIR-V support not found: set DXC"; exit 1; }
-OPT="-spirv -T cs_6_0 -O3 -fspv-target-env=vulkan1.1 -fvk-t-shift 8 0 -fvk-b-shift 16 0"
+# the defines select Vulkan's aligned block layouts (Q8_BYTES etc. in gpu_vulkan.c)
+OPT="-spirv -T cs_6_0 -O3 -fspv-target-env=vulkan1.1 -fvk-t-shift 8 0 -fvk-b-shift 16 0 -D PITHOS_VK -D Q8_BYTES=272 -D Q8_D=256 -D Q8_QS=0 -D Q6K_BYTES=224 -D Q6_D=208 -D Q6_QL=0 -D Q6_QH=128 -D Q6_SC=192"
 OUT=src/kernels_vk.h
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

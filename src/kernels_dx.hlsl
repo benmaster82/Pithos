@@ -10,7 +10,12 @@
 //       row split it into 64-value pieces, take integer dot products like the CPU kernels,
 //       and add up their sums in group-shared memory.
 //
-// Regenerate kernels_dx.h after editing:  tools\dx_shaders.cmd
+// Regenerate kernels_dx.h after editing:  tools\dx_shaders.cmd  (and kernels_vk.h: tools\vk_shaders.cmd)
+//
+// Vulkan (PITHOS_VK) compiles the same code with its own, 16-byte aligned GPU layouts of the Q8_K
+// and Q6_K blocks (the defines below), and the matrix-vector kernels read them through uint4
+// views of the same buffers: SPIR-V has no 16-byte load from a byte-address buffer, and the four
+// 4-byte loads it gets instead are much slower on some GPUs (Intel).
 
 ByteAddressBuffer W : register(t0);     // weight rows, wrow bytes apart
 RWByteAddressBuffer X : register(u1);   // Q8_K activation rows, xrow bytes apart (the decode pass's scratch)
@@ -20,9 +25,24 @@ cbuffer P : register(b0) {
     uint rows, nb, nt, wrow, xrow, orow;    // nb: 256-element blocks per row
 };
 
-#define Q8_BYTES 292
+#ifndef Q8_BYTES
+#define Q8_BYTES 292                // Q8_K block: float d at Q8_D, 256 int8 at Q8_QS
+#define Q8_D 0
+#define Q8_QS 4
+#endif
 #define Q4K_BYTES 144
-#define Q6K_BYTES 212
+#ifndef Q6K_BYTES
+#define Q6K_BYTES 212               // Q6_K block: half d at Q6_D, ql[128], qh[64], int8 scales[16]
+#define Q6_D 0
+#define Q6_QL 4
+#define Q6_QH 132
+#define Q6_SC 196
+#endif
+
+#ifdef PITHOS_VK
+[[vk::binding(8, 0)]] StructuredBuffer<uint4> W4 : register(t4);     // W and X as 16-byte words
+[[vk::binding(1, 0)]] RWStructuredBuffer<uint4> X4 : register(u4);
+#endif
 
 groupshared float4 Ws[32 * 16];     // [k][row / 4]
 groupshared float4 Xs[32 * 16];     // [k][token / 4]
@@ -40,8 +60,8 @@ int sbyte(uint2 q, uint i) {    // signed byte i (0..7) of 8 packed bytes
 // x: 8 values of sub-block j for this thread's token
 void load_x(uint xbase, uint b, uint j, uint part, uint slot) {
     const uint xb = xbase + b * Q8_BYTES;
-    const float xd = asfloat(X.Load(xb));
-    const uint2 q = X.Load2(xb + 4 + j * 32 + part * 8);
+    const float xd = asfloat(X.Load(xb + Q8_D));
+    const uint2 q = X.Load2(xb + Q8_QS + j * 32 + part * 8);
     [unroll] for (uint i = 0; i < 8; i++) Xs[(part * 8 + i) * 16 + (slot >> 2)][slot & 3] = xd * sbyte(q, i);
 }
 
@@ -111,7 +131,7 @@ void mm_q4_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     store(r0, t0, tr, tt, a0, a1, a2, a3);
 }
 
-// repacked q6_K block: half d (+2 bytes padding), ql[128], qh[64], int8 scales[16]
+// repacked q6_K block (Q6_* offsets): half d (+2 bytes padding), ql[128], qh[64], int8 scales[16]
 [numthreads(256, 1, 1)]
 void mm_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     const uint r0 = gid.x * 64, t0 = gid.y * 64;
@@ -121,14 +141,14 @@ void mm_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     float4 a0 = 0, a1 = 0, a2 = 0, a3 = 0;
     for (uint b = 0; b < nb; b++) {
         const uint wb = wbase + b * Q6K_BYTES;
-        const float d = f16tof32(W.Load(wb));
+        const float d = f16tof32(W.Load(wb + Q6_D));
         for (uint j = 0; j < 8; j++) {
             // sub-block j: half h = j / 4 of 128 values, quarter q = j % 4 of 32 values
             const uint h = j >> 2, q = j & 3;
-            const uint2 ql = W.Load2(wb + 4 + h * 64 + (q & 1) * 32 + part * 8);
-            const uint2 qh = W.Load2(wb + 132 + h * 32 + part * 8);
+            const uint2 ql = W.Load2(wb + Q6_QL + h * 64 + (q & 1) * 32 + part * 8);
+            const uint2 qh = W.Load2(wb + Q6_QH + h * 32 + part * 8);
             const uint si = h * 8 + q * 2 + (part >> 1);
-            const int s = int(W.Load(wb + 196 + (si & ~3u)) << (24 - 8 * (si & 3))) >> 24;
+            const int s = int(W.Load(wb + Q6_SC + (si & ~3u)) << (24 - 8 * (si & 3))) >> 24;
             const float ds = d * s;
             const uint lshift = (q >> 1) * 4, hshift = q * 2;
             [unroll] for (uint i = 0; i < 8; i++) {
@@ -182,12 +202,22 @@ void mv_q4_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
         for (uint p = li & 31; p < nb * 4; p += 32) {
             const uint b = p >> 2, pp = p & 3;
             const uint wb = wbase + b * Q4K_BYTES, xb = xbase + b * Q8_BYTES;
+#ifdef PITHOS_VK
+            const uint4 hd = W4[wb >> 4];
+            const uint dd = hd.x;
+            const uint4 sm = scales_pair(hd.yzw, pp);
+            const uint wq = (wb >> 4) + 1 + pp * 2, xq = (xb + Q8_QS) / 16 + pp * 4;
+            const uint4 q[2] = { W4[wq], W4[wq + 1] };
+            const uint4 xl[2] = { X4[xq], X4[xq + 1] };
+            const uint4 xh[2] = { X4[xq + 2], X4[xq + 3] };
+#else
             const uint dd = W.Load(wb);
             const uint3 sc = W.Load3(wb + 4);
             const uint4 sm = scales_pair(sc, pp);
             const uint4 q[2] = { W.Load4(wb + 16 + pp * 32), W.Load4(wb + 32 + pp * 32) };
             const uint4 xl[2] = { X.Load4(xb + 4 + pp * 64), X.Load4(xb + 20 + pp * 64) };
             const uint4 xh[2] = { X.Load4(xb + 36 + pp * 64), X.Load4(xb + 52 + pp * 64) };
+#endif
             int d1 = 0, n1 = 0, d2 = 0, n2 = 0;
             [unroll] for (uint i = 0; i < 8; i++) {
                 const uint w = q[i >> 2][i & 3], a = xl[i >> 2][i & 3], c = xh[i >> 2][i & 3];
@@ -199,7 +229,7 @@ void mv_q4_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
                     n2 += vc;
                 }
             }
-            sum += asfloat(X.Load(xb)) * (f16tof32(dd) * float(int(sm.x) * d1 + int(sm.y) * d2) -
+            sum += asfloat(X.Load(xb + Q8_D)) * (f16tof32(dd) * float(int(sm.x) * d1 + int(sm.y) * d2) -
                                           f16tof32(dd >> 16) * float(int(sm.z) * n1 + int(sm.w) * n2));
         }
     }
@@ -218,11 +248,22 @@ void mv_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
             const uint b = p >> 2, h = (p & 3) >> 1, a = p & 1;
             const uint wb = wbase + b * Q6K_BYTES, xb = xbase + b * Q8_BYTES;
             const uint j1 = h * 4 + a, j2 = j1 + 2;
+#ifdef PITHOS_VK
+            const uint wl = (wb + Q6_QL + h * 64 + a * 32) / 16, wh = (wb + Q6_QH + h * 32) / 16;
+            const uint x1q = (xb + Q8_QS + j1 * 32) / 16, x2q = (xb + Q8_QS + j2 * 32) / 16;
+            const uint4 ql[2] = { W4[wl], W4[wl + 1] };
+            const uint4 qh[2] = { W4[wh], W4[wh + 1] };
+            const uint4 x1[2] = { X4[x1q], X4[x1q + 1] };
+            const uint4 x2[2] = { X4[x2q], X4[x2q + 1] };
+            const uint4 sc = W4[(wb + Q6_SC) / 16];
+            const uint sl = h ? sc.z : sc.x, sh = h ? sc.w : sc.y;
+#else
             const uint4 ql[2] = { W.Load4(wb + 4 + h * 64 + a * 32), W.Load4(wb + 20 + h * 64 + a * 32) };
             const uint4 qh[2] = { W.Load4(wb + 132 + h * 32), W.Load4(wb + 148 + h * 32) };
             const uint4 x1[2] = { X.Load4(xb + 4 + j1 * 32), X.Load4(xb + 20 + j1 * 32) };
             const uint4 x2[2] = { X.Load4(xb + 4 + j2 * 32), X.Load4(xb + 20 + j2 * 32) };
             const uint sl = W.Load(wb + 196 + h * 8), sh = W.Load(wb + 200 + h * 8);
+#endif
             const uint hs1 = a * 2, hs2 = a * 2 + 4;
             int d1[2] = { 0, 0 }, d2[2] = { 0, 0 };
             [unroll] for (uint i = 0; i < 8; i++) {
@@ -236,7 +277,7 @@ void mv_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
             }
             const int dot = sx(sl, a * 2) * d1[0] + sx(sl, a * 2 + 1) * d1[1] + sx(sh, a * 2) * d2[0] +
                             sx(sh, a * 2 + 1) * d2[1];
-            sum += asfloat(X.Load(xb)) * f16tof32(W.Load(wb)) * float(dot);
+            sum += asfloat(X.Load(xb + Q8_D)) * f16tof32(W.Load(wb + Q6_D)) * float(dot);
         }
     }
     reduce_store(li, r, t, sum);
