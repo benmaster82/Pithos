@@ -10,7 +10,7 @@
   <meta property="og:type" content="website">
   <meta property="og:locale" content="en_US">
   <meta property="og:title" content="Pithos — C11 inference engine for local AI.">
-  <meta property="og:description" content="C11. Direct GGUF execution. SIMD CPU kernels and optional OpenCL acceleration. One engine, multiple interfaces.">
+  <meta property="og:description" content="C11. Direct GGUF execution. SIMD CPU kernels and optional GPU acceleration (OpenCL, Direct3D 12, Vulkan). One engine, multiple interfaces.">
   <meta property="og:url" content="https://benmaster82.github.io/Pithos/">
   <meta property="og:image" content="https://benmaster82.github.io/Pithos/assets/pandora-dark.png">
   <meta property="og:image:alt" content="Pandora, the Pithos web chat, with an agent running shell commands.">
@@ -61,7 +61,7 @@
       <div class="hero-copy">
         <div class="eyebrow"><span class="status-dot"></span> C11 INFERENCE ENGINE / LFM2 · LFM2.5 · LFM3</div>
         <h1 id="hero-title">The engine.<br><em>For local AI.</em></h1>
-        <p class="hero-description">Pithos runs Liquid AI's LFM2, LFM2.5 and LFM3 GGUF models locally. Written in C11, with SIMD CPU kernels and optional OpenCL acceleration. Chat, tools, and APIs share the same engine.</p>
+        <p class="hero-description">Pithos runs Liquid AI's LFM2, LFM2.5 and LFM3 GGUF models locally. Written in C11, with SIMD CPU kernels and optional GPU acceleration through OpenCL, Direct3D 12 or Vulkan. Chat, tools, and APIs share the same engine.</p>
         <div class="hero-actions"><a class="button button-dark" href="#get-started">Get started <svg aria-hidden="true" class="icon"><use href="#i-arrow"/></svg></a><a class="text-link" href="#architecture">See the architecture <span>↗</span></a></div>
         <p class="hero-note"><svg aria-hidden="true" class="icon"><use href="#i-check"/></svg> Open source <span>·</span> Windows, Linux and Xbox One <span>·</span> No GPU required</p>
       </div>
@@ -86,7 +86,7 @@
         </div>
       </div>
     </section>
-    <div class="fact-strip wrap" aria-label="Pithos at a glance"><div><strong>Written in C11.</strong><span>Standard OS APIs. No external ML runtime.</span></div><div><strong>GGUF, directly.</strong><span>Memory-mapped weights. Quantized compute.</span></div><div><strong>CPU-first execution.</strong><span>SIMD kernels. Optional OpenCL acceleration.</span></div></div>
+    <div class="fact-strip wrap" aria-label="Pithos at a glance"><div><strong>Written in C11.</strong><span>Standard OS APIs. No external ML runtime.</span></div><div><strong>GGUF, directly.</strong><span>Memory-mapped weights. Quantized compute.</span></div><div><strong>CPU-first execution.</strong><span>SIMD kernels. Optional OpenCL, Direct3D 12 or Vulkan acceleration.</span></div></div>
 
     <section class="setup-section section-space" id="get-started" aria-labelledby="setup-title"><div class="wrap setup-layout">
       <div class="setup-intro"><span class="eyebrow light">05 — BUILD AND RUN</span><h2 id="setup-title">Build and run Pithos</h2><p>You do not need to be a developer. Set aside some disk space and download time, open the right terminal, and follow one step at a time.</p><div class="requirements"><h3>Before you begin</h3><div><svg aria-hidden="true" class="icon"><use href="#i-computer"/></svg><p><strong>A 64-bit computer</strong><span>Native Windows and Linux guides. WSL2 is an optional Windows alternative.</span></p></div><div><span class="requirement-number" id="req-ram">16<span>GB</span></span><p><strong>RAM as a reference</strong><span>Not a guaranteed minimum. With WSL, also check how much memory Ubuntu receives.</span></p></div><div><svg aria-hidden="true" class="icon"><use href="#i-download"/></svg><p><strong id="req-disk">At least 15 GB free for the model</strong><span id="req-disk-detail">About 14.5 GB to download. Allow extra room for the compiler and, if used, Ubuntu.</span></p></div></div><div class="setup-reassurance"><svg aria-hidden="true" class="icon"><use href="#i-check"/></svg><span>Start with your CPU.<br>A dedicated graphics card is optional.</span></div><p class="model-choice-note">Model: <strong id="guide-model-name">LFM2.5-24B-A2B</strong> · <a href="#main">change it at the top of the page</a></p></div>
