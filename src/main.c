@@ -7,6 +7,7 @@
 #include "agent.h"
 #include "gpu.h"
 #include "gpu_dx.h"
+#include "gpu_vk.h"
 #include "model.h"
 #include "pcache.h"
 #include "platform.h"
@@ -35,7 +36,7 @@ typedef struct {
     int agent, agent_auto, yolo, max_steps, agent_think;
     int threads, n_ctx, n_batch, n_predict;
     int interactive, raw, bench, show_think, keep_think, prefetch, mlock, stats, verbose, ids;
-    int gpu, gpu_device, gpu_mem, gpu_dense, d3d12;
+    int gpu, gpu_device, gpu_mem, gpu_dense, d3d12, vulkan, vk_device;
     int bench_pp, bench_tg;
     int think_budget;           /* THINK_FULL / THINK_OFF / reasoning tokens (--reasoning) */
     SamplerParams sp;
@@ -195,8 +196,10 @@ static void usage(void) {
         "      --gpu-device N      use OpenCL device N (see --list-gpus; integrated GPUs too)\n"
         "      --gpu-mem MB        VRAM budget (default: VRAM - 900 MB)\n"
         "      --no-gpu-dense      keep attention/convolution/output on the CPU (GPU only for experts)\n"
-        "      --list-gpus         list OpenCL devices and exit\n"
+        "      --list-gpus         list OpenCL and Vulkan devices and exit\n"
         "      --d3d12             run on a Direct3D 12 GPU (Windows; Xbox in Game mode)\n"
+        "      --vulkan            run the matmuls on a Vulkan GPU (Windows, Linux; experimental)\n"
+        "      --vulkan-device N   use Vulkan device N (see --list-gpus; implies --vulkan)\n"
         "      --kernels K         force kernels: auto | scalar | avx (no AVX2)\n"
         "      --bench [PP,TG]     benchmark prompt processing and generation (default 128,64)\n"
         "      --tokenize TEXT     print token ids for TEXT and exit\n"
@@ -250,6 +253,7 @@ static int parse_args(int argc, char **argv, Args *a) {
     a->gpu = 1;
     a->gpu_dense = 1;
     a->gpu_device = -1;
+    a->vk_device = -1;
     a->show_think = 1;
     a->bench_pp = 128;
     a->bench_tg = 64;
@@ -308,8 +312,16 @@ static int parse_args(int argc, char **argv, Args *a) {
         else if (!strcmp(s, "--no-gpu-dense")) a->gpu_dense = 0;
         else if (!strcmp(s, "--gpu-device")) a->gpu_device = atoi(NEXT());
         else if (!strcmp(s, "--gpu-mem")) a->gpu_mem = atoi(NEXT());
-        else if (!strcmp(s, "--list-gpus")) { gpu_list_devices(); exit(0); }
+        else if (!strcmp(s, "--list-gpus")) {
+            printf("OpenCL (--gpu-device N):\n");
+            gpu_list_devices();
+            printf("Vulkan (--vulkan-device N):\n");
+            vk_list_devices();
+            exit(0);
+        }
         else if (!strcmp(s, "--d3d12")) a->d3d12 = 1;
+        else if (!strcmp(s, "--vulkan")) a->vulkan = 1;
+        else if (!strcmp(s, "--vulkan-device")) { a->vulkan = 1; a->vk_device = atoi(NEXT()); }
         else if (!strcmp(s, "--mlock")) a->mlock = 1;
         else if (!strcmp(s, "--kernels")) a->kernels = NEXT();
         else if (!strcmp(s, "--tokenize")) a->tokenize = NEXT();
@@ -737,6 +749,15 @@ static int real_main(int argc, char **argv) {
             if (dinfo[0]) fprintf(stderr, "             %s%s\n", whole ? "" : "matmuls only: ", dinfo);
         }
     }
+    Vulkan *vk = NULL;
+    if (a.vulkan && dx) {
+        fprintf(stderr, "Vulkan: not used, Direct3D 12 already runs the matmuls (choose one)\n");
+    } else if (a.vulkan) {
+        char vinfo[512];
+        vk = vk_create(&m, a.vk_device, vinfo, sizeof(vinfo));
+        fprintf(stderr, "Vulkan: %s%s\n", vk ? "" : "not used, ", vinfo);
+        if (vk) ctx_set_vk(ctx, vk);
+    }
 
     Engine e;
     memset(&e, 0, sizeof(e));
@@ -958,6 +979,7 @@ static int real_main(int argc, char **argv) {
     ctx_free(ctx);
     gpu_destroy(gpu);
     dx_destroy(dx);
+    vk_destroy(vk);
     pool_destroy(pool);
     tok_free(tk);
     model_free(&m);

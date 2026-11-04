@@ -15,6 +15,7 @@
 #include "model.h"
 #include "gpu.h"
 #include "gpu_dx.h"
+#include "gpu_vk.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -221,6 +222,8 @@ struct Context {
     int dx_min;                 /* tokens per batch from which matmuls go to dx */
     int dx_dense;               /* single tokens entirely on dx (same KV / conv bookkeeping as gpu_dense) */
     int dx_chunks;              /* prompt chunks too */
+    Vulkan *vk;                 /* optional Vulkan GPU for matmuls (instead of dx) */
+    int vk_min;                 /* tokens per batch from which matmuls go to vk */
     float *rope;                /* [2][n_batch][head_dim] RoPE tables of a chunk's positions */
     /* dense decode path: single tokens run on the GPU, which keeps its own copy of the KV cache
      * and of the convolution state. Rows [0, kv_cpu_n) / [0, kv_gpu_n) are valid on each side. */
@@ -346,6 +349,12 @@ int ctx_set_dx(Context *c, struct Dx *d, char *info, int infolen) {
     c->kv_gpu_n = 0;
     c->conv_gpu_ok = 0;
     return c->dx_dense;
+}
+
+void ctx_set_vk(Context *c, struct Vulkan *v) {
+    c->vk = v;
+    const char *env = getenv("PITHOS_VK_MIN");
+    c->vk_min = env && atoi(env) > 0 ? atoi(env) : DX_MIN_TOKENS;
 }
 
 /* make the host copy of the state current (before CPU work or a snapshot) */
@@ -514,6 +523,19 @@ static int dx_run(Context *c) {
     return dx_matmul(c->dx, dj, c->njobs);
 }
 
+/* the same on the Vulkan GPU */
+static int vk_run(Context *c) {
+    VulkanJob vj[16];
+    if (!c->vk || c->njobs > 16) return 0;
+    for (int ji = 0; ji < c->njobs; ji++) {
+        const MatJob *j = &c->jobs[ji];
+        if (!j->xq || j->nt < c->vk_min || !vk_has(c->vk, j->w)) return 0;
+        VulkanJob v = {j->w, j->xq, j->xstride, j->nt, j->out, j->ostride};
+        vj[ji] = v;
+    }
+    return vk_matmul(c->vk, vj, c->njobs);
+}
+
 /* split the jobs into row ranges for the thread pool */
 static void cpu_run(Context *c) {
     int nt = 0;
@@ -537,7 +559,7 @@ static void cpu_run(Context *c) {
 
 static void job_run(Context *c, int cat) {
     double t0 = time_sec();
-    if (!dx_run(c)) cpu_run(c);
+    if (!dx_run(c) && !vk_run(c)) cpu_run(c);
     const double dt = time_sec() - t0;
     c->stats.t_matmul += dt;
     c->stats.t_cat[cat] += dt;

@@ -7,7 +7,7 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0"
 if not exist build mkdir build
 
-set SRC=src\main.c src\model.c src\gguf.c src\tokenizer.c src\sampler.c src\quant.c src\platform.c src\quant_neon.c src\gpu_opencl.c src\gpu_d3d12.c src\json.c src\pcache.c src\server.c src\proc.c src\tools.c src\agent.c
+set SRC=src\main.c src\model.c src\gguf.c src\tokenizer.c src\sampler.c src\quant.c src\platform.c src\quant_neon.c src\gpu_opencl.c src\gpu_d3d12.c src\gpu_vulkan.c src\json.c src\pcache.c src\server.c src\proc.c src\tools.c src\agent.c
 set WANT=
 set TEST=
 for %%a in (%*) do (
@@ -35,8 +35,8 @@ gcc %CFLAGS% -mavx -mf16c -c src\quant_avx.c -o build\quant_avx.o || goto fail
 gcc %CFLAGS% -municode %SRC% build\quant_avx2.o build\quant_avx.o -o build\pithos.exe -lm -lws2_32 || goto fail
 if defined TEST (
     gcc %CFLAGS% tests\test_kernels.c src\gguf.c src\quant.c src\platform.c build\quant_avx2.o build\quant_avx.o -o build\test_kernels.exe -lm || goto fail
-    gcc %CFLAGS% tests\test_gpu.c src\model.c src\gguf.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c build\quant_avx2.o build\quant_avx.o -o build\test_gpu.exe -lm || goto fail
-    gcc %CFLAGS% tests\test_dx.c src\model.c src\gguf.c src\tokenizer.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c build\quant_avx2.o build\quant_avx.o -o build\test_dx.exe -lm || goto fail
+    gcc %CFLAGS% tests\test_gpu.c src\model.c src\gguf.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c src\gpu_vulkan.c build\quant_avx2.o build\quant_avx.o -o build\test_gpu.exe -lm || goto fail
+    gcc %CFLAGS% tests\test_dx.c src\model.c src\gguf.c src\tokenizer.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c src\gpu_vulkan.c build\quant_avx2.o build\quant_avx.o -o build\test_dx.exe -lm || goto fail
     gcc %CFLAGS% tests\test_vk.c src\gpu_vulkan.c src\model.c src\gguf.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c build\quant_avx2.o build\quant_avx.o -o build\test_vk.exe -lm || goto fail
     gcc %CFLAGS% tests\test_shell.c src\tools.c src\proc.c src\platform.c src\json.c -o build\test_shell.exe -lm || goto fail
 )
@@ -57,8 +57,8 @@ cl %CLFLAGS% /arch:AVX /c src\quant_avx.c /Fobuild\quant_avx.obj || goto fail
 cl %CLFLAGS% %SRC% build\quant_avx2.obj build\quant_avx.obj /Fobuild\ /Febuild\pithos.exe /link /LTCG || goto fail
 if defined TEST (
     cl %CLFLAGS% tests\test_kernels.c src\gguf.c src\quant.c src\platform.c build\quant_avx2.obj build\quant_avx.obj /Fobuild\ /Febuild\test_kernels.exe /link /LTCG || goto fail
-    cl %CLFLAGS% tests\test_gpu.c src\model.c src\gguf.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c build\quant_avx2.obj build\quant_avx.obj /Fobuild\ /Febuild\test_gpu.exe /link /LTCG || goto fail
-    cl %CLFLAGS% tests\test_dx.c src\model.c src\gguf.c src\tokenizer.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c build\quant_avx2.obj build\quant_avx.obj /Fobuild\ /Febuild\test_dx.exe /link /LTCG || goto fail
+    cl %CLFLAGS% tests\test_gpu.c src\model.c src\gguf.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c src\gpu_vulkan.c build\quant_avx2.obj build\quant_avx.obj /Fobuild\ /Febuild\test_gpu.exe /link /LTCG || goto fail
+    cl %CLFLAGS% tests\test_dx.c src\model.c src\gguf.c src\tokenizer.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c src\gpu_vulkan.c build\quant_avx2.obj build\quant_avx.obj /Fobuild\ /Febuild\test_dx.exe /link /LTCG || goto fail
     cl %CLFLAGS% tests\test_vk.c src\gpu_vulkan.c src\model.c src\gguf.c src\quant.c src\platform.c src\gpu_opencl.c src\gpu_d3d12.c build\quant_avx2.obj build\quant_avx.obj /Fobuild\ /Febuild\test_vk.exe /link /LTCG || goto fail
     cl %CLFLAGS% tests\test_shell.c src\tools.c src\proc.c src\platform.c src\json.c /Fobuild\ /Febuild\test_shell.exe /link /LTCG || goto fail
 )
