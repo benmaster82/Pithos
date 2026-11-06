@@ -939,12 +939,15 @@ for each of the 30 convolution layers.
   16-byte aligned, and those kernels read them through `uint4` views of the same buffers (the
   `PITHOS_VK` branches in `kernels_dx.hlsl`; the Direct3D 12 bytecode does not change). Generation
   got 2.4 times faster on the Intel UHD and 20% faster on the GTX 1650, now ahead of Direct3D 12.
-- **Intel decoding kernels:** on the Intel UHD the matrix-vector kernels are limited by its integer
-  units, not by memory (reading the same weights without the arithmetic runs twice as fast). Intel
-  GPUs get their own build of them: 8 lanes per row in groups of 128 threads instead of 32 in
+- **Intel kernels:** Intel GPUs get their own build of the four matmul kernels; other GPUs load the
+  same ones as before (`PITHOS_VK_INTEL=0` gives Intel those too). For decoding, the matrix-vector
+  kernels are limited by the UHD's integer units, not by memory (reading the same weights without
+  the arithmetic runs twice as fast): 8 lanes per row in groups of 128 threads instead of 32 in
   groups of 256, and for Q4_K two pairs of products per 32-bit multiply, with the activations made
-  unsigned so that the halves never carry. Generation 8.4 -> 10.1 tokens per second on the UHD;
-  other GPUs load the same kernels as before (`PITHOS_VK_INTEL_MV=0` gives Intel those too).
+  unsigned so that the halves never carry. For prompts, the tiled kernels were limited by reading
+  the weights from group-shared memory: each thread now computes 8 rows x 4 tokens instead of
+  4 x 4, so each read serves twice the products. LFM3 on the UHD: prompt 35 -> 53 tokens per
+  second, generation 8.4 -> 10 (the CPU: 85 / 21).
 - **Runtime loading:** `vulkan-1.dll` / `libvulkan.so.1` is loaded at runtime, with its own minimal
   declarations (no Vulkan SDK). Each command buffer is submitted once per token or prompt chunk, as
   with Direct3D 12, and the CPU polls its fence for up to 50 ms: the driver's wait wakes up about
@@ -998,7 +1001,7 @@ for each of the 30 convolution layers.
 | `PITHOS_DX_MIN=N` | Direct3D 12, matmuls-only path: batches of fewer than N tokens stay on the CPU (default 1) |
 | `PITHOS_DX_DEBUG=1` | enable the Direct3D 12 debug layer and print its messages |
 | `PITHOS_VK_DENSE=0`, `PITHOS_VK_CHUNKS=0`, `PITHOS_VK_MIN=N` | Vulkan: as the three `PITHOS_DX_*` above |
-| `PITHOS_VK_INTEL_MV=0` | Vulkan: on Intel GPUs, the common decoding kernels instead of the Intel build |
+| `PITHOS_VK_INTEL=0` | Vulkan: on Intel GPUs, the common matmul kernels instead of the Intel build |
 | `PITHOS_VK_SPIN=MS` | Vulkan: how long the CPU polls a submit before waiting in the driver (default 50) |
 | `PITHOS_VK_MAXBUF=MB` | Vulkan: a lower buffer size limit, to test the splitting of large matrices |
 | `PITHOS_VK_FAIL=N` | Vulkan: simulate a GPU failure at the Nth whole-pass submit, to test the fallback to the CPU |

@@ -17,9 +17,10 @@
 // views of the same buffers: SPIR-V has no 16-byte load from a byte-address buffer, and the four
 // 4-byte loads it gets instead are much slower on some GPUs (Intel).
 //
-// Intel GPUs get their own build of the mv_* kernels (tools\vk_shaders.cmd): 8 lanes per row in
-// groups of 128 threads (MV_LANES, MV_GROUP) and, for Q4_K, the products taken two pairs per
-// 32-bit multiply (MV_SWAR); their integer units, not the memory, set the decoding speed there.
+// Intel GPUs get their own build of the kernels (tools\vk_shaders.cmd): mv_* with 8 lanes per row
+// in groups of 128 threads (MV_LANES, MV_GROUP) and, for Q4_K, the products taken two pairs per
+// 32-bit multiply (MV_SWAR): their integer units, not the memory, set the decoding speed there;
+// mm_* with 8 x 4 outputs per thread (MM_INTEL, Vulkan only).
 
 ByteAddressBuffer W : register(t0);     // weight rows, wrow bytes apart
 RWByteAddressBuffer X : register(u1);   // Q8_K activation rows, xrow bytes apart (the decode pass's scratch)
@@ -97,6 +98,7 @@ void store(uint r0, uint t0, uint tr, uint tt, float4 a0, float4 a1, float4 a2, 
     store_token(r0, t + 3, tr, a3);
 }
 
+#ifndef MM_INTEL
 // q4_K block: half d, half dmin, 12 bytes of 6-bit scales and mins, 128 bytes of nibbles
 [numthreads(256, 1, 1)]
 void mm_q4_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
@@ -169,6 +171,100 @@ void mm_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     }
     store(r0, t0, tr, tt, a0, a1, a2, a3);
 }
+
+#else
+// Intel (Vulkan): the same 64 x 64 tiles with 128 threads of 8 rows x 4 tokens each, so that every
+// float4 of weights read from group-shared memory serves twice as many products (group-shared
+// reads, not arithmetic, limit the 4 x 4 version there); each thread loads 16 values per step.
+
+void store8(uint r0, uint t0, uint tr, uint tt, float4 a0, float4 a1, float4 a2, float4 a3,
+            float4 c0, float4 c1, float4 c2, float4 c3) {
+    store(r0, t0, tr, tt, a0, a1, a2, a3);
+    store(r0, t0, tr + 8, tt, c0, c1, c2, c3);
+}
+
+// 8 rows (tr*4 .. +4 and 32 + tr*4 .. +4) x 4 tokens (tt*4 .. +4) over the 32 values in group-shared memory
+void accumulate8(uint tr, uint tt, inout float4 a0, inout float4 a1, inout float4 a2, inout float4 a3,
+                 inout float4 c0, inout float4 c1, inout float4 c2, inout float4 c3) {
+    [unroll] for (uint k = 0; k < 32; k++) {
+        const float4 w0 = Ws[k * 16 + tr], w1 = Ws[k * 16 + 8 + tr], x = Xs[k * 16 + tt];
+        a0 += w0 * x.x; a1 += w0 * x.y; a2 += w0 * x.z; a3 += w0 * x.w;
+        c0 += w1 * x.x; c1 += w1 * x.y; c2 += w1 * x.z; c3 += w1 * x.w;
+    }
+}
+
+// x: values part*16 .. +16 of sub-block j for this thread's token
+void load_x16(uint xb, float xd, uint j, uint part, uint slot) {
+    const uint4 q = X4[(xb + Q8_QS) / 16 + j * 2 + part];
+    [unroll] for (uint i = 0; i < 16; i++)
+        Xs[(part * 16 + i) * 16 + (slot >> 2)][slot & 3] = xd * float(int(q[i >> 2] << (24 - 8 * (i & 3))) >> 24);
+}
+
+[numthreads(128, 1, 1)]
+void mm_q4_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint r0 = gid.x * 64, t0 = gid.y * 64;
+    const uint slot = li >> 1, part = li & 1;   // loading: row / token `slot`, values part*16 .. +16
+    const uint tr = li & 7, tt = li >> 3;       // computing: see accumulate8
+    const uint wbase = min(r0 + slot, rows - 1) * wrow, xbase = min(t0 + slot, nt - 1) * xrow;
+    float4 a0 = 0, a1 = 0, a2 = 0, a3 = 0, c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    for (uint b = 0; b < nb; b++) {
+        const uint wb = wbase + b * Q4K_BYTES, xb = xbase + b * Q8_BYTES;
+        const uint4 hd = W4[wb >> 4];
+        const float d = f16tof32(hd.x), dmin = f16tof32(hd.x >> 16), xd = asfloat(X.Load(xb + Q8_D));
+        for (uint j = 0; j < 8; j++) {
+            uint s, m;
+            if (j < 4) {
+                s = byte_of(hd.yzw, j) & 63;
+                m = byte_of(hd.yzw, j + 4) & 63;
+            } else {
+                s = (byte_of(hd.yzw, j + 4) & 15) | ((byte_of(hd.yzw, j - 4) >> 6) << 4);
+                m = (byte_of(hd.yzw, j + 4) >> 4) | ((byte_of(hd.yzw, j) >> 6) << 4);
+            }
+            const float ds = d * s, dm = dmin * m;
+            const uint4 q = W4[(wb >> 4) + 1 + (j >> 1) * 2 + part];
+            const uint shift = (j & 1) * 4;
+            [unroll] for (uint i = 0; i < 16; i++)
+                Ws[(part * 16 + i) * 16 + (slot >> 2)][slot & 3] = ds * ((q[i >> 2] >> ((i & 3) * 8 + shift)) & 15) - dm;
+            load_x16(xb, xd, j, part, slot);
+            GroupMemoryBarrierWithGroupSync();
+            accumulate8(tr, tt, a0, a1, a2, a3, c0, c1, c2, c3);
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+    store8(r0, t0, tr, tt, a0, a1, a2, a3, c0, c1, c2, c3);
+}
+
+[numthreads(128, 1, 1)]
+void mm_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint r0 = gid.x * 64, t0 = gid.y * 64;
+    const uint slot = li >> 1, part = li & 1;
+    const uint tr = li & 7, tt = li >> 3;
+    const uint wbase = min(r0 + slot, rows - 1) * wrow, xbase = min(t0 + slot, nt - 1) * xrow;
+    float4 a0 = 0, a1 = 0, a2 = 0, a3 = 0, c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    for (uint b = 0; b < nb; b++) {
+        const uint wb = wbase + b * Q6K_BYTES, xb = xbase + b * Q8_BYTES, w4 = wb / 16;
+        const float d = f16tof32(W.Load(wb + Q6_D)), xd = asfloat(X.Load(xb + Q8_D));
+        const uint4 scw = W4[w4 + Q6_SC / 16];
+        for (uint j = 0; j < 8; j++) {
+            // sub-block j: half h = j / 4 of 128 values, quarter q = j % 4 of 32; one scale per 16 values
+            const uint h = j >> 2, q = j & 3, si = h * 8 + q * 2 + part;
+            const uint4 ql = W4[w4 + (Q6_QL + h * 64 + (q & 1) * 32) / 16 + part];
+            const uint4 qh = W4[w4 + (Q6_QH + h * 32) / 16 + part];
+            const float ds = d * float(int(scw[si >> 2] << (24 - 8 * (si & 3))) >> 24);
+            const uint lshift = (q >> 1) * 4, hshift = q * 2;
+            [unroll] for (uint i = 0; i < 16; i++) {
+                const uint bl = (ql[i >> 2] >> ((i & 3) * 8)) & 255, bh = (qh[i >> 2] >> ((i & 3) * 8)) & 255;
+                Ws[(part * 16 + i) * 16 + (slot >> 2)][slot & 3] = ds * (int(((bl >> lshift) & 15) | (((bh >> hshift) & 3) << 4)) - 32);
+            }
+            load_x16(xb, xd, j, part, slot);
+            GroupMemoryBarrierWithGroupSync();
+            accumulate8(tr, tt, a0, a1, a2, a3, c0, c1, c2, c3);
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+    store8(r0, t0, tr, tt, a0, a1, a2, a3, c0, c1, c2, c3);
+}
+#endif
 
 // ---------------------------------------------------------------- matrix x few vectors
 

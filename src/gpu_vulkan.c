@@ -674,17 +674,18 @@ static int create_pipelines(Vulkan *v) {
         {g_vk_conv_chunk, sizeof(g_vk_conv_chunk), "conv_chunk"}, {g_vk_conv_state, sizeof(g_vk_conv_state), "conv_state"},
         {g_vk_attn_chunk, sizeof(g_vk_attn_chunk), "attn_chunk"},
     };
-    /* Intel: the decoding kernels built for its GPUs (kernels_dx.hlsl); PITHOS_VK_INTEL_MV=0: the common ones */
-    static const struct { const unsigned char *code; size_t size; } intel_mv[N_KERNELS] = {
+    /* Intel: the matmul kernels built for its GPUs (kernels_dx.hlsl); PITHOS_VK_INTEL=0: the common ones */
+    static const struct { const unsigned char *code; size_t size; } intel_k[2 * N_KERNELS] = {
+        {g_vk_mm_q4_K_intel, sizeof(g_vk_mm_q4_K_intel)}, {g_vk_mm_q6_K_intel, sizeof(g_vk_mm_q6_K_intel)},
         {g_vk_mv_q4_K_intel, sizeof(g_vk_mv_q4_K_intel)}, {g_vk_mv_q6_K_intel, sizeof(g_vk_mv_q6_K_intel)},
     };
-    const char *env = getenv("PITHOS_VK_INTEL_MV");
+    const char *env = getenv("PITHOS_VK_INTEL");
     const int intel = v->props.vendorID == 0x8086 && !(env && env[0] == '0');
     v->mv_rows = intel ? 16 : 8;
     for (int i = 0; i < 2 * N_KERNELS + N_TOKEN_KERNELS; i++) {
-        const int mv = i >= N_KERNELS && i < 2 * N_KERNELS;
-        const unsigned char *code = intel && mv ? intel_mv[i - N_KERNELS].code : k[i].code;
-        const size_t size = intel && mv ? intel_mv[i - N_KERNELS].size : k[i].size;
+        const int own = intel && i < 2 * N_KERNELS;
+        const unsigned char *code = own ? intel_k[i].code : k[i].code;
+        const size_t size = own ? intel_k[i].size : k[i].size;
         uint32_t *words = (uint32_t *)malloc(size);   /* the module wants 4-byte aligned code */
         memcpy(words, code, size);
         VkShaderModuleCreateInfo si = {ST_SHADER_MODULE_CREATE_INFO, NULL, 0, size, words};

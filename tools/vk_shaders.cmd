@@ -20,9 +20,9 @@ for %%e in (mm_q4_K mm_q6_K mv_q4_K mv_q6_K) do (
     type %TEMP%\pithos_vk_%%e.h >> %OUT%
     del %TEMP%\pithos_vk_%%e.h
 )
-rem the decoding kernels again for Intel GPUs (see kernels_dx.hlsl)
-for %%e in (mv_q4_K mv_q6_K) do (
-    "%DXC%" %OPT% -D MV_LANES=8 -D MV_LOG2=3 -D MV_GROUP=128 -D MV_SWAR -E %%e -Vn g_vk_%%e_intel -Fh %TEMP%\pithos_vk_%%e.h src\kernels_dx.hlsl >nul || goto fail
+rem the matmul kernels again for Intel GPUs (see kernels_dx.hlsl)
+for %%e in (mm_q4_K mm_q6_K mv_q4_K mv_q6_K) do (
+    "%DXC%" %OPT% -D MM_INTEL -D MV_LANES=8 -D MV_LOG2=3 -D MV_GROUP=128 -D MV_SWAR -E %%e -Vn g_vk_%%e_intel -Fh %TEMP%\pithos_vk_%%e.h src\kernels_dx.hlsl >nul || goto fail
     type %TEMP%\pithos_vk_%%e.h >> %OUT%
     del %TEMP%\pithos_vk_%%e.h
 )
