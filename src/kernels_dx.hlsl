@@ -16,6 +16,10 @@
 // and Q6_K blocks (the defines below), and the matrix-vector kernels read them through uint4
 // views of the same buffers: SPIR-V has no 16-byte load from a byte-address buffer, and the four
 // 4-byte loads it gets instead are much slower on some GPUs (Intel).
+//
+// Intel GPUs get their own build of the mv_* kernels (tools\vk_shaders.cmd): 8 lanes per row in
+// groups of 128 threads (MV_LANES, MV_GROUP) and, for Q4_K, the products taken two pairs per
+// 32-bit multiply (MV_SWAR); their integer units, not the memory, set the decoding speed there.
 
 ByteAddressBuffer W : register(t0);     // weight rows, wrow bytes apart
 RWByteAddressBuffer X : register(u1);   // Q8_K activation rows, xrow bytes apart (the decode pass's scratch)
@@ -168,19 +172,25 @@ void mm_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
 
 // ---------------------------------------------------------------- matrix x few vectors
 
-groupshared float red[256];
+#ifndef MV_LANES
+#define MV_LANES 32                 // lanes per row (a power of two)
+#define MV_LOG2 5
+#define MV_GROUP 256                // threads per group: MV_GROUP / MV_LANES rows
+#endif
+
+groupshared float red[MV_GROUP];
 
 int sx(uint w, uint k) { return int(w << (24 - 8 * k)) >> 24; }     // signed byte k of a word
 
-// sum of the 32 lanes of each row; lane 0 writes the result
+// sum of the MV_LANES lanes of each row; lane 0 writes the result
 void reduce_store(uint li, uint r, uint t, float sum) {
     red[li] = sum;
     GroupMemoryBarrierWithGroupSync();
-    [unroll] for (uint s = 16; s > 0; s >>= 1) {
-        if ((li & 31) < s) red[li] += red[li + s];
+    [unroll] for (uint s = MV_LANES / 2; s > 0; s >>= 1) {
+        if ((li & (MV_LANES - 1)) < s) red[li] += red[li + s];
         GroupMemoryBarrierWithGroupSync();
     }
-    if ((li & 31) == 0 && r < rows) O.Store((t * orow + r) * 4, asuint(red[li]));
+    if ((li & (MV_LANES - 1)) == 0 && r < rows) O.Store((t * orow + r) * 4, asuint(red[li]));
 }
 
 // scales and mins (s1, s2, m1, m2) of sub-blocks 2p and 2p+1, read as 16-bit halves of the
@@ -193,13 +203,13 @@ uint4 scales_pair(uint3 sc, uint p) {
 }
 
 // piece p of a block: sub-blocks 2p (low nibbles of qs[32p..]) and 2p+1 (high nibbles)
-[numthreads(256, 1, 1)]
+[numthreads(MV_GROUP, 1, 1)]
 void mv_q4_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
-    const uint r = gid.x * 8 + (li >> 5), t = gid.y;
+    const uint r = gid.x * (MV_GROUP / MV_LANES) + (li >> MV_LOG2), t = gid.y;
     float sum = 0;
     if (r < rows) {
         const uint wbase = r * wrow, xbase = t * xrow;
-        for (uint p = li & 31; p < nb * 4; p += 32) {
+        for (uint p = li & (MV_LANES - 1); p < nb * 4; p += MV_LANES) {
             const uint b = p >> 2, pp = p & 3;
             const uint wb = wbase + b * Q4K_BYTES, xb = xbase + b * Q8_BYTES;
 #ifdef PITHOS_VK
@@ -218,6 +228,27 @@ void mv_q4_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
             const uint4 xl[2] = { X.Load4(xb + 4 + pp * 64), X.Load4(xb + 20 + pp * 64) };
             const uint4 xh[2] = { X.Load4(xb + 36 + pp * 64), X.Load4(xb + 52 + pp * 64) };
 #endif
+#ifdef MV_SWAR
+            // (w0 + w2 << 16) * (x2 + x0 << 16) holds w0 x0 + w2 x2 in its high half when no term
+            // borrows or carries: x made unsigned (x + 128, corrected below with the nibble sums),
+            // and 4 words per accumulator keep both halves below 2^16
+            uint p1[2] = { 0, 0 }, p2[2] = { 0, 0 }, s1 = 0, s2 = 0, sa = 0, sc = 0;
+            [unroll] for (uint i = 0; i < 8; i++) {
+                const uint w = q[i >> 2][i & 3], a = xl[i >> 2][i & 3] ^ 0x80808080, c = xh[i >> 2][i & 3] ^ 0x80808080;
+                const uint ra = (a << 16) | (a >> 16), rc = (c << 16) | (c >> 16);
+                const uint l1 = w & 0x000F000F, l2 = (w >> 8) & 0x000F000F;
+                const uint h1 = (w >> 4) & 0x000F000F, h2 = (w >> 12) & 0x000F000F;
+                p1[i >> 2] += l1 * (ra & 0x00FF00FF) + l2 * ((ra >> 8) & 0x00FF00FF);
+                p2[i >> 2] += h1 * (rc & 0x00FF00FF) + h2 * ((rc >> 8) & 0x00FF00FF);
+                s1 += l1 + l2;
+                s2 += h1 + h2;
+                sa += (a & 0x00FF00FF) + ((a >> 8) & 0x00FF00FF);
+                sc += (c & 0x00FF00FF) + ((c >> 8) & 0x00FF00FF);
+            }
+            const int d1 = int((p1[0] >> 16) + (p1[1] >> 16)) - 128 * int((s1 & 0xffff) + (s1 >> 16));
+            const int d2 = int((p2[0] >> 16) + (p2[1] >> 16)) - 128 * int((s2 & 0xffff) + (s2 >> 16));
+            const int n1 = int((sa & 0xffff) + (sa >> 16)) - 4096, n2 = int((sc & 0xffff) + (sc >> 16)) - 4096;
+#else
             int d1 = 0, n1 = 0, d2 = 0, n2 = 0;
             [unroll] for (uint i = 0; i < 8; i++) {
                 const uint w = q[i >> 2][i & 3], a = xl[i >> 2][i & 3], c = xh[i >> 2][i & 3];
@@ -229,6 +260,7 @@ void mv_q4_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
                     n2 += vc;
                 }
             }
+#endif
             sum += asfloat(X.Load(xb + Q8_D)) * (f16tof32(dd) * float(int(sm.x) * d1 + int(sm.y) * d2) -
                                           f16tof32(dd >> 16) * float(int(sm.z) * n1 + int(sm.w) * n2));
         }
@@ -238,13 +270,13 @@ void mv_q4_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
 
 // piece p of a block: half h = p / 2, ql bytes [h*64 + a*32, +32) with a = p % 2: low nibbles
 // make sub-block j1 = 4h + a, high nibbles j2 = j1 + 2; scales change every 16 values
-[numthreads(256, 1, 1)]
+[numthreads(MV_GROUP, 1, 1)]
 void mv_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
-    const uint r = gid.x * 8 + (li >> 5), t = gid.y;
+    const uint r = gid.x * (MV_GROUP / MV_LANES) + (li >> MV_LOG2), t = gid.y;
     float sum = 0;
     if (r < rows) {
         const uint wbase = r * wrow, xbase = t * xrow;
-        for (uint p = li & 31; p < nb * 4; p += 32) {
+        for (uint p = li & (MV_LANES - 1); p < nb * 4; p += MV_LANES) {
             const uint b = p >> 2, h = (p & 3) >> 1, a = p & 1;
             const uint wb = wbase + b * Q6K_BYTES, xb = xbase + b * Q8_BYTES;
             const uint j1 = h * 4 + a, j2 = j1 + 2;

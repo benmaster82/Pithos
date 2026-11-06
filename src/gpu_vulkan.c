@@ -422,6 +422,7 @@ struct Vulkan {
     SetEntry sets[SET_CACHE];
     int nsets_cached;
     VkPipeline pso[N_KERNELS], pso_mv[N_KERNELS], pso_tok[N_TOKEN_KERNELS];
+    int mv_rows;                    /* rows per group of the pso_mv kernels: 8, or 16 with the Intel build */
     int recording, nsets, broken;
     VBuf consts, dummy;             /* the constants ring (MAX_SETS slots); a stand-in for unused bindings */
     VMat *mats;                     /* sorted by host address */
@@ -673,10 +674,20 @@ static int create_pipelines(Vulkan *v) {
         {g_vk_conv_chunk, sizeof(g_vk_conv_chunk), "conv_chunk"}, {g_vk_conv_state, sizeof(g_vk_conv_state), "conv_state"},
         {g_vk_attn_chunk, sizeof(g_vk_attn_chunk), "attn_chunk"},
     };
+    /* Intel: the decoding kernels built for its GPUs (kernels_dx.hlsl); PITHOS_VK_INTEL_MV=0: the common ones */
+    static const struct { const unsigned char *code; size_t size; } intel_mv[N_KERNELS] = {
+        {g_vk_mv_q4_K_intel, sizeof(g_vk_mv_q4_K_intel)}, {g_vk_mv_q6_K_intel, sizeof(g_vk_mv_q6_K_intel)},
+    };
+    const char *env = getenv("PITHOS_VK_INTEL_MV");
+    const int intel = v->props.vendorID == 0x8086 && !(env && env[0] == '0');
+    v->mv_rows = intel ? 16 : 8;
     for (int i = 0; i < 2 * N_KERNELS + N_TOKEN_KERNELS; i++) {
-        uint32_t *words = (uint32_t *)malloc(k[i].size);   /* the module wants 4-byte aligned code */
-        memcpy(words, k[i].code, k[i].size);
-        VkShaderModuleCreateInfo si = {ST_SHADER_MODULE_CREATE_INFO, NULL, 0, k[i].size, words};
+        const int mv = i >= N_KERNELS && i < 2 * N_KERNELS;
+        const unsigned char *code = intel && mv ? intel_mv[i - N_KERNELS].code : k[i].code;
+        const size_t size = intel && mv ? intel_mv[i - N_KERNELS].size : k[i].size;
+        uint32_t *words = (uint32_t *)malloc(size);   /* the module wants 4-byte aligned code */
+        memcpy(words, code, size);
+        VkShaderModuleCreateInfo si = {ST_SHADER_MODULE_CREATE_INFO, NULL, 0, size, words};
         VkShaderModule mod = 0;
         VkResult r = v->vk.CreateShaderModule(v->dev, &si, NULL, &mod);
         free(words);
@@ -958,7 +969,7 @@ static int mm_dispatch(Vulkan *v, const VMat *x, Bind o, Bind in, int n, int oro
         const uint32_t c[6] = {(uint32_t)rows, nb, (uint32_t)n, (uint32_t)x->gpu_row, nb * Q8_BYTES, (uint32_t)orow};
         const Bind op = {o.b, o.off + (VkDeviceSize)r0 * 4}, w = {&x->part[p], 0};
         ok = n < VK_MV_TOKENS
-           ? dispatch(v, v->pso_mv[x->kernel], c, 6, op, in, none, w, none, (uint32_t)(rows + 7) / 8, (uint32_t)n, cached)
+           ? dispatch(v, v->pso_mv[x->kernel], c, 6, op, in, none, w, none, (uint32_t)((rows + v->mv_rows - 1) / v->mv_rows), (uint32_t)n, cached)
            : dispatch(v, v->pso[x->kernel], c, 6, op, in, none, w, none, (uint32_t)(rows + 63) / 64,
                       (uint32_t)(n + 63) / 64, cached);
     }
