@@ -7,7 +7,7 @@ OpenAI-compatible server and a terminal agent.
 | File | For |
 |---|---|
 | `pithos-0.5.0-windows-x64.zip` | Windows 10 / 11, 64-bit (AVX2, AVX or scalar kernels chosen at run time) |
-| `pithos-0.5.0-linux-x64.tar.gz` | Linux x86-64 with glibc 2.35 or newer (Ubuntu 22.04+, Debian 12+, Fedora 36+...) |
+| `pithos-0.5.0-linux-x64.tar.gz` | Linux x86-64 with glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, RHEL / Rocky 9+, Fedora 35+...) |
 | `pithos-0.5.0-linux-arm64.tar.gz` | Linux ARM64 (**experimental**): `pithos` for ARMv8.2 with dot product (Raspberry Pi 5, RK3566 / RK3588, Graviton 2+), `pithos-armv8` for older cores (Raspberry Pi 3 / 4) |
 | `SHA256SUMS` | checksums of the archives |
 

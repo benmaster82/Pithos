@@ -81,7 +81,7 @@ jobs:
 
   linux-x64:
     needs: version
-    # Ubuntu 22.04: glibc 2.35, so the binary also runs on Debian 12, Ubuntu 22.04 and newer
+    # Ubuntu 22.04: the binary needs glibc 2.34 (Ubuntu 22.04, Debian 12, RHEL 9 and newer)
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
