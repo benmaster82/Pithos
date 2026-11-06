@@ -1,0 +1,186 @@
+# Builds Pithos for Windows x64, Linux x64 and Linux ARM64, runs the tests on each with the
+# small model (LFM3-1.7B), and on a version tag (v*) creates a draft release with the archives.
+# Run it by hand (Actions -> release -> Run workflow) to build and test without releasing.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  MODEL: LFM3-1.7B-Q4_K_M.gguf
+  MODEL_URL: https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/bad5729bba61d076fff20d2548e62526665af215/LFM3-1.7B-Q4_K_M.gguf
+  MODEL_SHA256: 3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: Version from src/main.c (must match the tag)
+        run: |
+          v=$(sed -n 's/^#define VERSION "\(.*\)"/\1/p' src/main.c)
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$v" ]]; then
+            echo "tag $GITHUB_REF_NAME does not match VERSION $v in src/main.c"; exit 1
+          fi
+
+  windows-x64:
+    needs: version
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc
+      - name: Build (gcc, with tests)
+        shell: cmd
+        run: |
+          set "PATH=${{ steps.msys2.outputs.msys2-location }}\mingw64\bin;%PATH%"
+          call build.cmd test
+      - uses: actions/cache@v4
+        with:
+          path: models
+          key: model-${{ env.MODEL_SHA256 }}
+      - name: Model
+        shell: bash
+        run: |
+          mkdir -p models
+          [ -f "models/$MODEL" ] || curl -fL --retry 3 -o "models/$MODEL" "$MODEL_URL"
+          echo "$MODEL_SHA256  models/$MODEL" | sha256sum -c
+      - name: Tests
+        shell: bash
+        run: |
+          set -e
+          build/test_kernels.exe "models/$MODEL" > tk.txt || { cat tk.txt; exit 1; }
+          grep -E "ALL OK|FAIL" tk.txt
+          (mkdir -p shelltest && cd shelltest && ../build/test_shell.exe | tail -n 2)
+          out=$(build/pithos.exe -m "models/$MODEL" --cpu -p "What is the capital of France?" -n 24 --reasoning off)
+          echo "$out"
+          echo "$out" | grep -qi "paris"
+      - name: Package
+        shell: bash
+        run: |
+          d=pithos-${{ needs.version.outputs.version }}-windows-x64
+          mkdir -p "$d" dist
+          cp build/pithos.exe README.md LICENSE server.cmd "$d/"
+          7z a "dist/$d.zip" "$d" >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/*
+
+  linux-x64:
+    needs: version
+    # Ubuntu 22.04: glibc 2.35, so the binary also runs on Debian 12, Ubuntu 22.04 and newer
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (with tests)
+        run: make -j4 test
+      - uses: actions/cache@v4
+        with:
+          path: models
+          key: model-${{ env.MODEL_SHA256 }}
+      - name: Model
+        run: |
+          mkdir -p models
+          [ -f "models/$MODEL" ] || curl -fL --retry 3 -o "models/$MODEL" "$MODEL_URL"
+          echo "$MODEL_SHA256  models/$MODEL" | sha256sum -c
+      - name: Tests
+        run: |
+          set -e
+          build/test_kernels "models/$MODEL" > tk.txt || { cat tk.txt; exit 1; }
+          grep -E "ALL OK|FAIL" tk.txt
+          (mkdir -p shelltest && cd shelltest && ../build/test_shell | tail -n 2)
+          out=$(build/pithos -m "models/$MODEL" --cpu -p "What is the capital of France?" -n 24 --reasoning off)
+          echo "$out"
+          echo "$out" | grep -qi "paris"
+          echo "glibc needed: $(objdump -T build/pithos | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -n 1)"
+      - name: Package
+        run: |
+          d=pithos-${{ needs.version.outputs.version }}-linux-x64
+          mkdir -p "$d" dist
+          cp build/pithos README.md LICENSE "$d/"
+          tar czf "dist/$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: dist/*
+
+  linux-arm64:
+    needs: version
+    runs-on: ubuntu-22.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      # two binaries: ARMv8.2 with dot product (Raspberry Pi 5, RK3566/RK3588, Graviton 2+) and
+      # plain ARMv8 for older cores (Raspberry Pi 3 / 4); the runner has dot product, so it runs both
+      - name: Build (dotprod and armv8, with tests)
+        run: |
+          grep -m1 Features /proc/cpuinfo
+          make -j4 test BUILD=build-dotprod ARCHFLAGS="-march=armv8.2-a+dotprod+fp16"
+          make -j4 test BUILD=build-armv8 ARCHFLAGS="-march=armv8-a"
+      - uses: actions/cache@v4
+        with:
+          path: models
+          key: model-${{ env.MODEL_SHA256 }}
+      - name: Model
+        run: |
+          mkdir -p models
+          [ -f "models/$MODEL" ] || curl -fL --retry 3 -o "models/$MODEL" "$MODEL_URL"
+          echo "$MODEL_SHA256  models/$MODEL" | sha256sum -c
+      - name: Tests
+        run: |
+          set -e
+          for b in build-dotprod build-armv8; do
+            echo "== $b"
+            $b/test_kernels "models/$MODEL" > tk.txt || { cat tk.txt; exit 1; }
+            grep -E "ALL OK|FAIL" tk.txt
+            (mkdir -p shelltest && cd shelltest && ../$b/test_shell | tail -n 2)
+            out=$($b/pithos -m "models/$MODEL" --cpu -p "What is the capital of France?" -n 24 --reasoning off)
+            echo "$out"
+            echo "$out" | grep -qi "paris"
+            $b/pithos -m "models/$MODEL" --cpu --bench 64,32 2>&1 | grep warm
+          done
+      - name: Package
+        run: |
+          d=pithos-${{ needs.version.outputs.version }}-linux-arm64
+          mkdir -p "$d" dist
+          cp build-dotprod/pithos "$d/pithos"
+          cp build-armv8/pithos "$d/pithos-armv8"
+          cp README.md LICENSE "$d/"
+          tar czf "dist/$d.tar.gz" "$d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: dist/*
+
+  release:
+    needs: [version, windows-x64, linux-x64, linux-arm64]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Draft release (published by hand after a check)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --draft \
+            --title "Pithos $GITHUB_REF_NAME" --notes-file .github/release-notes.md

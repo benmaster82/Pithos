@@ -25,8 +25,11 @@
 #else
 #include <unistd.h>
 #endif
+#if defined(__aarch64__) && defined(__linux__) && defined(__ARM_FEATURE_DOTPROD)
+#include <sys/auxv.h>
+#endif
 
-#define VERSION "0.4.0"
+#define VERSION "0.5.0"
 
 typedef struct {
     const char *model, *prompt, *system, *kernels, *tokenize, *ppl;
@@ -1089,5 +1092,17 @@ int wmain(int argc, wchar_t **wargv) {
     return real_main(argc, argv);
 }
 #else
-int main(int argc, char **argv) { return real_main(argc, argv); }
+int main(int argc, char **argv) {
+#if defined(__aarch64__) && defined(__linux__) && defined(__ARM_FEATURE_DOTPROD)
+    /* a binary built for ARMv8.2 dot product would stop with "Illegal instruction" on older
+     * cores (Raspberry Pi 3 / 4): say what to use instead */
+    const unsigned long hw = getauxval(AT_HWCAP);
+    if (!(hw & (1ul << 20)) || !(hw & (1ul << 10))) {   /* HWCAP_ASIMDDP, HWCAP_ASIMDHP */
+        fprintf(stderr, "this pithos is built for ARMv8.2 with dot product, which this CPU lacks:\n"
+                        "use the armv8 build (pithos-armv8) or compile on this machine (make)\n");
+        return 1;
+    }
+#endif
+    return real_main(argc, argv);
+}
 #endif

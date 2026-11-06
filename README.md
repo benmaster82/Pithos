@@ -96,6 +96,13 @@ Both are real sessions with LFM2.5-24B-A2B on the reference laptop (i5-10500H, G
 
 ## Quick start
 
+**Prebuilt binaries** for Windows x64, Linux x64 and Linux ARM64 (experimental) are on the
+[Releases](https://github.com/benmaster82/Pithos/releases) page: extract the archive, put the model
+in a `models` folder next to the program and skip the build step below. The Linux x64 binary needs
+glibc 2.35 or newer (Ubuntu 22.04, Debian 12 and later). The ARM64 archive has two programs:
+`pithos` for cores with dot product (Raspberry Pi 5, RK3566 / RK3588) and `pithos-armv8` for older
+ones (Raspberry Pi 3 / 4). Otherwise build from source:
+
 1. **Get the model** (see [Downloading the model](#downloading-the-model) below).
    On Linux, `bash build.sh --download-model` can handle both the build and this download
    (`--download-model=lfm3-1.7b` for the small model, `--list-models` for the choices).

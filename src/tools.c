@@ -1833,7 +1833,7 @@ static void mcp_start(void *arg) {
     s->reader = thread_create(mcp_reader, s);
     Json *r = mcp_rpc(s, "initialize",
                       "{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},"
-                      "\"clientInfo\":{\"name\":\"pandora\",\"title\":\"Pandora (Pithos)\",\"version\":\"0.4.0\"}}",
+                      "\"clientInfo\":{\"name\":\"pandora\",\"title\":\"Pandora (Pithos)\",\"version\":\"0.5.0\"}}",
                       180000, err, sizeof(err));
     if (!r) goto fail;
     json_free(r);
