@@ -169,7 +169,7 @@ static const char *default_model_path(void) {
 
 static void usage(void) {
     printf(
-        "Pithos " VERSION " - dependency-free C inference engine for LFM2 / LFM2-MoE GGUF models\n\n"
+        "Pithos " VERSION " - dependency-free C inference engine for LFM2 / LFM2-MoE / LFM3 GGUF models\n\n"
         "usage: pithos [options]\n"
         "  -m, --model PATH        GGUF model (default: models/LFM2.5-24B-A2B-Q4_K_M.gguf, else the only\n"
         "                          .gguf in models/; also looked up in ../models and ../../models)\n"
