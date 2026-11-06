@@ -22,8 +22,10 @@ typedef struct {
 /* Print the Vulkan devices (index, name, type, memory). */
 void vk_list_devices(void);
 
-/* device: an index from vk_list_devices, or -1 for the discrete GPU with the most memory.
+/* device: an index from vk_list_devices, -1 for the discrete GPU with the most memory, or
+ * VK_AUTO_DEVICE for a discrete NVIDIA GPU only (the vendor tested, what --gpu auto uses).
  * info receives a one-line description, or why the GPU is not used. */
+#define VK_AUTO_DEVICE (-2)
 Vulkan *vk_create(const Model *m, int device, char *info, int infolen);
 void vk_destroy(Vulkan *v);
 

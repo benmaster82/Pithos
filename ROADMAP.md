@@ -74,11 +74,8 @@ generation uses about 30 of them.
   per token (for example, quantization fused into the norm kernels), and a look at the `mv_*`
   memory access pattern.
 - [ ] **Logits of every token on the GPU**, so that `--ppl` and `ctx_forward_all` use the fast path too.
-- [ ] **Direct3D 12 by default for dense models on Windows**: on the GTX 1650 with LFM3-1.7B,
-  `--no-gpu --d3d12` gives 330 tok/s of prompt and 69 of generation, against 67–103 and 56 with
-  OpenCL. Today it has to be asked for explicitly. Plain `--d3d12` with OpenCL active only moves
-  the prompt matmuls (190 / 56). Pick it automatically, keeping OpenCL for MoE models. It would also
-  serve GPUs without OpenCL.
+- [ ] **`--gpu auto` on more GPUs**: it picks Vulkan for dense models on discrete NVIDIA GPUs only
+  (done, see below). AMD (Vulkan or Direct3D 12) once measured; Direct3D 12 where Vulkan is missing.
 - [ ] **Experts on Direct3D 12**: the backend handles models without experts only. The 24B model
   does not fit in the Xbox's 5 GB, but it matters for PCs.
 - [ ] **Xbox app type**: every reinstall resets the app to "App", and the user must set "Game"
@@ -86,7 +83,7 @@ generation uses about 30 of them.
 - [ ] **Merge `xbox` into `main`** after review: shared-code changes are small and measured neutral
   on Windows and Linux.
 
-## 7. Vulkan backend (`--vulkan`, experimental)
+## 7. Vulkan backend (`--gpu vulkan`, experimental)
 The Direct3D 12 kernels compiled to SPIR-V; same results on the same GPU. LFM3-1.7B on the GTX 1650:
 prompt 328 tok/s, generation 82 (Direct3D 12: 336 / 70).
 
@@ -96,9 +93,14 @@ prompt 328 tok/s, generation 82 (Direct3D 12: 336 / 70).
   prompt against 42 with Direct3D 12). Integrated Intel GPUs stay slower than the CPU anyway.
 - [ ] **KV cache over the buffer limit**: split it like the large matrices, so that small-buffer
   devices (llvmpipe: 128 MB) keep the whole forward pass at the default context.
-- [ ] **Vulkan by default where it is fastest**, together with the Direct3D 12 item above.
+- [x] **Vulkan by default where it is fastest**: `--gpu auto` on discrete NVIDIA GPUs, for dense
+  models.
 
 ## Done
+- Branch `gpu-cli`: one option for the GPU, `--gpu auto|off|vulkan|d3d12|opencl|opencl+vulkan|opencl+d3d12`
+  (and `--cpu`), with `--gpu-device N` for every backend and `--list-gpus` listing all three; by
+  default LFM3 runs on Vulkan on a discrete NVIDIA GPU (82 tok/s instead of 56). The old options
+  keep their meaning.
 - Branch `vulkan`: Vulkan backend (`--vulkan`, `--vulkan-device N`) on Windows and Linux, loaded at
   runtime, with the whole forward pass of dense models and the matmuls for MoE models.
 - Branch `xbox` (not released yet): UWP app for the Xbox One in Dev Mode with a status and chat

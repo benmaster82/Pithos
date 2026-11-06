@@ -16,8 +16,9 @@
 
 #if !defined(_WIN32)
 
-Dx *dx_create(const Model *m, char *info, int infolen) {
-    (void)m;
+void dx_list_devices(void) { printf("  Direct3D 12 needs Windows\n"); }
+Dx *dx_create(const Model *m, int device, char *info, int infolen) {
+    (void)m; (void)device;
     snprintf(info, (size_t)infolen, "Direct3D 12 needs Windows");
     return NULL;
 }
@@ -362,18 +363,43 @@ static int create_pipeline(Dx *d, HMODULE lib) {
     return 1;
 }
 
-/* the adapter with the most dedicated memory (a laptop's discrete GPU rather than the integrated one) */
-static IDXGIAdapter1 *pick_adapter(char *name, int namelen) {
+static IDXGIFactory1 *dxgi_factory(void) {
     HMODULE dxgi = load_system_dll(L"dxgi.dll");
     CreateFactory_t create = dxgi ? (CreateFactory_t)(void *)GetProcAddress(dxgi, "CreateDXGIFactory1") : NULL;
     IDXGIFactory1 *f = NULL;
     if (!create || FAILED(create(&DX_IID_Factory1, (void **)&f))) return NULL;
+    return f;
+}
+
+void dx_list_devices(void) {
+    IDXGIFactory1 *f = dxgi_factory();
+    if (!f) { printf("  DXGI not available\n"); return; }
+    IDXGIAdapter1 *a = NULL;
+    for (UINT i = 0; IDXGIFactory1_EnumAdapters1(f, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+        DXGI_ADAPTER_DESC1 desc;
+        char name[128] = "?";
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &desc))) {
+            WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name), NULL, NULL);
+            printf("  [%u] %s | %llu MB dedicated%s\n", i, name, (unsigned long long)(desc.DedicatedVideoMemory >> 20),
+                   desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE ? " | software" : "");
+        }
+        IDXGIAdapter1_Release(a);
+    }
+    IDXGIFactory1_Release(f);
+}
+
+/* adapter number want, or (want < 0) the one with the most dedicated memory (a laptop's discrete
+ * GPU rather than the integrated one) */
+static IDXGIAdapter1 *pick_adapter(int want, char *name, int namelen) {
+    IDXGIFactory1 *f = dxgi_factory();
+    if (!f) return NULL;
     IDXGIAdapter1 *best = NULL, *a = NULL;
     SIZE_T best_mem = 0;
     for (UINT i = 0; IDXGIFactory1_EnumAdapters1(f, i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
         DXGI_ADAPTER_DESC1 desc;
-        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
-            (!best || desc.DedicatedVideoMemory > best_mem)) {
+        if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &desc)) &&
+            (want >= 0 ? (int)i == want
+                       : !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && (!best || desc.DedicatedVideoMemory > best_mem))) {
             if (best) IDXGIAdapter1_Release(best);
             best = a;
             best_mem = desc.DedicatedVideoMemory;
@@ -388,7 +414,7 @@ static IDXGIAdapter1 *pick_adapter(char *name, int namelen) {
 
 static void dense_free(Dx *d);
 
-Dx *dx_create(const Model *m, char *info, int infolen) {
+Dx *dx_create(const Model *m, int device, char *info, int infolen) {
     info[0] = 0;
     HMODULE lib = load_system_dll(L"d3d12.dll");
     CreateDevice_t create = lib ? (CreateDevice_t)(void *)GetProcAddress(lib, "D3D12CreateDevice") : NULL;
@@ -409,7 +435,12 @@ Dx *dx_create(const Model *m, char *info, int infolen) {
     Dx *d = (Dx *)calloc(1, sizeof(Dx));
     d->lib = lib;
     char name[128] = "default adapter";
-    IDXGIAdapter1 *adapter = pick_adapter(name, sizeof(name));
+    IDXGIAdapter1 *adapter = pick_adapter(device, name, sizeof(name));
+    if (device >= 0 && !adapter) {
+        snprintf(info, (size_t)infolen, "no Direct3D 12 adapter %d (see --list-gpus)", device);
+        free(d);
+        return NULL;
+    }
     HRESULT hr = create((IUnknown *)adapter, D3D_FEATURE_LEVEL_11_0, &DX_IID_Device, (void **)&d->dev);
     if (adapter) IDXGIAdapter1_Release(adapter);
     if (FAILED(hr)) {

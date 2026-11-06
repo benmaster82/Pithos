@@ -199,7 +199,7 @@
         <div class="x-chapter-body">
           <span class="eyebrow">BACK TO THE PC</span>
           <h2 id="c8">The console made the PC faster too.</h2>
-          <p>The Direct3D 12 backend also works on Windows PCs. On the reference laptop (GTX 1650), <code>--no-gpu --d3d12</code> runs LFM3-1.7B at <strong>330 tokens per second</strong> on the prompt and <strong>69</strong> on generation, against 67–103 and 56 with OpenCL. The AVX kernels give older PCs without AVX2 a fast CPU path. Nothing changed for the default path on Windows and Linux: the same tokens, at the same speed.</p>
+          <p>The Direct3D 12 backend also works on Windows PCs. On the reference laptop (GTX 1650), <code>--gpu d3d12</code> runs LFM3-1.7B at <strong>330 tokens per second</strong> on the prompt and <strong>69</strong> on generation, against 67–103 and 56 with OpenCL. The AVX kernels give older PCs without AVX2 a fast CPU path. Nothing changed for the default path on Windows and Linux: the same tokens, at the same speed.</p>
         </div>
       </section>
     </article>
@@ -212,7 +212,7 @@
 xbox\build.cmd</code></pre></li>
         <li><strong>Install and upload the model.</strong><pre><code>python xbox\deploy.py --xbox CONSOLE-IP install
 python xbox\deploy.py --xbox CONSOLE-IP upload models\LFM3-1.7B-Q4_K_M.gguf</code></pre></li>
-        <li><strong>Game mode.</strong> Dev Home → Pithos.X Server → View details → App type: Game. Put <code>-t 6 --d3d12</code> in <code>pithos.args</code>, then start the app.</li>
+        <li><strong>Game mode.</strong> Dev Home → Pithos.X Server → View details → App type: Game. Put <code>-t 6 --gpu d3d12</code> in <code>pithos.args</code>, then start the app.</li>
         <li><strong>Connect.</strong> Open <code>http://CONSOLE-IP:8080</code> from any device on the network.</li>
       </ol>
       <a class="button button-dark" href="https://github.com/benmaster82/Pithos#xbox-one" target="_blank" rel="noopener noreferrer">Full instructions in the README <svg aria-hidden="true" class="icon"><use href="#i-external"/></svg></a>

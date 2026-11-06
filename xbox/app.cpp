@@ -123,10 +123,11 @@ static void server_thread(std::wstring local) {
     // the agent keeps its workspace next to the process; LocalState is the writable folder
     SetCurrentDirectoryW(local.c_str());
 
+    // CPU by default: the GPU (Direct3D 12) needs the app type Game, and is asked for in pithos.args
     std::vector<std::string> args = { "pithos", "--server", "--host", "0.0.0.0", "--port", "8080",
-                                      "--no-gpu", "-m", utf8(model) };
-    // LocalState\pithos.args: more options (for example "-t 6"), separated by spaces or lines;
-    // they come after the defaults, so they also override them
+                                      "--gpu", "off", "-m", utf8(model) };
+    // LocalState\pithos.args: more options (for example "-t 6 --gpu d3d12"), separated by spaces or
+    // lines; they come after the defaults, so they also override them
     size_t defaults = args.size();
     std::string extra = read_tail(local + L"\\pithos.args", 4096);
     for (size_t p = 0; (p = extra.find_first_not_of(" \t\r\n", p)) != std::string::npos;) {

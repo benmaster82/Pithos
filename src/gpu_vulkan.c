@@ -18,7 +18,7 @@
 
 #if defined(PITHOS_UWP)
 
-void vk_list_devices(void) { printf("Vulkan not available on this platform\n"); }
+void vk_list_devices(void) { printf("  Vulkan not available on this platform\n"); }
 Vulkan *vk_create(const Model *m, int device, char *info, int infolen) {
     (void)m; (void)device;
     snprintf(info, (size_t)infolen, "Vulkan not available on this platform");
@@ -454,7 +454,7 @@ static int enum_devices(VkApi *vk, VkInstance inst, VkPhysicalDevice *pds) {
 void vk_list_devices(void) {
     VkApi vk;
     VkInstance inst = vk_load(&vk) ? vk_instance(&vk) : NULL;
-    if (!inst) { printf("Vulkan not available\n"); return; }
+    if (!inst) { printf("  Vulkan not available\n"); return; }
     VkPhysicalDevice pds[MAX_DEVICES];
     const int n = enum_devices(&vk, inst, pds);
     for (int i = 0; i < n; i++) {
@@ -800,7 +800,8 @@ static int upload_weights(Vulkan *v, char *err, int errlen) {
 }
 
 /* the requested device, or the discrete GPU with the most memory (else any GPU), never a CPU
- * implementation unless asked for by index */
+ * implementation unless asked for by index; VK_AUTO_DEVICE: discrete NVIDIA GPUs only, and not
+ * through WSL's Direct3D 12 layer (dozen, "Microsoft Direct3D12 (...)") */
 static int pick_device(Vulkan *v, int want, char *info, int infolen) {
     VkPhysicalDevice pds[MAX_DEVICES];
     const int n = enum_devices(&v->vk, v->inst, pds);
@@ -812,10 +813,16 @@ static int pick_device(Vulkan *v, int want, char *info, int infolen) {
         VkPhysicalDeviceProperties p;
         v->vk.GetPhysicalDeviceProperties(pds[i], &p);
         if (p.deviceType == 4 || p.apiVersion < VK_API_1_1) continue;
+        if (want == VK_AUTO_DEVICE && (p.deviceType != 2 || p.vendorID != 0x10DE || !strncmp(p.deviceName, "Microsoft", 9)))
+            continue;
         const long long score = (p.deviceType == 2 ? 1ll << 50 : 0) + (long long)(device_memory(&v->vk, pds[i]) >> 20);
         if (score > best_score) { best_score = score; best = i; }
     }
-    if (best < 0) { snprintf(info, (size_t)infolen, "no Vulkan 1.1 GPU (a CPU implementation needs its device index)"); return 0; }
+    if (best < 0) {
+        snprintf(info, (size_t)infolen, "%s", want == VK_AUTO_DEVICE ? "no discrete NVIDIA GPU"
+                                              : "no Vulkan 1.1 GPU (a CPU implementation needs its device index)");
+        return 0;
+    }
     v->pd = pds[best];
     v->vk.GetPhysicalDeviceProperties(v->pd, &v->props);
     v->vk.GetPhysicalDeviceMemoryProperties(v->pd, &v->mem);

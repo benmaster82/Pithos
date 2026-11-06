@@ -41,7 +41,7 @@ const buildGuide = m => ({
       {title:'Open your first chat.', label:'03 / ALMOST THERE',
         description:'<p>Stay in the project folder in PowerShell. Start Pithos with this command and <strong>keep the terminal open</strong>.</p><p>When the server is ready, open the local address below in your browser.</p>',
         command:`.\\build\\pithos.exe${modelArg(m, true)} --server`, context:'PowerShell · inside Pithos-main', localLink:true,
-        note:'A compatible GPU is used automatically; add --no-gpu to stay on the CPU. Press Ctrl+C to stop the program. To open it tomorrow, repeat just this step.'}
+        note:'A compatible GPU is used automatically; add --cpu to stay on the CPU. Press Ctrl+C to stop the program. To open it tomorrow, repeat just this step.'}
     ]
   },
   linux: {
@@ -58,7 +58,7 @@ const buildGuide = m => ({
       {title:'Your chat is one step away.',label:'03 / OPEN PANDORA',
         description:'<p>Run this command from the Pithos folder. It starts the local server. <strong>Keep the terminal open</strong> and open the address in your browser.</p>',
         command:`./build/pithos${modelArg(m, false)} --server`,context:'Linux terminal · inside Pithos',localLink:true,
-        note:'The chat runs on your computer; a compatible GPU is used automatically (--no-gpu stays on the CPU). Press Ctrl+C to stop it. Next time, repeat only this step.'}
+        note:'The chat runs on your computer; a compatible GPU is used automatically (--cpu stays on the CPU). Press Ctrl+C to stop it. Next time, repeat only this step.'}
     ]
   },
   wsl:{
@@ -74,7 +74,7 @@ const buildGuide = m => ({
         note:`The download is about ${m.download}. If interrupted, run “bash build.sh ${downloadFlag(m)}” again from the Pithos folder. Your Linux password is not displayed as you type.`},
       {title:'Open your Windows browser.',label:'03 / OPEN PANDORA',
         description:'<p>Start the server from the Pithos folder in the Ubuntu terminal. Open the local address in your usual <strong>Windows browser</strong>. Keep Ubuntu open.</p>',
-        command:`./build/pithos${modelArg(m, false)} --server --no-gpu`,context:'Ubuntu terminal · inside Pithos',localLink:true,
+        command:`./build/pithos${modelArg(m, false)} --server --cpu`,context:'Ubuntu terminal · inside Pithos',localLink:true,
         note:'This guide uses the CPU. OpenCL GPU acceleration in WSL was not verified. Press Ctrl+C in the Ubuntu terminal to stop the program.'}
     ]
   }
@@ -150,7 +150,7 @@ const SHOTS={
 function renderMode() {
   const windows=state.os==='windows';
   const binary=(windows?'.\\build\\pithos.exe':'./build/pithos')+modelArg(MODELS[state.model],windows);
-  const cpu=state.os==='wsl'?' --no-gpu':''; // GPU acceleration was not verified under WSL
+  const cpu=state.os==='wsl'?' --cpu':''; // GPU acceleration was not verified under WSL
   document.querySelector('#hero-code').textContent=`${binary} --server${cpu}`;
   document.querySelector('#hero-context').textContent=windows?'WINDOWS / NATIVE':state.os==='wsl'?'UBUNTU / WSL2':'LINUX / LOCAL';
   document.querySelector('#hero-prompt').textContent=windows?'PS>':'$';

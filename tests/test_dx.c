@@ -125,7 +125,7 @@ int main(int argc, char **argv) {
     char err[512];
     if (argc < 2 || !model_load(&m, argv[1], err, sizeof(err))) { printf("usage: test_dx model.gguf\n"); return 1; }
     quant_init(NULL);
-    Dx *d = dx_create(&m, err, sizeof(err));
+    Dx *d = dx_create(&m, -1, err, sizeof(err));
     if (!d) { printf("no Direct3D 12: %s\n", err); return 0; }
     printf("Direct3D 12: %s\n", err);
     /* the first layer with each shape and type */

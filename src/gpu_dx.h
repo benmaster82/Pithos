@@ -19,8 +19,12 @@ typedef struct {
     float *out; int ostride;
 } DxJob;
 
-/* info receives a one-line description, or why the GPU is not used. */
-Dx  *dx_create(const Model *m, char *info, int infolen);
+/* Print the Direct3D 12 adapters (index, name, dedicated memory). */
+void dx_list_devices(void);
+
+/* device: an index from dx_list_devices, or -1 for the adapter with the most dedicated memory.
+ * info receives a one-line description, or why the GPU is not used. */
+Dx  *dx_create(const Model *m, int device, char *info, int infolen);
 void dx_destroy(Dx *d);
 
 /* Is this weight matrix in GPU memory? */

@@ -47,10 +47,12 @@ model). **Pandora** is the agent in the web interface.
 - CPU inference with AVX2 / AVX / NEON integer kernels that read the quantized weights in place.
 - Optional OpenCL GPU acceleration: hot experts and all dense layers in VRAM, with the remaining experts
   computed on the CPU in parallel.
-- Optional Direct3D 12 GPU acceleration (`--d3d12`, Windows and Xbox): for dense models such as
+- Optional Direct3D 12 GPU acceleration (`--gpu d3d12`, Windows and Xbox): for dense models such as
   LFM3, the whole forward pass, prompt included, runs on the GPU.
-- Optional Vulkan GPU acceleration (`--vulkan`, Windows and Linux; experimental): the same kernels
+- Optional Vulkan GPU acceleration (`--gpu vulkan`, Windows and Linux; experimental): the same kernels
   and the same whole forward pass as Direct3D 12, on any GPU with a Vulkan 1.1 driver.
+- One option chooses the GPU backend, `--gpu`; by default (`auto`) Pithos picks the fastest one
+  measured for the model ([Choosing the GPU](#choosing-the-gpu)).
 - **An Xbox One app**: the server runs on a console in Developer Mode, with a status and chat screen
   on the TV.
 - Works with models larger than the free RAM (asynchronous read-ahead, expert prediction).
@@ -170,22 +172,22 @@ Pithos also rejects a truncated file and names the tensor that is missing.
 that fits in 1.1 GB, with the same chat, server, Pandora and terminal agent. With a GPU every layer
 lives in VRAM (1.2 GB with a 8k context) and decoding runs there: about 55 tokens per second on the
 reference laptop (GTX 1650), against about 20 on the CPU alone. With OpenCL the prompt is read on
-the CPU (45-75 tokens per second). On Windows, **`--no-gpu --d3d12`** runs everything on the GPU
-through Direct3D 12 instead, which is faster on both counts: about 330 tokens per second of prompt
-and 69 of generation on the same laptop. **`--no-gpu --vulkan`** does the same through Vulkan, on
-Windows and on Linux (experimental): the prompt at the same speed, generation faster (about 82
-tokens per second). This is also the model that runs on the [Xbox One](#xbox-one).
+the CPU (45-75 tokens per second). Through Vulkan (Windows and Linux, experimental) or Direct3D 12
+(Windows) the whole forward pass runs on the GPU, which is faster on both counts: about 330 tokens
+per second of prompt, and 82 (Vulkan) or 69 (Direct3D 12) of generation. On a discrete NVIDIA GPU
+Pithos uses Vulkan for this model by default; `--gpu d3d12` or `--gpu opencl` choose the others.
+This is also the model that runs on the [Xbox One](#xbox-one).
 
 | LFM3-1.7B on the reference laptop | Prompt | Generation |
 |---|---:|---:|
-| CPU only (`--no-gpu`) | 80–100 tok/s | 23 tok/s |
-| OpenCL (default) | 67–103 tok/s | 56 tok/s |
-| OpenCL, with prompt matmuls on Direct3D 12 (`--d3d12`) | 190 tok/s | 56 tok/s |
-| **Direct3D 12 only (`--no-gpu --d3d12`)** | **330 tok/s** | **69 tok/s** |
-| Vulkan only (`--no-gpu --vulkan`, experimental) | 328 tok/s | 82 tok/s |
+| CPU only (`--cpu`) | 80–100 tok/s | 23 tok/s |
+| OpenCL (`--gpu opencl`) | 67–103 tok/s | 56 tok/s |
+| OpenCL, with prompt matmuls on Direct3D 12 (`--gpu opencl+d3d12`) | 190 tok/s | 56 tok/s |
+| Direct3D 12 (`--gpu d3d12`) | 330 tok/s | 69 tok/s |
+| **Vulkan (default here, `--gpu vulkan`; experimental)** | **328 tok/s** | **82 tok/s** |
 
 ```
-build\pithos.exe -m models\LFM3-1.7B-Q4_K_M.gguf --no-gpu --d3d12 --server --open
+build\pithos.exe -m models\LFM3-1.7B-Q4_K_M.gguf --server --open
 ```
 
 | | |
@@ -315,13 +317,15 @@ installation; combine it with `--download-model` only when you do want network a
 After [downloading the reference model](#downloading-the-model), try CPU inference:
 
 ```bash
-./build/pithos --no-gpu -m models/LFM2.5-24B-A2B-Q4_K_M.gguf -p "Hello"
-./build/pithos --server --no-gpu  # web chat at http://127.0.0.1:8080
+./build/pithos --cpu -m models/LFM2.5-24B-A2B-Q4_K_M.gguf -p "Hello"
+./build/pithos --server --cpu  # web chat at http://127.0.0.1:8080
 ```
 
-GPU acceleration is optional and requires a working OpenCL runtime/driver. In our
-WSL2 test, the CPU path passed; no OpenCL device was exposed, so GPU inference was
-not verified. Seeing the GPU in `nvidia-smi` alone does not establish OpenCL support.
+GPU acceleration is optional and needs a working OpenCL or Vulkan driver (see
+[Choosing the GPU](#choosing-the-gpu)). In our WSL2 test, the CPU path passed; no OpenCL
+device and only the software Vulkan driver were exposed, so GPU inference was not verified
+there and the default choice stays on the CPU. Seeing the GPU in `nvidia-smi` alone does not
+establish OpenCL or Vulkan support.
 
 `--test` runs only the model-independent shell test, in a temporary folder. For
 numerical tests, use the reference **24B MoE** GGUF, not the smaller dense model:
@@ -353,16 +357,16 @@ you need and use **Ctrl+C** to stop it:
 | All command-line options | `./build/pithos --help` |
 
 With `--server`, open **http://127.0.0.1:8080** in your browser; the API base URL is
-`http://127.0.0.1:8080/v1`. Add `--no-gpu` to explicitly use the CPU, for example
-`./build/pithos --server --no-gpu`. Autonomous mode still asks before commands it
+`http://127.0.0.1:8080/v1`. Add `--cpu` to explicitly use the CPU, for example
+`./build/pithos --server --cpu`. Autonomous mode still asks before commands it
 recognizes as destructive; see [Terminal agent](#terminal-agent) for details.
 
 **GPU on Linux (Vulkan, experimental).** With a Vulkan driver installed (NVIDIA's own driver, or
 Mesa's RADV / ANV for AMD and Intel: `sudo apt install libvulkan1 mesa-vulkan-drivers`),
-`./build/pithos --list-gpus` lists the devices, and `--no-gpu --vulkan` runs LFM3 entirely on the
-GPU. For MoE models Vulkan takes the prompt matmuls. Mesa's software driver (llvmpipe, a "CPU"
-device) is used only when chosen by number with `--vulkan-device N`: it is useful for testing, not
-for speed. Where a GPU's buffers are small (llvmpipe: 128 MB), larger matrices are split over
+`./build/pithos --list-gpus` lists the devices, and `--gpu vulkan` runs LFM3 entirely on the
+GPU (on a discrete NVIDIA GPU that is already the default). For MoE models, `--gpu opencl+vulkan`
+gives Vulkan the prompt matmuls. Mesa's software driver (llvmpipe, a "CPU" device) is used only
+when chosen by number with `--gpu vulkan --gpu-device N`: it is useful for testing, not for speed. Where a GPU's buffers are small (llvmpipe: 128 MB), larger matrices are split over
 several, and a KV cache that does not fit makes Pithos fall back to the matmuls only, with a
 message suggesting a smaller `-c`.
 
@@ -412,7 +416,7 @@ served by the console, with an answer generated by the Xbox at 26.6 tokens per s
 | Xbox One S, LFM3-1.7B Q4_K_M | Prompt | Generation |
 |---|---:|---:|
 | App mode, CPU only (8 threads) | 17.6 tok/s | 7.3 tok/s |
-| **Game mode, Direct3D 12** (`-t 6 --d3d12`) | **146 tok/s** (121 at 1000 tokens) | **29.5 tok/s** (26 after 1000 tokens of context) |
+| **Game mode, Direct3D 12** (`-t 6 --gpu d3d12`) | **146 tok/s** (121 at 1000 tokens) | **29.5 tok/s** (26 after 1000 tokens of context) |
 
 The console's CPU (8 AMD Jaguar cores) has no AVX2, so it uses the AVX kernels. In Game mode the
 app gets about 5 GB of RAM and Direct3D 12 on the GPU, which runs the whole forward pass: weights,
@@ -473,16 +477,18 @@ and set the app type to Game again. `LocalState` (the model, `pithos.args` and t
 conversations) is kept across updates.
 
 ### Options and best use
-The app starts the server as `pithos --server --host 0.0.0.0 --port 8080 --no-gpu -m MODEL`
-(`--no-gpu` refers to OpenCL, which the Xbox does not have). The options in `LocalState\pithos.args`
-are added after these, so they can also override them. Upload the file, then restart the app:
+The app starts the server as `pithos --server --host 0.0.0.0 --port 8080 --gpu off -m MODEL`: the
+CPU, since the GPU is reachable only in Game mode. The options in `LocalState\pithos.args` are
+added after these, so they can also override them. Upload the file, then restart the app:
 
 | Mode | Recommended `pithos.args` | Why |
 |---|---|---|
-| Game (recommended) | `-t 6 --d3d12` | the GPU does all the work; 6 CPU threads leave room for the system |
+| Game (recommended) | `-t 6 --gpu d3d12` | the GPU does all the work; 6 CPU threads leave room for the system |
 | App (no Game type) | `-t 8` | Direct3D 12 is not available; all 8 cores give the best CPU speed |
 
-- **Start-up**: with `--d3d12` the server answers about a minute after launch, while the weights
+The older `-t 6 --d3d12` still works the same.
+
+- **Start-up**: with `--gpu d3d12` the server answers about a minute after launch, while the weights
   are copied into GPU memory. The log line `whole forward pass on the GPU` confirms the fast path.
 - **Context**: the server uses 16,384 tokens by default (352 MB of KV cache on the GPU). `-c 8192`
   halves it.
@@ -732,10 +738,13 @@ checkpoint and only processes the rest:
 | `--reasoning R` | reasoning level: `high` (default), `medium`, `low`, `off`, or a budget in tokens |
 | `--hide-think` | do not print the reasoning (`<think>…</think>`) |
 | `--keep-think` | keep the reasoning of past turns in the context |
-| `--no-gpu`, `--gpu-device N`, `--gpu-mem MB`, `--list-gpus` | GPU control |
-| `--no-gpu-dense` | in generation, use the GPU only for experts (attention, convolutions and output on the CPU) |
-| `--d3d12` | Direct3D 12 GPU (Windows, Xbox in Game mode). With `--no-gpu`, dense models (LFM3) run the whole forward pass on it, the fastest choice for them. With the OpenCL GPU also active, or for MoE models, only the prompt matmuls run there |
-| `--vulkan`, `--vulkan-device N` | Vulkan GPU (Windows, Linux; experimental): the same roles as `--d3d12`, which it cannot be combined with. Without a number the discrete GPU with the most memory is chosen; software drivers only by number (see `--list-gpus`) |
+| `--gpu B` | the GPU backend: `auto` (default), `off`, `vulkan`, `d3d12`, `opencl`, `opencl+vulkan`, `opencl+d3d12` ([Choosing the GPU](#choosing-the-gpu)) |
+| `--cpu` | CPU only (same as `--gpu off`) |
+| `--gpu-device N` | device N of the `--gpu` backend, integrated GPUs too (numbers from `--list-gpus`; in a combination, the OpenCL device) |
+| `--list-gpus` | list the OpenCL, Direct3D 12 and Vulkan devices |
+| `--gpu-mem MB` | OpenCL: VRAM budget (default: VRAM - 900 MB) |
+| `--no-gpu-dense` | OpenCL: in generation, use the GPU only for experts (attention, convolutions and output on the CPU) |
+| `--no-gpu`, `--d3d12`, `--vulkan`, `--vulkan-device N` | the options before `--gpu`, still accepted with their old meaning ([Choosing the GPU](#choosing-the-gpu)) |
 | `--kernels K` | force the CPU kernels: `auto`, `scalar` or `avx` (the set for CPUs without AVX2) |
 | `--prefetch` / `--no-prefetch` | expert read-ahead (default: on when the model exceeds the free RAM) |
 | `--mlock` | try to lock the model in RAM |
@@ -755,6 +764,32 @@ checkpoint and only processes the rest:
 | `--mcp FILE` | MCP servers to start (default `./mcp.json` if present) |
 | `--read-only`, `--no-web`, `--no-tools` | no `write_file`, no web tools, no tools at all |
 | `--tools-list`, `--tool NAME [JSON]` | list / run one tool without loading the model |
+
+### Choosing the GPU
+`--gpu` says which backend does the work; `--list-gpus` shows the devices of each, and
+`--gpu-device N` picks one (otherwise the dedicated GPU with the most memory).
+
+| `--gpu` | What runs on the GPU | Best for |
+|---|---|---|
+| `auto` (default) | dense models (LFM3): the whole forward pass through Vulkan, on a **discrete NVIDIA GPU** only; models with experts (24B), or without such a GPU: OpenCL as below, on a dedicated GPU; otherwise the CPU | not having to choose |
+| `vulkan` | the whole forward pass of dense models; the matmuls of models with experts (Windows, Linux; experimental) | LFM3, fastest generation measured |
+| `d3d12` | the same through Direct3D 12 (Windows; Xbox in Game mode) | LFM3 on Windows, the Xbox |
+| `opencl` | hot experts and all dense layers in VRAM, the other experts on the CPU in parallel | the 24B MoE model |
+| `opencl+vulkan`, `opencl+d3d12` | OpenCL as above, with the prompt matmuls on the other backend | long prompts with MoE models |
+| `off` (`--cpu`) | nothing | machines without a usable GPU |
+
+Why the two models differ: the 24B model (14.5 GB) does not fit in a 4 GB GPU, and only the OpenCL
+backend keeps the most used experts in VRAM; Vulkan and Direct3D 12 hold the dense layers only and
+leave the experts, most of the work, on the CPU. LFM3 fits whole, and there the
+whole-pass backends are 3–5 times faster on the prompt. `auto` uses Vulkan only on NVIDIA, the
+vendor it has been measured on; on integrated GPUs it stays off, since the CPU is faster there (on
+the reference laptop's Intel UHD: 8.5 tokens per second of generation against 17.7 on the CPU).
+When a backend asked for explicitly cannot start, Pithos says why and runs on the CPU; it never
+switches to another backend on its own.
+
+The options before `--gpu` keep working with their old meaning: OpenCL by default, `--no-gpu`
+turned it off, `--d3d12` and `--vulkan` added a backend. So `--no-gpu --vulkan` is `--gpu vulkan`,
+`--d3d12` alone is `--gpu opencl+d3d12`, and `--no-gpu` alone is `--cpu`.
 
 The chat template is the one in the GGUF:
 `<|startoftext|><|im_start|>user\n…<|im_end|>\n<|im_start|>assistant\n<think>`.

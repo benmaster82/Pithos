@@ -253,7 +253,7 @@ static int list_devices(CLApi *cl, DevInfo *out, int cap) {
 
 void gpu_list_devices(void) {
     CLApi cl;
-    if (!cl_load(&cl)) { printf("OpenCL not available\n"); return; }
+    if (!cl_load(&cl)) { printf("  OpenCL not available\n"); return; }
     DevInfo d[32];
     int n = list_devices(&cl, d, 32);
     for (int i = 0; i < n; i++)

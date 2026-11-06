@@ -36,7 +36,8 @@ typedef struct {
     int agent, agent_auto, yolo, max_steps, agent_think;
     int threads, n_ctx, n_batch, n_predict;
     int interactive, raw, bench, show_think, keep_think, prefetch, mlock, stats, verbose, ids;
-    int gpu, gpu_device, gpu_mem, gpu_dense, d3d12, vulkan, vk_device;
+    int gpu_auto, gpu_use;      /* --gpu auto (decided once the model is known) / the USE_* backends */
+    int gpu_device, gpu_mem, gpu_dense, vk_device;
     int bench_pp, bench_tg;
     int think_budget;           /* THINK_FULL / THINK_OFF / reasoning tokens (--reasoning) */
     SamplerParams sp;
@@ -192,14 +193,21 @@ static void usage(void) {
         "      --prefetch, --no-prefetch\n"
         "                          background read-ahead of experts (default: on if the model exceeds free RAM)\n"
         "      --mlock             try to lock the whole model in RAM\n"
-        "      --no-gpu            CPU only (default: hot experts cached on a dedicated OpenCL GPU)\n"
-        "      --gpu-device N      use OpenCL device N (see --list-gpus; integrated GPUs too)\n"
-        "      --gpu-mem MB        VRAM budget (default: VRAM - 900 MB)\n"
-        "      --no-gpu-dense      keep attention/convolution/output on the CPU (GPU only for experts)\n"
-        "      --list-gpus         list OpenCL and Vulkan devices and exit\n"
-        "      --d3d12             run on a Direct3D 12 GPU (Windows; Xbox in Game mode)\n"
-        "      --vulkan            run the matmuls on a Vulkan GPU (Windows, Linux; experimental)\n"
-        "      --vulkan-device N   use Vulkan device N (see --list-gpus; implies --vulkan)\n"
+        "      --gpu B             which GPU backend does the work (default auto):\n"
+        "                            auto    dense models (LFM3): Vulkan on a discrete NVIDIA GPU;\n"
+        "                                    models with experts, or no such GPU: a dedicated OpenCL GPU\n"
+        "                            off     CPU only (same as --cpu)\n"
+        "                            vulkan  the whole forward pass on a Vulkan GPU (Windows, Linux)\n"
+        "                            d3d12   the same on a Direct3D 12 GPU (Windows; Xbox in Game mode)\n"
+        "                            opencl  hot experts and dense layers on an OpenCL GPU\n"
+        "                            opencl+vulkan, opencl+d3d12: OpenCL, with the prompt matmuls on the other\n"
+        "      --cpu               CPU only\n"
+        "      --gpu-device N      device N of the --gpu backend (see --list-gpus; integrated GPUs too)\n"
+        "      --list-gpus         list the OpenCL, Direct3D 12 and Vulkan devices and exit\n"
+        "      --gpu-mem MB        OpenCL: VRAM budget (default: VRAM - 900 MB)\n"
+        "      --no-gpu-dense      OpenCL: keep attention/convolution/output on the CPU (GPU only for experts)\n"
+        "      --no-gpu, --d3d12, --vulkan, --vulkan-device N\n"
+        "                          the options before --gpu, with the same meaning (see README)\n"
         "      --kernels K         force kernels: auto | scalar | avx (no AVX2)\n"
         "      --bench [PP,TG]     benchmark prompt processing and generation (default 128,64)\n"
         "      --tokenize TEXT     print token ids for TEXT and exit\n"
@@ -237,6 +245,62 @@ static void usage(void) {
         "  -h, --help              this help\n");
 }
 
+enum { USE_CL = 1, USE_DX = 2, USE_VK = 4 };
+
+static int gpu_parse(const char *v, int *use) {
+    static const struct { const char *name; int use; } t[] = {
+        {"auto", USE_CL}, {"off", 0}, {"vulkan", USE_VK}, {"d3d12", USE_DX},
+        {"opencl", USE_CL}, {"opencl+vulkan", USE_CL | USE_VK}, {"opencl+d3d12", USE_CL | USE_DX}};
+    for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++)
+        if (!strcmp(v, t[i].name)) { *use = t[i].use; return 1; }
+    return 0;
+}
+
+static void gpu_legacy(Args *a) {
+    if (a->gpu_auto) { a->gpu_auto = 0; a->gpu_use = USE_CL; }
+}
+
+static Gpu *start_cl(const Model *m, Context *ctx, const Args *a, int device, char *info, int len) {
+    char prof[1100];
+    snprintf(prof, sizeof(prof), "%s.pithos-experts", a->model);
+    Gpu *g = gpu_create(m, device, a->gpu_mem, a->n_batch, a->gpu_dense ? a->n_ctx : 0, prof, info, len);
+    if (g) ctx_set_gpu(ctx, g);
+    return g;
+}
+
+/* info: the device, then (after a newline) what runs on it */
+static void add_role(char *info, int len, int whole, const char *more) {
+    const size_t n = strlen(info);
+    if (more[0]) snprintf(info + n, (size_t)len - n, "\n%s%s", whole ? "" : "matmuls only: ", more);
+}
+
+static Dx *start_dx(const Model *m, Context *ctx, int device, char *info, int len) {
+    Dx *d = dx_create(m, device, info, len);
+    if (d) {
+        char more[512] = "";
+        const int whole = ctx_set_dx(ctx, d, more, sizeof(more));
+        add_role(info, len, whole, more);
+    }
+    return d;
+}
+
+static Vulkan *start_vk(const Model *m, Context *ctx, int device, char *info, int len) {
+    Vulkan *v = vk_create(m, device, info, len);
+    if (v) {
+        char more[512] = "";
+        const int whole = ctx_set_vk(ctx, v, more, sizeof(more));
+        add_role(info, len, whole, more);
+    }
+    return v;
+}
+
+/* "GPU: <backend> | <device>", what runs on it on the next line */
+static void print_gpu(const char *backend, const char *info) {
+    const char *nl = strchr(info, '\n');
+    fprintf(stderr, "GPU: %s | %.*s\n", backend, nl ? (int)(nl - info) : (int)strlen(info), info);
+    if (nl) fprintf(stderr, "     %s\n", nl + 1);
+}
+
 static int parse_args(int argc, char **argv, Args *a) {
     memset(a, 0, sizeof(*a));
     a->n_ctx = 8192;
@@ -250,7 +314,7 @@ static int parse_args(int argc, char **argv, Args *a) {
     a->workspace = "workspace";
     a->show_think = 1;
     a->prefetch = -1;
-    a->gpu = 1;
+    a->gpu_auto = 1;
     a->gpu_dense = 1;
     a->gpu_device = -1;
     a->vk_device = -1;
@@ -308,20 +372,33 @@ static int parse_args(int argc, char **argv, Args *a) {
         else if (!strcmp(s, "--keep-think")) a->keep_think = 1;
         else if (!strcmp(s, "--prefetch")) a->prefetch = 1;
         else if (!strcmp(s, "--no-prefetch")) a->prefetch = 0;
-        else if (!strcmp(s, "--no-gpu")) a->gpu = 0;
+        else if (!strcmp(s, "--gpu")) {
+            const char *v = NEXT();
+            if (!gpu_parse(v, &a->gpu_use)) {
+                fprintf(stderr, "--gpu: use auto, off, vulkan, d3d12, opencl, opencl+vulkan or opencl+d3d12 (got %s)\n", v);
+                return 0;
+            }
+            a->gpu_auto = !strcmp(v, "auto");
+        }
+        else if (!strcmp(s, "--cpu")) { a->gpu_auto = 0; a->gpu_use = 0; }
         else if (!strcmp(s, "--no-gpu-dense")) a->gpu_dense = 0;
         else if (!strcmp(s, "--gpu-device")) a->gpu_device = atoi(NEXT());
         else if (!strcmp(s, "--gpu-mem")) a->gpu_mem = atoi(NEXT());
         else if (!strcmp(s, "--list-gpus")) {
-            printf("OpenCL (--gpu-device N):\n");
+            printf("OpenCL (--gpu opencl --gpu-device N):\n");
             gpu_list_devices();
-            printf("Vulkan (--vulkan-device N):\n");
+            printf("Direct3D 12 (--gpu d3d12 --gpu-device N):\n");
+            dx_list_devices();
+            printf("Vulkan (--gpu vulkan --gpu-device N):\n");
             vk_list_devices();
             exit(0);
         }
-        else if (!strcmp(s, "--d3d12")) a->d3d12 = 1;
-        else if (!strcmp(s, "--vulkan")) a->vulkan = 1;
-        else if (!strcmp(s, "--vulkan-device")) { a->vulkan = 1; a->vk_device = atoi(NEXT()); }
+        /* the options before --gpu, with their meaning then: OpenCL by default, --no-gpu turned it
+         * off, --d3d12 / --vulkan added a backend */
+        else if (!strcmp(s, "--no-gpu")) { gpu_legacy(a); a->gpu_use &= ~USE_CL; }
+        else if (!strcmp(s, "--d3d12")) { gpu_legacy(a); a->gpu_use |= USE_DX; }
+        else if (!strcmp(s, "--vulkan")) { gpu_legacy(a); a->gpu_use |= USE_VK; }
+        else if (!strcmp(s, "--vulkan-device")) { gpu_legacy(a); a->gpu_use |= USE_VK; a->vk_device = atoi(NEXT()); }
         else if (!strcmp(s, "--mlock")) a->mlock = 1;
         else if (!strcmp(s, "--kernels")) a->kernels = NEXT();
         else if (!strcmp(s, "--tokenize")) a->tokenize = NEXT();
@@ -731,36 +808,43 @@ static int real_main(int argc, char **argv) {
     ctx_set_prefetch(ctx, a.prefetch);
     if (a.prefetch) fprintf(stderr, "background expert read-ahead: on\n");
     Gpu *gpu = NULL;
-    if (a.gpu) {
-        char ginfo[512], prof[1100];
-        snprintf(prof, sizeof(prof), "%s.pithos-experts", a.model);
-        gpu = gpu_create(&m, a.gpu_device, a.gpu_mem, a.n_batch, a.gpu_dense ? a.n_ctx : 0, prof, ginfo, sizeof(ginfo));
-        fprintf(stderr, "GPU: %s\n", gpu ? ginfo : "not used");
-        if (!gpu && ginfo[0]) fprintf(stderr, "     (%s)\n", ginfo);
-        ctx_set_gpu(ctx, gpu);
-    }
     Dx *dx = NULL;
-    if (a.d3d12) {
-        char dinfo[512];
-        dx = dx_create(&m, dinfo, sizeof(dinfo));
-        fprintf(stderr, "Direct3D 12: %s%s\n", dx ? "" : "not used, ", dinfo);
-        if (dx) {
-            int whole = ctx_set_dx(ctx, dx, dinfo, sizeof(dinfo));
-            if (dinfo[0]) fprintf(stderr, "             %s%s\n", whole ? "" : "matmuls only: ", dinfo);
-        }
-    }
     Vulkan *vk = NULL;
-    if (a.vulkan && dx) {
-        fprintf(stderr, "Vulkan: not used, Direct3D 12 already runs the matmuls (choose one)\n");
-    } else if (a.vulkan) {
-        char vinfo[512];
-        vk = vk_create(&m, a.vk_device, vinfo, sizeof(vinfo));
-        fprintf(stderr, "Vulkan: %s%s\n", vk ? "" : "not used, ", vinfo);
-        if (vk) {
-            int whole = ctx_set_vk(ctx, vk, vinfo, sizeof(vinfo));
-            if (vinfo[0]) fprintf(stderr, "        %s%s\n", whole ? "" : "matmuls only: ", vinfo);
+    char info_cl[1024] = "", info_dx[1024] = "", info_vk[1024] = "";
+    if (a.gpu_auto && a.gpu_device >= 0) { a.gpu_auto = 0; a.gpu_use = USE_CL; }   /* --gpu-device alone: OpenCL, as before */
+    if (a.gpu_auto) {
+        /* a dense model runs whole on a discrete NVIDIA GPU through Vulkan, the fastest path
+         * measured (README); models with experts, or without such a GPU: OpenCL as before */
+        if (!m.n_expert && (vk = start_vk(&m, ctx, VK_AUTO_DEVICE, info_vk, sizeof(info_vk))) != NULL) print_gpu("Vulkan", info_vk);
+        else if ((gpu = start_cl(&m, ctx, &a, -1, info_cl, sizeof(info_cl))) != NULL) print_gpu("OpenCL", info_cl);
+        else if (!m.n_expert) fprintf(stderr, "GPU: none, CPU only (Vulkan: %s; OpenCL: %s)\n", info_vk, info_cl);
+        else fprintf(stderr, "GPU: none, CPU only (OpenCL: %s)\n", info_cl);
+    } else {
+        /* --gpu-device: the device of the one backend named, or of OpenCL in a combination */
+        const int use = a.gpu_use, one = use == USE_CL || use == USE_DX || use == USE_VK;
+        if (use & USE_CL) {
+            gpu = start_cl(&m, ctx, &a, a.gpu_device, info_cl, sizeof(info_cl));
+            if (gpu) print_gpu("OpenCL", info_cl);
+            else fprintf(stderr, "GPU: OpenCL not used (%s)\n", info_cl);
         }
+        if (use & USE_DX) {
+            dx = start_dx(&m, ctx, one ? a.gpu_device : -1, info_dx, sizeof(info_dx));
+            if (dx) print_gpu("Direct3D 12", info_dx);
+            else fprintf(stderr, "GPU: Direct3D 12 not used (%s)\n", info_dx);
+        }
+        if ((use & USE_VK) && dx) {
+            fprintf(stderr, "GPU: Vulkan not used (Direct3D 12 already runs the matmuls: choose one)\n");
+        } else if (use & USE_VK) {
+            const int dev = a.vk_device >= 0 ? a.vk_device : one ? a.gpu_device : -1;
+            vk = start_vk(&m, ctx, dev, info_vk, sizeof(info_vk));
+            if (vk) print_gpu("Vulkan", info_vk);
+            else fprintf(stderr, "GPU: Vulkan not used (%s)\n", info_vk);
+        }
+        if (!gpu && !dx && !vk) fprintf(stderr, "%s", use ? "     running on the CPU\n" : "GPU: off, CPU only\n");
     }
+    char gpu_names[64];
+    snprintf(gpu_names, sizeof(gpu_names), "%s%s%s%s%s", gpu ? "OpenCL" : "", gpu && (dx || vk) ? " + " : "",
+             dx ? "Direct3D 12" : "", vk ? "Vulkan" : "", gpu || dx || vk ? "" : "no");
 
     Engine e;
     memset(&e, 0, sizeof(e));
@@ -793,7 +877,7 @@ static int real_main(int argc, char **argv) {
         if (a.cache_mb > 0)
             fprintf(stderr, "prompt reuse: %d stored conversations in %s\n", pcache_n_files(pc), cache_dir);
         snprintf(info, sizeof(info), "%s | %d thread | kernel %s | GPU: %s", si.brand[0] ? si.brand : "CPU", a.threads, kn,
-                 gpu ? "yes" : dx ? "Direct3D 12" : "no");
+                 gpu_names);
         ServerConfig sc;
         memset(&sc, 0, sizeof(sc));
         sc.host = a.host;
