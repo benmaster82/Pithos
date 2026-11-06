@@ -787,6 +787,18 @@ the reference laptop's Intel UHD: 8.5 tokens per second of generation against 17
 When a backend asked for explicitly cannot start, Pithos says why and runs on the CPU; it never
 switches to another backend on its own.
 
+Long contexts also favor Vulkan: OpenCL keeps a larger safety margin of VRAM free (900 MB plus
+512 MB) and moves the dense layers back to the CPU when the KV cache does not fit within it. With
+LFM3 on the 4 GB GTX 1650, OpenCL no longer fits from `-c 81920` (CPU only: 64–68 / 18 tok/s),
+while Vulkan keeps the whole forward pass up to `-c 114688` (212 / 61) and the matmuls beyond
+(`-c 131072`: 170 / 36).
+
+**Other GPUs.** `auto` was measured on the reference laptop only. On AMD or Intel Arc cards it
+chooses OpenCL, because Vulkan has not been tested there; with the 24B model on a GPU with a lot of
+VRAM, `--gpu opencl+vulkan` may read the prompt faster than OpenCL alone. In those cases compare the
+backends on your machine with `--bench` (for example `--gpu vulkan --bench` against
+`--gpu opencl --bench`) and keep the fastest; reports of the numbers are welcome.
+
 The options before `--gpu` keep working with their old meaning: OpenCL by default, `--no-gpu`
 turned it off, `--d3d12` and `--vulkan` added a backend. So `--no-gpu --vulkan` is `--gpu vulkan`,
 `--d3d12` alone is `--gpu opencl+d3d12`, and `--no-gpu` alone is `--cpu`.
