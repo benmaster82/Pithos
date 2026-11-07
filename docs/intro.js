@@ -1,7 +1,7 @@
 'use strict';
-/* Opening scene. Pandora flies through a neural network: the neurons she touches fire, their pulses
-   run forward layer by layer, and each one that reaches the output layer leaves as a token. She
-   speeds up while the counter climbs to the measured speed. Decorative only: no requests, no inference. */
+/* Opening scene. Pandora glides through a neural network: the neurons she passes fire, their pulses
+   run forward layer by layer, and each one that reaches the output layer leaves as a token, while
+   the counter climbs to the measured speed. Kept slow and quiet on purpose. Decorative only: no requests, no inference. */
 (() => {
   const intro = document.querySelector('.intro');
   if (!intro) return;
@@ -15,7 +15,7 @@
   const reduced = matchMedia('(prefers-reduced-motion: reduce)');
   const WORDS = ['Local', 'AI', 'on', 'the', 'laptop', 'you', 'already', 'have', '.', 'No', 'big', 'GPU',
                  'needed', ':', 'just', 'Pithos', '.'];
-  const ENTER = 500, START = 1700, RAMP = 3000, CALM = 7500; // ms from load
+  const ENTER = 400, START = 1200; // ms from load
   const lerp = (a, b, k) => a + (b - a) * Math.min(Math.max(k, 0), 1);
   const el = (name, attrs, parent) => {
     const e = document.createElementNS(SVG, name);
@@ -41,8 +41,8 @@
 
   // Pandora's flight: left to right across the network on a wave, a new wave for every crossing
   const X0 = -70, X1 = 640;
-  let wave = {amp: 95, len: 520, shift: 0};
-  const newWave = () => { wave = {amp: lerp(70, 130, Math.random()), len: lerp(420, 640, Math.random()),
+  let wave = {amp: 30, len: 700, shift: 0};
+  const newWave = () => { wave = {amp: lerp(20, 40, Math.random()), len: lerp(620, 820, Math.random()),
                                    shift: Math.random() * Math.PI * 2}; };
   const waveY = x => CY + wave.amp * Math.sin(2 * Math.PI * (x - X0) / wave.len + wave.shift);
   const place = (x, y, rot, s) =>
@@ -58,9 +58,9 @@
   }
 
   // ---- pulses: a fired neuron passes the signal to one or two neurons of the next layer
-  const flash = (p, delay = 0) => p.glow.animate([{opacity: 0}, {opacity: .95}, {opacity: 0}],
-    {duration: 520, delay, easing: 'ease-out'});
-  let hop = 320;
+  const flash = (p, delay = 0) => p.glow.animate([{opacity: 0}, {opacity: .55}, {opacity: 0}],
+    {duration: 900, delay, easing: 'ease-in-out'});
+  const hop = 520;
   function fire(p, fan) {
     flash(p);
     if (p.layer === layers.length - 1) { emit(p); return; }
@@ -68,16 +68,16 @@
     for (let i = 0; i < fan; i++) {
       if (pulses.childElementCount > 120) return;
       const b = next[Math.floor(Math.random() * next.length)];
-      const dot = el('circle', {class: 'net-pulse', r: 3, cx: 0, cy: 0}, pulses);
+      const dot = el('circle', {class: 'net-pulse', r: 2.4, cx: 0, cy: 0}, pulses);
       dot.animate([{transform: `translate(${p.x}px,${p.y}px)`}, {transform: `translate(${b.x}px,${b.y}px)`}],
-                  {duration: hop, easing: 'ease-in'}).onfinish = () => { dot.remove(); fire(b, 1); };
+                  {duration: hop, easing: 'ease-in-out'}).onfinish = () => { dot.remove(); fire(b, 1); };
     }
   }
 
   let word = 0, lastToken = 0;
   function emit(p) {
     const now = performance.now();
-    if (tokens.childElementCount > 14 || now - lastToken < 150) return;
+    if (tokens.childElementCount > 6 || now - lastToken < 700) return;
     lastToken = now;
     const tint = Math.random();
     const g = el('g', {class: 'intro-token' + (tint < .2 ? ' hot' : tint < .35 ? ' warm' : '')}, tokens);
@@ -87,18 +87,18 @@
     const w = Math.max(22, text.getComputedTextLength() + 16);
     rect.setAttribute('x', String(-w / 2)); rect.setAttribute('y', '-11');
     rect.setAttribute('width', String(w)); rect.setAttribute('height', '22'); rect.setAttribute('rx', '7');
-    const angle = lerp(-0.35, -1.45, Math.random()), reach = lerp(80, 150, Math.random());
+    const angle = lerp(-0.35, -1.45, Math.random()), reach = lerp(60, 110, Math.random());
     const dx = Math.cos(angle) * reach, dy = Math.sin(angle) * reach;
     g.animate([
       {transform: `translate(${p.x}px,${p.y}px) scale(.3)`, opacity: 0},
       {transform: `translate(${p.x + dx * .2}px,${p.y + dy * .2}px) scale(1)`, opacity: 1, offset: .2},
       {transform: `translate(${p.x + dx * .8}px,${p.y + dy * .8}px) scale(1)`, opacity: .9, offset: .75},
       {transform: `translate(${p.x + dx}px,${p.y + dy}px) scale(.95)`, opacity: 0}
-    ], {duration: 1500, easing: 'cubic-bezier(.25,.6,.35,1)'}).onfinish = () => g.remove();
+    ], {duration: 2400, easing: 'ease-out'}).onfinish = () => g.remove();
   }
 
   // ---- the flight
-  const TRAIL = 16;
+  const TRAIL = 10;
   const ghosts = Array.from({length: TRAIL}, (_, i) =>
     el('circle', {class: 'intro-ghost', r: lerp(14, 2, i / TRAIL), opacity: 0}, trail));
   const history = [];
@@ -112,34 +112,32 @@
     const age = now - t0, dt = Math.min(now - last, 50) / 1000;
     last = now;
     if (age >= ENTER) {
-      const ramp = (age - START) / RAMP, calm = age >= CALM;
-      const speed = calm ? 210 : age < START ? 170 : lerp(170, 430, ramp); // px per second
-      hop = calm ? 300 : lerp(320, 150, ramp);
+      const speed = 85; // px per second: one unhurried crossing every 8 seconds
       x += speed * dt;
       if (x > X1) { x = X0; newWave(); history.length = 0; } // out on the right, back in on the left
       const y = waveY(x);
       const slope = (waveY(x + 4) - y) / 4;
       // she grows to full size on her first entrance
       const s = lerp(.5, 1, (age - ENTER) / 900);
-      place(x, y, Math.max(-28, Math.min(28, Math.atan(slope) * 57.3)), s);
+      place(x, y, Math.max(-6, Math.min(6, Math.atan(slope) * 28)), s);
       flyer.setAttribute('opacity', String(Math.min(lerp(0, 1, (x - X0) / 80), lerp(1, 0, (x - 540) / 90))));
       history.unshift({x, y});
       history.length = Math.min(history.length, TRAIL);
       ghosts.forEach((g, i) => {
         const h = history[i];
-        g.setAttribute('opacity', h ? String(lerp(.35, 0, i / TRAIL) * lerp(.5, 1, speed / 430)) : '0');
+        g.setAttribute('opacity', h ? String(lerp(.16, 0, i / TRAIL)) : '0');
         if (h) { g.setAttribute('cx', h.x); g.setAttribute('cy', h.y); }
       });
       // the neurons she brushes past fire
       for (const p of nodes) {
         if (now - p.lit > 450 && (p.x - x) ** 2 + (p.y - y) ** 2 < 46 * 46) {
           p.lit = now;
-          fire(p, Math.random() < .35 ? 2 : 1);
+          fire(p, 1);
         }
       }
     }
     if (age >= START) {
-      const k = (age - START) / 2000;
+      const k = (age - START) / 2600;
       counter.textContent = String(Math.round(target * (1 - Math.pow(1 - Math.min(k, 1), 3))));
     }
     frame = requestAnimationFrame(tick);
