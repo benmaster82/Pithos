@@ -755,7 +755,7 @@ checkpoint and only processes the rest:
 | `--kernels K` | force the CPU kernels: `auto`, `scalar` or `avx` (the set for CPUs without AVX2) |
 | `--prefetch` / `--no-prefetch` | expert read-ahead (default: on when the model exceeds the free RAM) |
 | `--mlock` | try to lock the model in RAM |
-| `--bench [PP,TG]` | benchmark with a per-operation profile |
+| `--bench [PP,TG]` | benchmark with a per-operation profile (the context grows to fit PP unless `--ctx` is given) |
 | `--ppl FILE` | perplexity with the same method as `llama-perplexity` |
 | `--tokenize TEXT` | print the token ids |
 | `--stats`, `-v` | detailed statistics |

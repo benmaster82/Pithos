@@ -304,6 +304,13 @@ static void print_gpu(const char *backend, const char *info) {
     if (nl) fprintf(stderr, "     %s\n", nl + 1);
 }
 
+/* context tokens --bench uses: the prompt pass, or up to 16 prompt tokens plus the generation pass */
+static int bench_need(const Args *a) {
+    const int pp = a->bench_pp > 0 ? a->bench_pp : 0, tg = a->bench_tg > 0 ? a->bench_tg : 0;
+    const int gen = (pp < 16 ? pp : 16) + tg;
+    return pp > gen ? pp : gen;
+}
+
 static int parse_args(int argc, char **argv, Args *a) {
     memset(a, 0, sizeof(*a));
     a->n_ctx = 8192;
@@ -453,6 +460,7 @@ static int parse_args(int argc, char **argv, Args *a) {
     if (a->n_batch > 512) a->n_batch = 512;
     if (a->n_predict < 0) a->n_predict = a->server ? 0 : 4096;
     if ((a->server || a->agent) && !a->ctx_set) a->n_ctx = 16384; /* room for tool results in agent mode */
+    if (a->bench && !a->ctx_set && bench_need(a) > a->n_ctx) a->n_ctx = bench_need(a); /* room for a long --bench prompt */
     if (a->agent) {
         a->server = 0;
         a->shell = 1;
@@ -972,6 +980,11 @@ static int real_main(int argc, char **argv) {
         free(lg); free(ids); free(txt);
     } else if (a.bench) {
         int npp = a.bench_pp, ntg = a.bench_tg;
+        if (bench_need(&a) > a.n_ctx) {
+            fprintf(stderr, "error: --bench %d,%d needs a %d-token context, the context is %d (see --ctx)\n", npp, ntg,
+                    bench_need(&a), a.n_ctx);
+            return 1;
+        }
         int *ids = (int *)malloc(sizeof(int) * (npp > 0 ? npp : 1));
         for (int i = 0; i < npp; i++) ids[i] = 1000 + (i * 7919) % 50000;
         if (gpu) {
