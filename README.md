@@ -38,8 +38,10 @@
 Pithos is an inference engine written from scratch in C11 with **no dependencies**: no external
 libraries at build time, only the operating system API (Win32 or POSIX). It runs GGUF models of
 Liquid AI's LFM2 / LFM2-MoE / LFM3 architectures and is tuned for `LFM2.5-24B-A2B-Q4_K_M.gguf`
-(24 billion parameters, about 2 billion active per token) on an ordinary laptop. The small
-[LFM3-1.7B](#lfm3-17b-small-and-fast) runs too: about 55 tokens per second with the GPU, 20 on the CPU alone.
+(24 billion parameters, about 2 billion active per token) on an ordinary laptop. Two smaller models
+are validated too: [LFM2.5-8B-A1B](#lfm25-8b-a1b-the-middle-ground), a mixture of experts that fits
+in 8 GB of RAM (about 22 tokens per second on the CPU alone), and the small
+[LFM3-1.7B](#lfm3-17b-small-and-fast): about 55 tokens per second with the GPU, 20 on the CPU alone.
 
 **Pithos** is the engine and the server (in the myth, the *pithos* is Pandora's jar: it holds the
 model). **Pandora** is the agent in the web interface.
@@ -105,7 +107,8 @@ ones (Raspberry Pi 3 / 4). Otherwise build from source:
 
 1. **Get the model** (see [Downloading the model](#downloading-the-model) below).
    On Linux, `bash build.sh --download-model` can handle both the build and this download
-   (`--download-model=lfm3-1.7b` for the small model, `--list-models` for the choices).
+   (`--download-model=lfm2.5-8b` or `--download-model=lfm3-1.7b` for the smaller models,
+   `--list-models` for the choices).
 2. **Build.** On Windows run `build.cmd`; on Linux run `bash build.sh`; on macOS run `make`
    (see [Building](#building)). You can compile before downloading the model.
 3. **Run.**
@@ -123,7 +126,15 @@ On Linux / macOS the binary is `build/pithos`, with the same options. For the co
 [Xbox One](#xbox-one): the app is built on a Windows PC and installed over the network.
 
 ### Downloading the model
-Pithos uses the file **`LFM2.5-24B-A2B-Q4_K_M.gguf`** from Liquid AI's public repository
+Three models are validated. Choose by the memory of your computer:
+
+| Model | Download | RAM | Best for |
+|---|---:|---:|---|
+| [LFM2.5-24B-A2B](#downloading-the-model) (the reference, MoE) | 13.5 GiB | 16 GB | the deepest answers; it also runs when the model does not fit in RAM, from disk |
+| [LFM2.5-8B-A1B](#lfm25-8b-a1b-the-middle-ground) (MoE) | 4.8 GiB | 8 GB | a larger model on the CPU: it fits in RAM and generates as fast as LFM3-1.7B there |
+| [LFM3-1.7B](#lfm3-17b-small-and-fast) (dense) | 1.0 GiB | 4 GB | modest hardware, the fastest with a GPU (the whole model in VRAM), the Xbox One |
+
+Pithos uses by default the file **`LFM2.5-24B-A2B-Q4_K_M.gguf`** from Liquid AI's public repository
 [LiquidAI/LFM2.5-24B-A2B-GGUF](https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF). No account
 is needed.
 
@@ -173,6 +184,46 @@ hf download LiquidAI/LFM2.5-24B-A2B-GGUF LFM2.5-24B-A2B-Q4_K_M.gguf --local-dir 
 To check that the file is found and complete, run `build\pithos.exe -p "Hello"` (Linux:
 `build/pithos -p "Hello"`). The first lines report the model (`model: lfm2moe | 40 layers ...`).
 Pithos also rejects a truncated file and names the tensor that is missing.
+
+### LFM2.5-8B-A1B: the middle ground
+[LiquidAI/LFM2.5-8B-A1B](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B) is a mixture of experts like
+the reference model, with the same architecture (`lfm2moe`) and chat format: 8.3 billion parameters,
+1.5 billion active per token, 24 layers (6 attention, 18 convolution) and 4 of 32 experts per token.
+The file fits in the RAM of an 8 GB computer (the process uses about 4 GB), so nothing is read from
+disk while it runs, and on the CPU alone it generates about as fast as LFM3-1.7B. Liquid AI recommends
+it for instructions, tool use and multilingual assistants rather than heavy programming. Like the
+24B model, it reasons before every answer ([reasoning levels](#server-and-web-chat) shorten it).
+
+| LFM2.5-8B-A1B on the reference laptop (`--bench`) | Prompt | Generation |
+|---|---:|---:|
+| CPU only (`--cpu`) | 73 tok/s | 22.5 tok/s |
+| OpenCL (default here): 55% of the experts and the dense layers in VRAM | 80 tok/s | 47 tok/s |
+| **OpenCL, with prompt matmuls on Vulkan (`--gpu opencl+vulkan`)** | **96 tok/s** | **54 tok/s** |
+| Vulkan (`--gpu vulkan`): dense matmuls only, the experts on the CPU | 79 tok/s | 24 tok/s |
+| Intel UHD Graphics (`--gpu vulkan --gpu-device N`) | 63 tok/s | 7.7 tok/s |
+
+llama.cpp b12179 (Vulkan build) on the same laptop: 59 / 17 tok/s on the CPU, 95 / 40 with the
+GTX 1650 and its best setting tried (`-ngl 99 --n-cpu-moe 10`).
+
+```
+build\pithos.exe -m models\LFM2.5-8B-A1B-Q4_K_M.gguf --server --open
+```
+
+| | |
+|---|---|
+| File | `LFM2.5-8B-A1B-Q4_K_M.gguf` from [LiquidAI/LFM2.5-8B-A1B-GGUF](https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF) |
+| Size | 5,155,564,768 bytes (4.8 GiB): keep about 6 GB free on the disk |
+| SHA-256 | `4923ec14f06b968b74d663e5949867d2d9c3bf13a20b8be1a9f9af39989b2bb0` |
+| Direct link | https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/main/LFM2.5-8B-A1B-Q4_K_M.gguf |
+| License | LFM Open License v1.0 (see the model card) |
+
+Download it with the same commands as above (replace the file name and the URL), then pass it
+with `-m`:
+
+```
+build/pithos -m models/LFM2.5-8B-A1B-Q4_K_M.gguf -i
+build/pithos -m models/LFM2.5-8B-A1B-Q4_K_M.gguf --server --open
+```
 
 ### LFM3-1.7B: small and fast
 [LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B) is a 1.7-billion-parameter model
@@ -289,8 +340,9 @@ other package-manager paths still need validation on their distributions.
 bash build.sh --test             # build the C tests and run the shell tests
 bash build.sh --list-models      # the models it can download (models.tsv), without building
 bash build.sh --download-model   # also download/verify the reference 24B model
+bash build.sh --download-model=lfm2.5-8b              # the 8B MoE instead (4.8 GiB)
 bash build.sh --download-model=lfm3-1.7b              # the small model instead (1.0 GiB)
-bash build.sh --download-model=lfm3-1.7b,lfm2.5-24b   # both
+bash build.sh --download-model=lfm3-1.7b,lfm2.5-24b   # two of them
 bash build.sh --no-install       # build without installing anything (offline/CI)
 bash build.sh --yes --test       # allow missing-package installation without prompting
 bash build.sh --native --jobs 4  # optimize for this CPU; not for distributing binaries
@@ -538,8 +590,8 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
      -d '{"messages":[{"role":"user","content":"Hello!"}]}'
 ```
 
-**Reasoning levels.** Neither model has official effort levels: LFM3 has an on/off switch in its
-template (`enable_thinking`), LFM2.5-24B always reasons. Pithos adds the levels as reasoning budgets:
+**Reasoning levels.** None of the models has official effort levels: LFM3 has an on/off switch in its
+template (`enable_thinking`), the LFM2.5 models always reason. Pithos adds the levels as reasoning budgets:
 
 | Level | Behaviour |
 |---|---|
@@ -559,10 +611,16 @@ client to do the same).
 
 The chat template is implemented in C following the Jinja template in the GGUF: system prompt, tools,
 call arguments in the `f(arg='v')` format, and reasoning removed from past turns. `tests/test_server.py`
-compares it with Jinja2 character by character and token by token.
+compares it with Jinja2 character by character and token by token. LFM2.5-8B-A1B ships an earlier
+revision of the LFM2.5 template, and Pithos renders it like the 24B model's newer one: the
+generation starts inside `<think>` (the token the model writes first anyway), quotes and
+backslashes in tool-call arguments are escaped, lists in them are written as JSON, and kept
+reasoning is also read from `reasoning_content`. Against that older template, `test_server.py`
+reports exactly these differences; its arithmetic and raw-completion checks fail with this model too,
+with the same answers llama.cpp gives (it reads "17 per 23" as 17/23).
 
 ### Agent mode
-LFM2.5-24B-A2B and LFM3 are trained to use tools, and can make more than one call per answer.
+LFM2.5-24B-A2B, LFM2.5-8B-A1B and LFM3 are trained to use tools, and can make more than one call per answer.
 LFM2.5 writes calls as `<|tool_call_start|>[f(arg='v')]<|tool_call_end|>`, LFM3 as
 `<tool_call><function=f><parameter=arg>v</parameter></function></tool_call>`; the server turns
 both into OpenAI `tool_calls`, so clients see no difference.
@@ -778,15 +836,16 @@ checkpoint and only processes the rest:
 
 | `--gpu` | What runs on the GPU | Best for |
 |---|---|---|
-| `auto` (default) | dense models (LFM3): the whole forward pass through Vulkan, on a **discrete NVIDIA GPU** only; models with experts (24B), or without such a GPU: OpenCL as below, on a dedicated GPU; otherwise the CPU | not having to choose |
+| `auto` (default) | dense models (LFM3): the whole forward pass through Vulkan, on a **discrete NVIDIA GPU** only; models with experts (LFM2.5-24B and 8B), or without such a GPU: OpenCL as below, on a dedicated GPU; otherwise the CPU | not having to choose |
 | `vulkan` | the whole forward pass of dense models; the matmuls of models with experts (Windows, Linux; experimental) | LFM3, fastest generation measured |
 | `d3d12` | the same through Direct3D 12 (Windows; Xbox in Game mode) | LFM3 on Windows, the Xbox |
-| `opencl` | hot experts and all dense layers in VRAM, the other experts on the CPU in parallel | the 24B MoE model |
-| `opencl+vulkan`, `opencl+d3d12` | OpenCL as above, with the prompt matmuls on the other backend | long prompts with MoE models |
+| `opencl` | hot experts and all dense layers in VRAM, the other experts on the CPU in parallel | the MoE models (LFM2.5-24B, 8B) |
+| `opencl+vulkan`, `opencl+d3d12` | OpenCL as above, with the prompt matmuls on the other backend | long prompts with MoE models; LFM2.5-8B, fastest measured |
 | `off` (`--cpu`) | nothing | machines without a usable GPU |
 
-Why the two models differ: the 24B model (14.5 GB) does not fit in a 4 GB GPU, and only the OpenCL
-backend keeps the most used experts in VRAM; Vulkan and Direct3D 12 hold the dense layers only and
+Why the models differ: the 24B model (14.5 GB) does not fit in a 4 GB GPU, nor does the 8B one
+(5.2 GB), and only the OpenCL backend keeps the most used experts in VRAM (55% of the 8B's experts
+on the 4 GB GTX 1650); Vulkan and Direct3D 12 hold the dense layers only and
 leave the experts, most of the work, on the CPU. LFM3 fits whole, and there the
 whole-pass backends are 3–5 times faster on the prompt. `auto` uses Vulkan only on NVIDIA, the
 vendor it has been measured on; on integrated GPUs it stays off, since the CPU is faster there (on
@@ -820,8 +879,8 @@ without its reasoning is processed again.
 Any GGUF of the `lfm2` (dense), `lfm2moe` or `lfm3` architecture loads, as long as its tensors use
 the supported formats: Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16, F32. BF16, Q2_K, Q3_K and IQ formats are
 not supported. GPU acceleration needs Q4_K / Q6_K weights: MoE models keep their hot experts and
-dense layers in VRAM, dense models (LFM3) all their layers. Validated so far: LFM2.5-24B-A2B and
-LFM3-1.7B.
+dense layers in VRAM, dense models (LFM3) all their layers. Validated so far: LFM2.5-24B-A2B,
+LFM2.5-8B-A1B and LFM3-1.7B.
 
 `lfm3` adds to LFM2: an RMSNorm on the output of every block before the residual sum (sandwich
 norm), a sigmoid gate per head on the attention output, sliding-window attention (256 tokens) on 5
@@ -974,6 +1033,11 @@ for each of the 30 convolution layers.
   vs 3.62 with 1024 (sliding window active). The gap is the int8 activations and the f16 KV cache.
   On the GPU, token by token (`--ppl -b 1`): 4.390 / 3.622 with the f32 kernels, the reference's
   4.390 / 3.621; 4.408 / 3.626 with the int8 (dp4a) ones.
+- LFM2.5-8B-A1B: tokenizer identical to `llama-tokenize` (10,599 tokens of this README);
+  perplexity against `llama-perplexity` b12179 on 3,825 tokens of this README (512-token windows,
+  CPU): 30.52 vs 30.34, a gap like LFM3-1.7B's on the same text (16.15 vs 16.00). On short texts
+  (about 1,000 tokens) MoE perplexity moves by ±2% with rounding alone (scalar against AVX2
+  kernels), so compare on longer ones.
 - `python tests/test_server.py` (with the server running): template against Jinja2, answers,
   streaming, prompt reuse across turns, tool calls, completions, stop strings, errors.
 - `python tests/versus.py [ROUNDS] [llama.cpp|llama.cpp-cuda]`: head-to-head with llama-server

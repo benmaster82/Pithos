@@ -14,7 +14,8 @@ If prerequisites are missing, show the package commands and ask before installin
   --test         Also build the C tests and run test_shell in a temporary folder
   --download-model[=ID[,ID...]]
                  Download/verify models in models/: by default the reference 24B
-                 (13.5 GiB); --download-model=lfm3-1.7b gets the small one (1.0 GiB)
+                 (13.5 GiB); --download-model=lfm2.5-8b the 8B MoE (4.8 GiB),
+                 --download-model=lfm3-1.7b the small one (1.0 GiB)
   --list-models  List the downloadable models (models.tsv) and exit without building
   --native       Optimize for this CPU; do not use for distributable binaries
   --jobs N       Parallel build jobs, 1-256 (default: detected CPU count, max 256)
@@ -391,7 +392,7 @@ print_run_hints() {
         printf 'No model in models/ yet. See the choices with: bash build.sh --list-models\n'
         printf 'then download one, e.g.: bash build.sh --download-model=lfm3-1.7b\n'
     else
-        printf 'The GPU is used when an OpenCL driver is available; --no-gpu runs on the CPU only.\n'
+        printf 'A supported GPU is used automatically (see --list-gpus); --cpu runs on the CPU only.\n'
     fi
 }
 
