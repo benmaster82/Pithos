@@ -27,10 +27,10 @@
   <link rel="stylesheet" href="simple.css">
   <link rel="stylesheet" href="effects.css?v=2">
   <link rel="stylesheet" href="models.css?v=2">
-  <link rel="stylesheet" href="intro.css?v=1">
+  <link rel="stylesheet" href="intro.css?v=2">
   <script src="app.js?v=4" defer></script>
   <script src="effects.js?v=2" defer></script>
-  <script src="intro.js?v=1" defer></script>
+  <script src="intro.js?v=2" defer></script>
 </head>
 <body>
   <svg class="svg-library" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
@@ -78,17 +78,20 @@
             <radialGradient id="intro-light"><stop offset="0" stop-color="#ec5c8c" stop-opacity=".55"/><stop offset=".55" stop-color="#7c5cf6" stop-opacity=".18"/><stop offset="1" stop-color="#7c5cf6" stop-opacity="0"/></radialGradient>
             <radialGradient id="intro-floor"><stop offset="0" stop-color="#7c5cf6" stop-opacity=".35"/><stop offset="1" stop-color="#7c5cf6" stop-opacity="0"/></radialGradient>
             <clipPath id="intro-body-clip"><path d="M166 168C166 186 120 196 106 236C90 282 100 338 156 384L160 396L260 396L264 384C320 338 330 282 314 236C300 196 254 186 254 168Z"/></clipPath>
+            <pattern id="intro-grid" width="12" height="12" patternUnits="userSpaceOnUse"><circle cx="6" cy="6" r=".8" fill="#edf6ff"/></pattern>
             <clipPath id="intro-above-rim"><rect x="-200" y="-300" width="920" height="450"/></clipPath>
           </defs>
           <ellipse cx="210" cy="404" rx="150" ry="16" fill="url(#intro-floor)"/>
           <ellipse class="intro-glow" cx="210" cy="96" rx="96" ry="84" fill="url(#intro-light)"/>
           <g class="intro-jar">
             <ellipse cx="210" cy="151" rx="50" ry="8" fill="#000" class="jar-line"/>
-            <path class="jar-line" d="M112 226C84 214 86 186 122 190M308 226C336 214 334 186 298 190"/>
-            <path d="M166 168C166 186 120 196 106 236C90 282 100 338 156 384L160 396L260 396L264 384C320 338 330 282 314 236C300 196 254 186 254 168Z" fill="url(#intro-body)"/>
-            <g clip-path="url(#intro-body-clip)"><path class="jar-band" d="M96 262Q210 282 324 262M92 304Q210 324 328 304M120 352Q210 368 300 352"/></g>
+            <path class="jar-line" d="M118 232H96V198H124M302 232H324V198H296"/>
+            <circle class="jar-node" cx="96" cy="215" r="4"/><circle class="jar-node" cx="324" cy="215" r="4"/>
+            <path id="intro-body-path" d="M166 168C166 186 120 196 106 236C90 282 100 338 156 384L160 396L260 396L264 384C320 338 330 282 314 236C300 196 254 186 254 168Z" fill="url(#intro-body)"/>
+            <g clip-path="url(#intro-body-clip)"><rect x="80" y="160" width="260" height="240" fill="url(#intro-grid)" opacity=".08"/><g id="intro-net"></g></g>
             <path class="jar-line" d="M166 168C166 186 120 196 106 236C90 282 100 338 156 384L160 396L260 396L264 384C320 338 330 282 314 236C300 196 254 186 254 168"/>
             <rect class="jar-line" x="154" y="150" width="112" height="20" rx="7" fill="#0b1118"/>
+            <g class="jar-leds"><circle cx="176" cy="160" r="2"/><circle cx="193" cy="160" r="2"/><circle cx="210" cy="160" r="2"/><circle cx="227" cy="160" r="2"/><circle cx="244" cy="160" r="2"/></g>
           </g>
           <g id="intro-tokens"></g>
           <g clip-path="url(#intro-above-rim)"><g class="intro-pandora"><g class="float"><image href="assets/pandora-mark.svg" x="152" y="28" width="116" height="116"/></g></g></g>
