@@ -144,7 +144,7 @@ struct Gpu {
     cl_program prog;
     cl_kernel k_gu, k_down;
     int int8, dot, rpw;     /* int8 path and its dot product (DOT_*); rows per lane group (RPW) */
-    int lpr, rows_wg;       /* lanes per row (LPR) and rows per work-group (WG / LPR * RPW) */
+    int lpr, rows_wg, mvwg; /* lanes per row (LPR), rows per work-group (MVWG / LPR * RPW), matvec work-group size */
     cl_ulong local_mem;     /* local memory per work-group (32 KB on AMD GCN) */
     cl_mem arena[MAX_ARENAS];
     int n_arenas, spa, n_slots;
@@ -203,6 +203,9 @@ struct Gpu {
     int lookahead;                         /* 1: queue the next layer behind a user event */
     int eager;                             /* flush after every command */
     cl_kernel k_mv, k_conv, k_silu, k_attn, k_route, k_comb, k_addn;
+    /* PITHOS_GPU_PROFILE: device time of the dense-path kernels, per name and grid size */
+    struct { const char *what; size_t gws; double t; long n; } kp[32];
+    int n_kp;
 };
 
 static int state_load(volatile int *p) {
@@ -512,29 +515,44 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     g->lpr = getenv("PITHOS_GPU_LPR") ? atoi(getenv("PITHOS_GPU_LPR")) : 8;
     if (g->lpr != 8 && g->lpr != 16 && g->lpr != 32 && g->lpr != 64) g->lpr = 8;
     if (g->rpw > g->lpr) g->rpw = g->lpr; /* reduce_rows: one lane per row */
-    g->rows_wg = WG / g->lpr * g->rpw;
+    /* matvec work-groups of 128 threads on Intel, as its Vulkan build (+1.5% on the UHD) */
+    g->mvwg = getenv("PITHOS_GPU_MVWG") ? atoi(getenv("PITHOS_GPU_MVWG")) : dv->vendor == 0x8086 ? 128 : 256;
+    if (g->mvwg != 64 && g->mvwg != 128 && g->mvwg != 256) g->mvwg = 256;
+    if (g->mvwg < g->lpr * 4) g->mvwg = 256; /* QUANT_LOCAL: 4 threads share a 32-block */
+    g->rows_wg = g->mvwg / g->lpr * g->rpw;
     for (;;) {
         /* NV_FENCE: every NVIDIA GPU needs membar.gl for device-wide ordering, whatever the path */
-        snprintf(opts, sizeof(opts), "-cl-mad-enable -DRPW=%d -DLPR=%d%s%s", g->rpw, g->lpr,
+        /* INTEL_MV: the int8 matvecs with 64 values per lane (Intel; PITHOS_GPU_INTELMV=0/1 overrides) */
+        const char *imv = getenv("PITHOS_GPU_INTELMV");
+        const int intel_mv = g->int8 && (imv ? atoi(imv) > 0 : dv->vendor == 0x8086);
+        snprintf(opts, sizeof(opts), "-cl-mad-enable -DRPW=%d -DLPR=%d -DMVWG=%d%s%s%s", g->rpw, g->lpr, g->mvwg,
                  g->dot == DOT_PTX ? " -DUSE_INT8 -DDOT_PTX" : g->dot == DOT_KHR ? " -DUSE_INT8 -DDOT_KHR"
                  : g->dot == DOT_EMU ? " -DUSE_INT8 -DDOT_EMU" : "",
-                 dv->vendor == 0x10DE ? " -DNV_FENCE" : "");
+                 intel_mv ? " -DINTEL_MV" : "", dv->vendor == 0x10DE ? " -DNV_FENCE" : "");
         if (getenv("PITHOS_GPU_CLOPTS")) { /* extra build options, for experiments */
             const size_t n = strlen(opts);
             snprintf(opts + n, sizeof(opts) - n, " %s", getenv("PITHOS_GPU_CLOPTS"));
         }
         if (cl->BuildProgram(g->prog, 1, &g->dev, opts, NULL, NULL) == 0) break;
-        char log[2048] = { 0 };
-        cl->GetProgramBuildInfo(g->prog, g->dev, CL_PROGRAM_BUILD_LOG, sizeof(log) - 1, log, NULL);
+        /* the whole log: a buffer smaller than it gets nothing at all */
+        size_t loglen = 0;
+        cl->GetProgramBuildInfo(g->prog, g->dev, CL_PROGRAM_BUILD_LOG, 0, NULL, &loglen);
+        char *full = (char *)calloc(loglen + 1, 1), log[2048] = { 0 };
+        if (full && cl->GetProgramBuildInfo(g->prog, g->dev, CL_PROGRAM_BUILD_LOG, loglen, full, NULL) == 0) {
+            if (getenv("PITHOS_GPU_BUILDLOG")) fprintf(stderr, "%s\n", full);
+            snprintf(log, sizeof(log), "%s", full);
+        }
+        free(full);
+        const char *lg = log + strspn(log, " \r\n"); /* some drivers start the log with a blank line */
         if (g->dot == DOT_KHR || g->dot == DOT_EMU) {
             /* a driver that lists the extension but cannot compile the path: fall back to f32 */
             fprintf(stderr, "GPU: the %s kernels did not build, using f32 (%.*s)\n", path_name(g->dot),
-                    (int)strcspn(log, "\r\n"), log);
+                    (int)strcspn(lg, "\r\n"), lg);
             g->dot = DOT_NONE;
             g->int8 = 0;
             continue;
         }
-        snprintf(info, infolen, "OpenCL kernel build failed: %.300s", log);
+        snprintf(info, infolen, "OpenCL kernel build failed: %.300s", lg);
         gpu_destroy(g);
         return NULL;
     }
@@ -586,7 +604,9 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
                 g->dense = 1;
                 g->dense_bytes = need;
                 g->lookahead = getenv("PITHOS_GPU_LOOKAHEAD") && atoi(getenv("PITHOS_GPU_LOOKAHEAD")) > 0;
-                g->eager = !getenv("PITHOS_GPU_EAGER") || atoi(getenv("PITHOS_GPU_EAGER")) > 0;
+                /* a flush per command costs Intel's driver ~20 ms per token (UHD LFM3: 8.3 -> 9.9 tok/s
+                 * without); NVIDIA is the same either way */
+                g->eager = getenv("PITHOS_GPU_EAGER") ? atoi(getenv("PITHOS_GPU_EAGER")) > 0 : dv->vendor != 0x8086;
                 budget -= need;
                 snprintf(dense_note, sizeof(dense_note), " | dense layers in VRAM (%.2f GB)", need / 1073741824.0);
             } else {
@@ -612,7 +632,7 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     g->spa = (int)(per_arena / slot);
     if (g->spa < 1) { snprintf(info, infolen, "not enough VRAM"); gpu_destroy(g); return NULL; }
     int want = (int)(budget / slot);
-    if (want > m->n_layer * m->n_expert) want = m->n_layer * m->n_expert;
+    if (want > ok_layers * m->n_expert) want = ok_layers * m->n_expert; /* only MoE layers have experts */
     for (int a = 0; a < MAX_ARENAS && g->n_slots < want; a++) {
         int ns = want - g->n_slots < g->spa ? want - g->n_slots : g->spa;
         g->arena[a] = cl->CreateBuffer(g->ctx, CL_MEM_READ_ONLY, (size_t)ns * slot, NULL, &err);
@@ -699,6 +719,14 @@ void gpu_destroy(Gpu *g) {
         for (int i = 0; i < N_EV; i++) fprintf(stderr, " %s %.1f", names[i], 1e6 * g->ptime[i] / g->pcount);
         fprintf(stderr, "\n");
     }
+    if (g->profiling && g->n_kp) {
+        double tot = 0;
+        for (int i = 0; i < g->n_kp; i++) tot += g->kp[i].t;
+        fprintf(stderr, "GPU dense kernels (device time):\n");
+        for (int i = 0; i < g->n_kp; i++)
+            fprintf(stderr, "  %-12s grid %7zu: %8.1f us x %6ld = %5.1f%%\n", g->kp[i].what, g->kp[i].gws,
+                    1e6 * g->kp[i].t / g->kp[i].n, g->kp[i].n, 100 * g->kp[i].t / tot);
+    }
     if (g->sub_th) {
         lock_acquire(g->sub_lk);
         g->sub_stop = 1;
@@ -777,10 +805,10 @@ static void submit_job(Gpu *g) {
 
     const cl_ulong sb = g->slot_bytes, upo = g->up_off[layer], dno = g->down_off[layer];
     const int gt = g->gate_type[layer], dt = g->down_type[layer];
-    const size_t lws[2] = { WG, 1 };
-    const size_t gws_gu[2] = { (size_t)((F + g->rows_wg - 1) / g->rows_wg) * WG, (size_t)(2 * n_assign) };
-    const size_t gws_dn[2] = { (size_t)((D + g->rows_wg - 1) / g->rows_wg) * WG, (size_t)n_assign };
-    const size_t red_bytes = sizeof(float) * WG * g->rpw;
+    const size_t lws[2] = { (size_t)g->mvwg, 1 };
+    const size_t gws_gu[2] = { (size_t)((F + g->rows_wg - 1) / g->rows_wg) * g->mvwg, (size_t)(2 * n_assign) };
+    const size_t gws_dn[2] = { (size_t)((D + g->rows_wg - 1) / g->rows_wg) * g->mvwg, (size_t)n_assign };
+    const size_t red_bytes = sizeof(float) * g->mvwg * g->rpw;
 
     cl_kernel k = g->k_gu;
     set_slot_args(g, k, &sb);
@@ -1167,8 +1195,20 @@ static void arg(Gpu *g, cl_kernel k, cl_uint i, size_t sz, const void *v) { g->c
 
 static void run1(Gpu *g, cl_kernel k, size_t gws, size_t lws, const char *what) {
     const size_t gw[1] = { gws }, lw[1] = { lws };
-    check(g, g->cl.EnqueueNDRangeKernel(g->q, k, 1, NULL, gw, lws ? lw : NULL, 0, NULL, NULL), what);
+    cl_event ev = NULL;
+    check(g, g->cl.EnqueueNDRangeKernel(g->q, k, 1, NULL, gw, lws ? lw : NULL, 0, NULL, g->profiling ? &ev : NULL), what);
     if (g->eager) g->cl.Flush(g->q); /* the GPU starts while the host queues the next command */
+    if (ev) { /* profiling only: serializes the queue */
+        cl_ulong t0 = 0, t1 = 0;
+        g->cl.Finish(g->q);
+        g->cl.GetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(t0), &t0, NULL);
+        g->cl.GetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(t1), &t1, NULL);
+        g->cl.ReleaseEvent(ev);
+        int i = 0;
+        while (i < g->n_kp && (g->kp[i].what != what || g->kp[i].gws != gws)) i++;
+        if (i == g->n_kp && i < 32) { g->kp[i].what = what; g->kp[i].gws = gws; g->n_kp++; }
+        if (i < 32) { g->kp[i].t += (double)(t1 - t0) * 1e-9; g->kp[i].n++; }
+    }
 }
 
 /* y[y_off[i]..] (+)= W_i x for up to three weights with the same K (Q4_K / Q6_K in VRAM), in one
@@ -1176,7 +1216,7 @@ static void run1(Gpu *g, cl_kernel k, size_t gws, size_t lws, const char *what) 
 static void dense_mv(Gpu *g, int n, const DT *const *w, const int *y_off, cl_mem x, const DT *norm, cl_mem y, int accumulate) {
     cl_kernel k = g->k_mv;
     const int K = w[0]->cols, per = g->rows_wg;
-    const size_t red = sizeof(float) * WG * g->rpw;
+    const size_t red = sizeof(float) * g->mvwg * g->rpw;
     /* the f32 build keeps x in local memory: split long rows (never normalized ones) into
      * chunks that fit next to the reduction buffer, in whole super-blocks; 1 KB stays free
      * for the driver (NVIDIA rejects a launch that takes all 48 KB) */
@@ -1219,7 +1259,7 @@ static void dense_mv(Gpu *g, int n, const DT *const *w, const int *y_off, cl_mem
             arg(g, k, 19, sizeof(float) * (size_t)klen, NULL);
             arg(g, k, 20, red, NULL);
         }
-        run1(g, k, wgs * WG, WG, "matvec");
+        run1(g, k, wgs * g->mvwg, g->mvwg, "matvec");
     }
 }
 
@@ -1381,10 +1421,10 @@ static void dense_enqueue_layer(Gpu *g, int l) {
     /* resident experts: the same kernels as the prompt path, on this token only */
     const cl_ulong sb = g->slot_bytes, upo = g->up_off[l], dno = g->down_off[l];
     const int gt = g->gate_type[l], dt = g->down_type[l];
-    const size_t lws[2] = { WG, 1 };
-    const size_t gws_gu[2] = { (size_t)((F + g->rows_wg - 1) / g->rows_wg) * WG, (size_t)(2 * K) };
-    const size_t gws_dn[2] = { (size_t)((D + g->rows_wg - 1) / g->rows_wg) * WG, (size_t)K };
-    const size_t red_bytes = sizeof(float) * WG * g->rpw;
+    const size_t lws[2] = { (size_t)g->mvwg, 1 };
+    const size_t gws_gu[2] = { (size_t)((F + g->rows_wg - 1) / g->rows_wg) * g->mvwg, (size_t)(2 * K) };
+    const size_t gws_dn[2] = { (size_t)((D + g->rows_wg - 1) / g->rows_wg) * g->mvwg, (size_t)K };
+    const size_t red_bytes = sizeof(float) * g->mvwg * g->rpw;
     k = g->k_gu;
     for (int a = 0; a < MAX_ARENAS; a++) ARGM(k, (cl_uint)a, g->arena[a]);
     ARGI(k, 4, g->spa);

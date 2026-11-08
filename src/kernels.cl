@@ -19,7 +19,11 @@
 #ifndef LPR
 #define LPR 32
 #endif
-#define GPR (WG / LPR) /* row groups per work-group */
+/* MVWG: work-group size of the matvec kernels (moe_gate_up, moe_down, matvec); the others use WG */
+#ifndef MVWG
+#define MVWG WG
+#endif
+#define GPR (MVWG / LPR) /* row groups per work-group */
 
 inline float h2f(__global const uchar *p) { return vload_half(0, (__global const half *)p); }
 
@@ -101,7 +105,7 @@ inline float wg_max(__local float *red, float v) {
     float ns = 1.f;                                                                            \
     if (has_norm) {                                                                            \
         float ss = 0.f;                                                                        \
-        for (int i = lid; i < K; i += WG) ss += x[i] * x[i];                                   \
+        for (int i = lid; i < K; i += MVWG) ss += x[i] * x[i];                                 \
         ns = rsqrt(wg_sum(red, ss) / K + eps);                                                 \
     }                                                                                          \
     const ulong rb = row_bytes(wt, K), skip = row_bytes(wt, k0);                               \
@@ -130,6 +134,90 @@ inline int dp4a(uint a, int b, int c) {
 }
 #endif
 
+#ifdef INTEL_MV
+/* Intel build (as the Vulkan one): every lane takes a 64-value piece of a super-block (32 weight
+ * bytes) per step, so the scales and d / dmin are decoded once per 64 weights instead of 32, and
+ * the 12 scale bytes come in as three words. x stays in plain order in local memory. */
+inline int swz8(int b) { return b; }
+#define XQ(off) vload4(0, (__local const int *)(xq + (off)))
+
+/* scales and mins (s1, s2, m1, m2) of sub-blocks 2p and 2p+1 from the 12 scale bytes */
+inline uint4 scales_pair(uint3 sc, int p) {
+    const uint sh = (uint)(p & 1) * 16, hx = sc.x >> sh, hy = sc.y >> sh, hz = sc.z >> sh;
+    if (p < 2) return (uint4)(hx & 63, (hx >> 8) & 63, hy & 63, (hy >> 8) & 63);
+    return (uint4)((hz & 15) | (((hx >> 6) & 3) << 4), ((hz >> 8) & 15) | (((hx >> 14) & 3) << 4),
+                   ((hz >> 4) & 15) | (((hy >> 6) & 3) << 4), ((hz >> 12) & 15) | (((hy >> 14) & 3) << 4));
+}
+
+#define DOT4(W_, X_, A_) A_ = dp4a((W_).x, (X_).x, A_); A_ = dp4a((W_).y, (X_).y, A_); \
+                         A_ = dp4a((W_).z, (X_).z, A_); A_ = dp4a((W_).w, (X_).w, A_);
+#define SUM4(X_, A_) A_ = dp4a(0x01010101u, (X_).x, A_); A_ = dp4a(0x01010101u, (X_).y, A_); \
+                     A_ = dp4a(0x01010101u, (X_).z, A_); A_ = dp4a(0x01010101u, (X_).w, A_);
+
+/* piece p of block i: sub-block 2p (low nibbles of qs[32p..32p+31]) and 2p+1 (high nibbles) */
+inline float dot_q4k(__global const uchar *row, __local const char *xq, __local const float *xd, int nb, int lane) {
+    float acc = 0.f;
+    for (int t = lane; t < nb * 4; t += LPR) {
+        const int i = t >> 2, p = t & 3;
+        __global const uchar *b = row + i * 144;
+        const uint4 sm = scales_pair(vload3(0, (__global const uint *)(b + 4)), p);
+        const uint4 q0 = vload4(0, (__global const uint *)(b + 16 + 32 * p));
+        const uint4 q1 = vload4(1, (__global const uint *)(b + 16 + 32 * p));
+        const int f = i * 256 + 64 * p;
+        const int4 l0 = XQ(f), l1 = XQ(f + 16), h0 = XQ(f + 32), h1 = XQ(f + 48);
+        int d1 = 0, d2 = 0, n1 = 0, n2 = 0;
+        DOT4(q0 & 0x0F0F0F0Fu, l0, d1) DOT4(q1 & 0x0F0F0F0Fu, l1, d1)
+        DOT4((q0 >> 4) & 0x0F0F0F0Fu, h0, d2) DOT4((q1 >> 4) & 0x0F0F0F0Fu, h1, d2)
+        SUM4(l0, n1) SUM4(l1, n1) SUM4(h0, n2) SUM4(h1, n2)
+        const float dl = xd[f >> 5], dh = xd[(f >> 5) + 1];
+        const float d = vload_half(0, (__global const half *)b), dmin = vload_half(1, (__global const half *)b);
+        acc += d * (dl * (float)((int)sm.x * d1) + dh * (float)((int)sm.y * d2)) -
+               dmin * (dl * (float)((int)sm.z * n1) + dh * (float)((int)sm.w * n2));
+    }
+    return acc;
+}
+
+/* 32 bytes at p as 8 words. Q6_K blocks are 210 bytes, so every other one is only 2-byte aligned:
+ * read 9 aligned words and shift by 16 bits instead of 2-byte loads (slow on Intel); the ninth
+ * word is still inside the block for every piece read here */
+inline void load32_a2(__global const uchar *p, uint4 *w0, uint4 *w1) {
+    const uint s = (uint)((size_t)p & 2) * 8; /* 0 or 16 */
+    __global const uint *q = (__global const uint *)(p - (s >> 3));
+    const uint4 u0 = vload4(0, q), u1 = vload4(1, q);
+    const uint4 n0 = (uint4)(u0.y, u0.z, u0.w, u1.x), n1 = (uint4)(u1.y, u1.z, u1.w, q[8]);
+    *w0 = (u0 >> s) | ((n0 << 16) << (16 - s));
+    *w1 = (u1 >> s) | ((n1 << 16) << (16 - s));
+}
+
+/* piece p of block i: half h = p / 2, ql bytes [64h + 32a, +32) with a = p % 2: the low nibbles
+ * give values 128h + 32a + l, the high ones 128h + 64 + 32a + l; scales change every 16 values */
+inline float dot_q6k(__global const uchar *row, __local const char *xq, __local const float *xd, int nb, int lane) {
+    float acc = 0.f;
+    for (int t = lane; t < nb * 4; t += LPR) {
+        const int i = t >> 2, h = (t & 3) >> 1, a = t & 1;
+        __global const uchar *b = row + i * 210;
+        uint4 ql0, ql1, qh0, qh1;
+        load32_a2(b + 64 * h + 32 * a, &ql0, &ql1);
+        load32_a2(b + 128 + 32 * h, &qh0, &qh1);
+        const uint s1 = 2u * (uint)a, s2 = s1 + 4u;
+        const uint4 v10 = (ql0 & 0x0F0F0F0Fu) | (((qh0 >> s1) & 0x03030303u) << 4);
+        const uint4 v11 = (ql1 & 0x0F0F0F0Fu) | (((qh1 >> s1) & 0x03030303u) << 4);
+        const uint4 v20 = ((ql0 >> 4) & 0x0F0F0F0Fu) | (((qh0 >> s2) & 0x03030303u) << 4);
+        const uint4 v21 = ((ql1 >> 4) & 0x0F0F0F0Fu) | (((qh1 >> s2) & 0x03030303u) << 4);
+        const int f1 = i * 256 + 128 * h + 32 * a, f2 = f1 + 64;
+        const int4 x10 = XQ(f1), x11 = XQ(f1 + 16), x20 = XQ(f2), x21 = XQ(f2 + 16);
+        int d10 = 0, d11 = 0, d20 = 0, d21 = 0, m10 = 0, m11 = 0, m20 = 0, m21 = 0;
+        DOT4(v10, x10, d10) DOT4(v11, x11, d11) DOT4(v20, x20, d20) DOT4(v21, x21, d21)
+        SUM4(x10, m10) SUM4(x11, m11) SUM4(x20, m20) SUM4(x21, m21)
+        __global const char *sc = (__global const char *)(b + 192);
+        const int j1 = 2 * (4 * h + a), j2 = j1 + 4; /* scale index of the first 16 values */
+        const float d = vload_half(0, (__global const half *)(b + 208));
+        acc += d * (xd[f1 >> 5] * (float)(sc[j1] * (d10 - 32 * m10) + sc[j1 + 1] * (d11 - 32 * m11)) +
+                    xd[f2 >> 5] * (float)(sc[j2] * (d20 - 32 * m20) + sc[j2 + 1] * (d21 - 32 * m21)));
+    }
+    return acc;
+}
+#else
 /* int8 activations in local memory: 16-byte units are permuted inside every 128-byte block so
  * the 8 lanes of a quarter-warp read distinct banks (both Q4_K and Q6_K layouts). */
 inline int swz8(int b) { return ((((b >> 4) ^ (((b >> 7) & 1) * 6))) << 4) | (b & 15); }
@@ -209,6 +297,8 @@ inline float dot_q6k(__global const uchar *row, __local const char *xq, __local 
     return acc;
 }
 
+#endif /* INTEL_MV */
+
 inline float dot_row(int type, __global const uchar *row, __local const char *xq, __local const float *xd, int K, int lane) {
     return type == 12 ? dot_q4k(row, xq, xd, K / 256, lane) : dot_q6k(row, xq, xd, K / 256, lane);
 }
@@ -222,7 +312,7 @@ inline float dot_row(int type, __global const uchar *row, __local const char *xq
 /* every thread takes 8 consecutive values; 4 neighbouring threads share a 32-block and combine
  * their maxima through `red` (free until reduce_rows) */
 #define QUANT_LOCAL(N, EXPR)                                                        \
-    for (int base = 0; base < (N); base += WG * 8) {                                \
+    for (int base = 0; base < (N); base += MVWG * 8) {                              \
         const int e0 = base + lid * 8;                                              \
         float v[8], am = 0.f;                                                       \
         if (e0 < (N))                                                               \
@@ -239,8 +329,8 @@ inline float dot_row(int type, __global const uchar *row, __local const char *xq
         barrier(CLK_LOCAL_MEM_FENCE);                                               \
     }
 
-/* gate and up projections for every (expert, token) assignment: grid (ceil(F / (8*RPW)) * WG, 2 * n_assign) */
-__kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
+/* gate and up projections for every (expert, token) assignment: grid (ceil(F / (GPR * RPW)) * MVWG, 2 * n_assign) */
+__kernel __attribute__((reqd_work_group_size(MVWG, 1, 1)))
 void moe_gate_up(__global const uchar *A0, __global const uchar *A1, __global const uchar *A2, __global const uchar *A3,
                  int spa, ulong slot_bytes, __global const int *meta, int max_assign, int K, int F, ulong up_off,
                  int wtype, __global float *gu, __local int *xqi, __local float *xd, __local float *red,
@@ -262,8 +352,8 @@ void moe_gate_up(__global const uchar *A0, __global const uchar *A1, __global co
     reduce_rows(red, lid, lane, grp, acc, gu + ((ulong)a * 2 + which) * F, row0, F, 0);
 }
 
-/* SiLU(gate)*up quantized in local memory, then the down projection: grid (ceil(D / (8*RPW)) * WG, n_assign) */
-__kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
+/* SiLU(gate)*up quantized in local memory, then the down projection: grid (ceil(D / (GPR * RPW)) * MVWG, n_assign) */
+__kernel __attribute__((reqd_work_group_size(MVWG, 1, 1)))
 void moe_down(__global const uchar *A0, __global const uchar *A1, __global const uchar *A2, __global const uchar *A3,
               int spa, ulong slot_bytes, __global const int *meta, int F, int D, ulong down_off, int wtype,
               __global const float *gu, __global float *Y, __local int *xqi, __local float *xd, __local float *red) {
@@ -285,8 +375,8 @@ void moe_down(__global const uchar *A0, __global const uchar *A1, __global const
 }
 
 /* y[row] (+)= W[row] . x over the K-range [k0, k0 + klen): dense layers kept in VRAM.
- * grid: sum over the segments of ceil(rows / (8*RPW)) * WG */
-__kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
+ * grid: sum over the segments of ceil(rows / (GPR * RPW)) * MVWG */
+__kernel __attribute__((reqd_work_group_size(MVWG, 1, 1)))
 void matvec(MV_ARGS, __local int *xqi, __local float *xd, __local float *red) {
     __local char *xq = (__local char *)xqi;
     MV_PROLOGUE
@@ -370,7 +460,7 @@ inline float dot_row(int type, __global const uchar *row, __local const float *x
 #define META_SLOTS(meta) (meta)
 #define META_XIDX(meta, ma) ((meta) + (ma))
 
-__kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
+__kernel __attribute__((reqd_work_group_size(MVWG, 1, 1)))
 void moe_gate_up(__global const uchar *A0, __global const uchar *A1, __global const uchar *A2, __global const uchar *A3,
                  int spa, ulong slot_bytes, __global const int *meta, int max_assign, int K, int F, ulong up_off,
                  int wtype, __global float *gu, __local float *xl, __local float *red,
@@ -379,7 +469,7 @@ void moe_gate_up(__global const uchar *A0, __global const uchar *A1, __global co
     const int ek = get_group_id(1), a = ek >> 1, which = ek & 1;
     if (META_SLOTS(meta)[a] < 0) return;
     __global const float *x = X + x_off + (ulong)META_XIDX(meta, max_assign)[a] * K;
-    for (int i = lid; i < K; i += WG) xl[swz(i)] = x[i];
+    for (int i = lid; i < K; i += MVWG) xl[swz(i)] = x[i];
     barrier(CLK_LOCAL_MEM_FENCE);
     __global const uchar *base = slot_ptr(A0, A1, A2, A3, META_SLOTS(meta)[a], spa, slot_bytes) + (which ? up_off : 0);
     const ulong rb = row_bytes(wtype, K);
@@ -392,7 +482,7 @@ void moe_gate_up(__global const uchar *A0, __global const uchar *A1, __global co
     reduce_rows(red, lid, lane, grp, acc, gu + ((ulong)a * 2 + which) * F, row0, F, 0);
 }
 
-__kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
+__kernel __attribute__((reqd_work_group_size(MVWG, 1, 1)))
 void moe_down(__global const uchar *A0, __global const uchar *A1, __global const uchar *A2, __global const uchar *A3,
               int spa, ulong slot_bytes, __global const int *meta, int F, int D, ulong down_off, int wtype,
               __global const float *gu, __global float *Y, __local float *al, __local float *red) {
@@ -400,7 +490,7 @@ void moe_down(__global const uchar *A0, __global const uchar *A1, __global const
     const int a = get_group_id(1);
     if (META_SLOTS(meta)[a] < 0) return;
     __global const float *g = gu + (ulong)a * 2 * F;
-    for (int i = lid; i < F; i += WG) {
+    for (int i = lid; i < F; i += MVWG) {
         const float gv = g[i];
         al[swz(i)] = gv / (1.f + exp(-gv)) * g[F + i];
     }
@@ -415,10 +505,10 @@ void moe_down(__global const uchar *A0, __global const uchar *A1, __global const
     }
     reduce_rows(red, lid, lane, grp, acc, Y + (ulong)a * D, row0, D, 0);
 }
-__kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
+__kernel __attribute__((reqd_work_group_size(MVWG, 1, 1)))
 void matvec(MV_ARGS, __local float *xl, __local float *red) {
     MV_PROLOGUE
-    for (int i = lid; i < klen; i += WG) xl[swz(i)] = XIN(i);
+    for (int i = lid; i < klen; i += MVWG) xl[swz(i)] = XIN(i);
     barrier(CLK_LOCAL_MEM_FENCE);
     float acc[RPW];
     for (int r = 0; r < RPW; r++) {
