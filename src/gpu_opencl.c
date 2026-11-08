@@ -1,8 +1,9 @@
 /* gpu_opencl.c - expert co-processor on any OpenCL 1.2+ GPU.
  *
  * Nothing is linked at build time: the OpenCL ICD loader (OpenCL.dll / libOpenCL.so) is opened
- * at runtime and the kernels (src/kernels.cl, embedded) are compiled by the driver. On NVIDIA
- * GPUs with compute capability >= 6.1 an int8/dp4a path is used, elsewhere an f32 path.
+ * at runtime and the kernels (src/kernels.cl, embedded) are compiled by the driver. GPUs with an
+ * int8 dot product (NVIDIA sm_61+ through PTX, others through cl_khr_integer_dot_product) and
+ * Intel GPUs (emulated) use an int8 path, the rest an f32 path.
  *
  * VRAM layout: fixed-size slots (gate | up | down of one expert) inside up to 4 arenas
  * (OpenCL caps single allocations, typically at 1/4 of VRAM). A background thread uploads
@@ -40,12 +41,21 @@ typedef void *cl_platform_id, *cl_device_id, *cl_context, *cl_command_queue, *cl
 #define CL_DEVICE_HOST_UNIFIED_MEMORY 0x1035
 #define CL_DEVICE_COMPUTE_CAPABILITY_MAJOR_NV 0x4000
 #define CL_DEVICE_COMPUTE_CAPABILITY_MINOR_NV 0x4001
+#define CL_DEVICE_WARP_SIZE_NV 0x4003
+#define CL_DEVICE_WAVEFRONT_WIDTH_AMD 0x4043
+#define CL_DEVICE_SUB_GROUP_SIZES_INTEL 0x4108
+#define CL_DEVICE_VERSION 0x102F
+#define CL_DEVICE_EXTENSIONS 0x1030
+#define CL_DEVICE_INTEGER_DOT_PRODUCT_CAPABILITIES_KHR 0x1073
+#define CL_DEVICE_INTEGER_DOT_PRODUCT_ACCELERATION_PROPERTIES_4x8BIT_PACKED_KHR 0x1075
+#define CL_DEVICE_INTEGER_DOT_PRODUCT_INPUT_4x8BIT_PACKED_KHR (1 << 0)
 #define CL_MEM_READ_WRITE (1 << 0)
 #define CL_MEM_READ_ONLY (1 << 2)
 #define CL_MEM_ALLOC_HOST_PTR (1 << 4)
 #define CL_MAP_READ (1 << 0)
 #define CL_MAP_WRITE (1 << 1)
 #define CL_QUEUE_PROFILING_ENABLE (1 << 1)
+#define CL_EVENT_COMMAND_EXECUTION_STATUS 0x11D3
 #define CL_PROGRAM_BUILD_LOG 0x1183
 #define CL_PROFILING_COMMAND_START 0x1282
 #define CL_PROFILING_COMMAND_END 0x1283
@@ -133,7 +143,8 @@ struct Gpu {
     cl_command_queue q, qup;
     cl_program prog;
     cl_kernel k_gu, k_down;
-    int dp4a, rpw;          /* rows per 32-lane group (passed to kernels.cl as RPW) */
+    int int8, dot, rpw;     /* int8 path and its dot product (DOT_*); rows per lane group (RPW) */
+    int lpr, rows_wg;       /* lanes per row (LPR) and rows per work-group (WG / LPR * RPW) */
     cl_ulong local_mem;     /* local memory per work-group (32 KB on AMD GCN) */
     cl_mem arena[MAX_ARENAS];
     int n_arenas, spa, n_slots;
@@ -222,7 +233,72 @@ static void check(Gpu *g, cl_int e, const char *what) {
 
 /* ------------------------------------------------------------------ device discovery */
 
-typedef struct { cl_device_id id; char name[128]; cl_ulong mem, maxalloc; int unified, gpu; } DevInfo;
+/* what the kernels can use, read from the driver rather than guessed from the vendor:
+ * dot = the int8 dot product (DOT_PTX: NVIDIA sm_61+ via inline PTX; DOT_KHR: cl_khr_integer_dot_product,
+ * hardware accelerated; DOT_KHR_SLOW: the extension without acceleration, used only on request) */
+enum { DOT_NONE = 0, DOT_PTX, DOT_KHR, DOT_KHR_SLOW, DOT_EMU };
+enum { SG_NONE = 0, SG_KHR, SG_INTEL };
+typedef struct {
+    cl_device_id id;
+    char name[128], ver[64], sg_sizes[32];
+    cl_ulong mem, maxalloc;
+    cl_uint vendor, simd;   /* simd: the hardware SIMD width when the driver reports it (warp, wavefront) */
+    int unified, gpu, dot, khr, sg; /* khr: cl_khr_integer_dot_product (DOT_KHR / DOT_KHR_SLOW, or 0) */
+} DevInfo;
+
+static int has_ext(const char *exts, const char *name) {
+    const size_t n = strlen(name);
+    for (const char *p = exts; (p = strstr(p, name)) != NULL; p += n)
+        if ((p == exts || p[-1] == ' ') && (p[n] == ' ' || p[n] == 0)) return 1;
+    return 0;
+}
+
+static void query_caps(CLApi *cl, DevInfo *di) {
+    cl_device_id d = di->id;
+    cl->GetDeviceInfo(d, CL_DEVICE_VENDOR_ID, sizeof(di->vendor), &di->vendor, NULL);
+    cl->GetDeviceInfo(d, CL_DEVICE_VERSION, sizeof(di->ver) - 1, di->ver, NULL);
+    size_t len = 0;
+    cl->GetDeviceInfo(d, CL_DEVICE_EXTENSIONS, 0, NULL, &len);
+    char *exts = (char *)calloc(len + 1, 1);
+    if (exts && len) cl->GetDeviceInfo(d, CL_DEVICE_EXTENSIONS, len, exts, NULL);
+    const char *e = exts ? exts : "";
+    if (di->vendor == 0x10DE) {
+        cl_uint major = 0, minor = 0;
+        if (cl->GetDeviceInfo(d, CL_DEVICE_COMPUTE_CAPABILITY_MAJOR_NV, sizeof(major), &major, NULL) == 0 &&
+            cl->GetDeviceInfo(d, CL_DEVICE_COMPUTE_CAPABILITY_MINOR_NV, sizeof(minor), &minor, NULL) == 0 &&
+            (major > 6 || (major == 6 && minor >= 1)))
+            di->dot = DOT_PTX;
+        cl->GetDeviceInfo(d, CL_DEVICE_WARP_SIZE_NV, sizeof(di->simd), &di->simd, NULL);
+    }
+    if (has_ext(e, "cl_khr_integer_dot_product")) {
+        cl_ulong caps = 0;
+        cl_uint acc[6] = { 0 }; /* cl_device_integer_dot_product_acceleration_properties_khr */
+        cl->GetDeviceInfo(d, CL_DEVICE_INTEGER_DOT_PRODUCT_CAPABILITIES_KHR, sizeof(caps), &caps, NULL);
+        if (caps & CL_DEVICE_INTEGER_DOT_PRODUCT_INPUT_4x8BIT_PACKED_KHR) {
+            cl->GetDeviceInfo(d, CL_DEVICE_INTEGER_DOT_PRODUCT_ACCELERATION_PROPERTIES_4x8BIT_PACKED_KHR, sizeof(acc), acc, NULL);
+            di->khr = acc[2] ? DOT_KHR : DOT_KHR_SLOW; /* mixed signedness: unsigned weights, signed x */
+        }
+    }
+    if (!di->dot) di->dot = di->khr;
+    if (has_ext(e, "cl_intel_subgroups")) {
+        di->sg = SG_INTEL;
+        size_t sz[8] = { 0 }, got = 0;
+        if (cl->GetDeviceInfo(d, CL_DEVICE_SUB_GROUP_SIZES_INTEL, sizeof(sz), sz, &got) == 0) {
+            char *p = di->sg_sizes;
+            for (size_t i = 0; i < got / sizeof(size_t) && i < 8; i++)
+                p += snprintf(p, (size_t)(di->sg_sizes + sizeof(di->sg_sizes) - p), "%s%u", i ? "/" : "", (unsigned)sz[i]);
+        }
+    } else if (has_ext(e, "cl_khr_subgroups")) {
+        di->sg = SG_KHR;
+    }
+    if (di->vendor == 0x1002) cl->GetDeviceInfo(d, CL_DEVICE_WAVEFRONT_WIDTH_AMD, sizeof(di->simd), &di->simd, NULL);
+    free(exts);
+}
+
+static const char *dot_name(int dot) {
+    return dot == DOT_PTX ? "dp4a (PTX)" : dot == DOT_KHR ? "cl_khr_integer_dot_product"
+         : dot == DOT_KHR_SLOW ? "cl_khr_integer_dot_product, not accelerated" : "none";
+}
 
 static int list_devices(CLApi *cl, DevInfo *out, int cap) {
     cl_platform_id plats[8];
@@ -246,6 +322,7 @@ static int list_devices(CLApi *cl, DevInfo *out, int cap) {
             cl_ulong type = 0;
             cl->GetDeviceInfo(devs[d], CL_DEVICE_TYPE, sizeof(type), &type, NULL);
             di->gpu = (type & CL_DEVICE_TYPE_GPU) != 0;
+            query_caps(cl, di);
         }
     }
     return n;
@@ -256,19 +333,32 @@ void gpu_list_devices(void) {
     if (!cl_load(&cl)) { printf("  OpenCL not available\n"); return; }
     DevInfo d[32];
     int n = list_devices(&cl, d, 32);
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
         printf("  [%d] %s | %llu MB | %s%s\n", i, d[i].name, (unsigned long long)(d[i].mem >> 20),
                d[i].gpu ? "GPU" : "other", d[i].unified ? " integrated (shared memory)" : " dedicated");
+        char sg[64] = "no", simd[32] = "";
+        if (d[i].sg == SG_INTEL) snprintf(sg, sizeof(sg), "Intel%s%s", d[i].sg_sizes[0] ? " " : "", d[i].sg_sizes);
+        else if (d[i].sg == SG_KHR) snprintf(sg, sizeof(sg), "yes");
+        if (d[i].simd) snprintf(simd, sizeof(simd), " | SIMD %u", d[i].simd);
+        printf("      %s | int8 dot: %s%s | subgroups: %s%s\n", d[i].ver, dot_name(d[i].dot),
+               d[i].dot == DOT_PTX && d[i].khr ? " (cl_khr_integer_dot_product too)" : "", sg, simd);
+    }
 }
 
-/* NVIDIA compute capability >= 6.1 has dp4a; reachable from OpenCL through inline PTX */
-static int device_has_dp4a(CLApi *cl, cl_device_id dev) {
-    cl_uint vendor = 0, major = 0, minor = 0;
-    cl->GetDeviceInfo(dev, CL_DEVICE_VENDOR_ID, sizeof(vendor), &vendor, NULL);
-    if (vendor != 0x10DE) return 0;
-    if (cl->GetDeviceInfo(dev, CL_DEVICE_COMPUTE_CAPABILITY_MAJOR_NV, sizeof(major), &major, NULL) != 0) return 0;
-    if (cl->GetDeviceInfo(dev, CL_DEVICE_COMPUTE_CAPABILITY_MINOR_NV, sizeof(minor), &minor, NULL) != 0) return 0;
-    return major > 6 || (major == 6 && minor >= 1);
+/* the int8 dot product the kernels will use; PITHOS_GPU_DOT=ptx|khr|emu|f32 overrides it (tests) */
+static int pick_dot(const DevInfo *dv) {
+    const char *env = getenv("PITHOS_GPU_DOT");
+    if (getenv("PITHOS_GPU_NODP4A") || (env && !strcmp(env, "f32"))) return DOT_NONE;
+    if (env && !strcmp(env, "khr")) return dv->khr ? DOT_KHR : DOT_NONE;
+    if (env && !strcmp(env, "ptx")) return dv->dot == DOT_PTX ? DOT_PTX : DOT_NONE;
+    if (env && !strcmp(env, "emu")) return DOT_EMU;
+    if (dv->dot == DOT_PTX || dv->dot == DOT_KHR) return dv->dot;
+    /* Intel without an int8 dot product (Gen9 UHD): emulated int8 beats f32 (LFM3 tg 4.7 -> 6.4) */
+    return dv->vendor == 0x8086 ? DOT_EMU : DOT_NONE;
+}
+
+static const char *path_name(int dot) {
+    return dot == DOT_PTX ? "int8/dp4a" : dot == DOT_KHR ? "int8/khr dot" : dot == DOT_EMU ? "int8/emulated dot" : "f32";
 }
 
 /* ------------------------------------------------------------------ uploader */
@@ -410,17 +500,40 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     if (!g->q || !g->qup) { snprintf(info, infolen, "creating the OpenCL queues failed (%d)", err); gpu_destroy(g); return NULL; }
 
     /* kernels */
-    g->dp4a = device_has_dp4a(cl, g->dev) && !getenv("PITHOS_GPU_NODP4A");
+    g->dot = pick_dot(dv);
+    g->int8 = g->dot != DOT_NONE;
     const char *src = KERNELS_CL;
     size_t srclen = strlen(src);
     g->prog = cl->CreateProgramWithSource(g->ctx, 1, &src, &srclen, &err);
     char opts[256];
     g->rpw = getenv("PITHOS_GPU_RPW") ? atoi(getenv("PITHOS_GPU_RPW")) : 4;
     if (g->rpw < 1 || g->rpw > 32) g->rpw = 4;
-    snprintf(opts, sizeof(opts), "-cl-mad-enable -DRPW=%d%s", g->rpw, g->dp4a ? " -DUSE_DP4A" : "");
-    if (cl->BuildProgram(g->prog, 1, &g->dev, opts, NULL, NULL) != 0) {
+    /* 8 lanes per row: generation +8-10% on the GTX 1650 (LFM3, 8B), +30% on the Intel UHD */
+    g->lpr = getenv("PITHOS_GPU_LPR") ? atoi(getenv("PITHOS_GPU_LPR")) : 8;
+    if (g->lpr != 8 && g->lpr != 16 && g->lpr != 32 && g->lpr != 64) g->lpr = 8;
+    if (g->rpw > g->lpr) g->rpw = g->lpr; /* reduce_rows: one lane per row */
+    g->rows_wg = WG / g->lpr * g->rpw;
+    for (;;) {
+        /* NV_FENCE: every NVIDIA GPU needs membar.gl for device-wide ordering, whatever the path */
+        snprintf(opts, sizeof(opts), "-cl-mad-enable -DRPW=%d -DLPR=%d%s%s", g->rpw, g->lpr,
+                 g->dot == DOT_PTX ? " -DUSE_INT8 -DDOT_PTX" : g->dot == DOT_KHR ? " -DUSE_INT8 -DDOT_KHR"
+                 : g->dot == DOT_EMU ? " -DUSE_INT8 -DDOT_EMU" : "",
+                 dv->vendor == 0x10DE ? " -DNV_FENCE" : "");
+        if (getenv("PITHOS_GPU_CLOPTS")) { /* extra build options, for experiments */
+            const size_t n = strlen(opts);
+            snprintf(opts + n, sizeof(opts) - n, " %s", getenv("PITHOS_GPU_CLOPTS"));
+        }
+        if (cl->BuildProgram(g->prog, 1, &g->dev, opts, NULL, NULL) == 0) break;
         char log[2048] = { 0 };
         cl->GetProgramBuildInfo(g->prog, g->dev, CL_PROGRAM_BUILD_LOG, sizeof(log) - 1, log, NULL);
+        if (g->dot == DOT_KHR || g->dot == DOT_EMU) {
+            /* a driver that lists the extension but cannot compile the path: fall back to f32 */
+            fprintf(stderr, "GPU: the %s kernels did not build, using f32 (%.*s)\n", path_name(g->dot),
+                    (int)strcspn(log, "\r\n"), log);
+            g->dot = DOT_NONE;
+            g->int8 = 0;
+            continue;
+        }
         snprintf(info, infolen, "OpenCL kernel build failed: %.300s", log);
         gpu_destroy(g);
         return NULL;
@@ -492,7 +605,7 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
             return NULL;
         }
         g->lk = lock_create(); /* no expert cache: only take_uploads uses it */
-        snprintf(info, infolen, "%s | %s | all layers in VRAM (%.2f GB)", dv->name, g->dp4a ? "int8/dp4a" : "f32",
+        snprintf(info, infolen, "%s | %s | all layers in VRAM (%.2f GB)", dv->name, path_name(g->dot),
                  g->dense_bytes / 1073741824.0);
         return g;
     }
@@ -573,7 +686,7 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     gpu_rebalance(g, g->n_slots);
     double gb = (double)g->n_slots * slot / 1073741824.0;
     snprintf(info, infolen, "%s | %s | %d expert slots (%.2f GB VRAM, %.0f%% of the experts)%s", dv->name,
-             g->dp4a ? "int8/dp4a" : "f32", g->n_slots, gb, 100.0 * g->n_slots / (ok_layers * m->n_expert), dense_note);
+             path_name(g->dot), g->n_slots, gb, 100.0 * g->n_slots / (ok_layers * m->n_expert), dense_note);
     g->st.slots = g->n_slots;
     return g;
 }
@@ -665,8 +778,8 @@ static void submit_job(Gpu *g) {
     const cl_ulong sb = g->slot_bytes, upo = g->up_off[layer], dno = g->down_off[layer];
     const int gt = g->gate_type[layer], dt = g->down_type[layer];
     const size_t lws[2] = { WG, 1 };
-    const size_t gws_gu[2] = { (size_t)((F + 8 * g->rpw - 1) / (8 * g->rpw)) * WG, (size_t)(2 * n_assign) };
-    const size_t gws_dn[2] = { (size_t)((D + 8 * g->rpw - 1) / (8 * g->rpw)) * WG, (size_t)n_assign };
+    const size_t gws_gu[2] = { (size_t)((F + g->rows_wg - 1) / g->rows_wg) * WG, (size_t)(2 * n_assign) };
+    const size_t gws_dn[2] = { (size_t)((D + g->rows_wg - 1) / g->rows_wg) * WG, (size_t)n_assign };
     const size_t red_bytes = sizeof(float) * WG * g->rpw;
 
     cl_kernel k = g->k_gu;
@@ -678,7 +791,7 @@ static void submit_job(Gpu *g) {
     cl->SetKernelArg(k, 11, sizeof(int), &gt);
     cl->SetKernelArg(k, 12, sizeof(cl_mem), &g->d_gu);
     const cl_ulong x_off = 2 * (cl_ulong)g->max_assign; /* x follows slots and xidx in meta */
-    if (g->dp4a) {
+    if (g->int8) {
         cl->SetKernelArg(k, 13, (size_t)D, NULL);                      /* int8 x */
         cl->SetKernelArg(k, 14, sizeof(float) * (D / 32), NULL);       /* block scales */
         cl->SetKernelArg(k, 15, red_bytes, NULL);
@@ -700,7 +813,7 @@ static void submit_job(Gpu *g) {
     cl->SetKernelArg(k, 10, sizeof(int), &dt);
     cl->SetKernelArg(k, 11, sizeof(cl_mem), &g->d_gu);
     cl->SetKernelArg(k, 12, sizeof(cl_mem), &g->d_y);
-    if (g->dp4a) {
+    if (g->int8) {
         cl->SetKernelArg(k, 13, (size_t)F, NULL);
         cl->SetKernelArg(k, 14, sizeof(float) * (F / 32), NULL);
         cl->SetKernelArg(k, 15, red_bytes, NULL);
@@ -850,8 +963,6 @@ int gpu_pending(Gpu *g) {
  * resident: after each MoE router the GPU sends the hidden state and the top-k choice to the
  * host (8 KB), runs its resident experts while the CPU computes the others, and adds the CPU
  * part when it arrives. */
-
-#define CL_EVENT_COMMAND_EXECUTION_STATUS 0x11D3
 
 static size_t dense_rows_bytes(const Mat *w) { return w->expert_stride; }
 
@@ -1064,14 +1175,14 @@ static void run1(Gpu *g, cl_kernel k, size_t gws, size_t lws, const char *what) 
  * launch; norm != NULL: x is RMS-normalized with those weights first */
 static void dense_mv(Gpu *g, int n, const DT *const *w, const int *y_off, cl_mem x, const DT *norm, cl_mem y, int accumulate) {
     cl_kernel k = g->k_mv;
-    const int K = w[0]->cols, per = 8 * g->rpw;
+    const int K = w[0]->cols, per = g->rows_wg;
     const size_t red = sizeof(float) * WG * g->rpw;
     /* the f32 build keeps x in local memory: split long rows (never normalized ones) into
      * chunks that fit next to the reduction buffer, in whole super-blocks; 1 KB stays free
      * for the driver (NVIDIA rejects a launch that takes all 48 KB) */
     int fit = (int)((g->local_mem - red - 1024) / sizeof(float)) & ~255;
     if (fit > 8192) fit = 8192;
-    const int kmax = g->dp4a || norm || fit >= K ? K : fit;
+    const int kmax = g->int8 || norm || fit >= K ? K : fit;
     cl_int wt[4] = { 0 }, rows[4] = { 0 }, yo[4] = { 0 };
     size_t wgs = 0;
     for (int i = 0; i < 3; i++) {
@@ -1100,7 +1211,7 @@ static void dense_mv(Gpu *g, int n, const DT *const *w, const int *y_off, cl_mem
         ARGI(k, 10, k0);
         ARGI(k, 11, klen);
         ARGI(k, 18, accumulate || k0 > 0);
-        if (g->dp4a) {
+        if (g->int8) {
             arg(g, k, 19, (size_t)((klen + 15) & ~15), NULL);
             arg(g, k, 20, sizeof(float) * (size_t)(klen / 32 + 1), NULL);
             arg(g, k, 21, red, NULL);
@@ -1271,8 +1382,8 @@ static void dense_enqueue_layer(Gpu *g, int l) {
     const cl_ulong sb = g->slot_bytes, upo = g->up_off[l], dno = g->down_off[l];
     const int gt = g->gate_type[l], dt = g->down_type[l];
     const size_t lws[2] = { WG, 1 };
-    const size_t gws_gu[2] = { (size_t)((F + 8 * g->rpw - 1) / (8 * g->rpw)) * WG, (size_t)(2 * K) };
-    const size_t gws_dn[2] = { (size_t)((D + 8 * g->rpw - 1) / (8 * g->rpw)) * WG, (size_t)K };
+    const size_t gws_gu[2] = { (size_t)((F + g->rows_wg - 1) / g->rows_wg) * WG, (size_t)(2 * K) };
+    const size_t gws_dn[2] = { (size_t)((D + g->rows_wg - 1) / g->rows_wg) * WG, (size_t)K };
     const size_t red_bytes = sizeof(float) * WG * g->rpw;
     k = g->k_gu;
     for (int a = 0; a < MAX_ARENAS; a++) ARGM(k, (cl_uint)a, g->arena[a]);
@@ -1285,7 +1396,7 @@ static void dense_enqueue_layer(Gpu *g, int l) {
     ARGU(k, 10, upo);
     ARGI(k, 11, gt);
     ARGM(k, 12, g->dgu2);
-    if (g->dp4a) {
+    if (g->int8) {
         arg(g, k, 13, (size_t)D, NULL);
         arg(g, k, 14, sizeof(float) * (D / 32), NULL);
         arg(g, k, 15, red_bytes, NULL);
@@ -1309,7 +1420,7 @@ static void dense_enqueue_layer(Gpu *g, int l) {
     ARGI(k, 10, dt);
     ARGM(k, 11, g->dgu2);
     ARGM(k, 12, g->dy2);
-    if (g->dp4a) {
+    if (g->int8) {
         arg(g, k, 13, (size_t)F, NULL);
         arg(g, k, 14, sizeof(float) * (F / 32), NULL);
         arg(g, k, 15, red_bytes, NULL);

@@ -2,17 +2,24 @@
  * Embedded into the binary as src/kernels_cl.h (tools/embed.py); compiled by the driver.
  *
  * Two paths:
- *  - USE_DP4A (NVIDIA sm_61+, via inline PTX): activations quantized to int8 in 32-blocks,
- *    weight nibbles/6-bit values multiplied with dp4a (4 MACs per instruction).
+ *  - USE_INT8: activations quantized to int8 in 32-blocks, weight nibbles/6-bit values
+ *    multiplied 4 at a time; DOT_PTX: NVIDIA sm_61+ dp4a via inline PTX, DOT_KHR: the
+ *    standard cl_khr_integer_dot_product (Intel Xe/Arc, AMD and others that accelerate it),
+ *    DOT_EMU: plain integer multiplies (Intel GPUs without either, faster than f32 there).
  *  - default: f32 activations in local memory (any OpenCL 1.2 GPU).
  *
- * Work layout: a 32-lane group computes RPW rows; 8 lanes share a super-block and each lane
- * takes 16 consecutive weight bytes, so a group consumes 4 super-blocks per iteration. */
+ * Work layout: a group of LPR lanes computes RPW rows; 8 lanes share a super-block and each lane
+ * takes 16 consecutive weight bytes, so a group consumes LPR / 8 super-blocks per iteration.
+ * The host passes LPR = 8: faster than 32 on the GTX 1650 and the Intel UHD alike. */
 
 #define WG 256
 #ifndef RPW
 #define RPW 4
 #endif
+#ifndef LPR
+#define LPR 32
+#endif
+#define GPR (WG / LPR) /* row groups per work-group */
 
 inline float h2f(__global const uchar *p) { return vload_half(0, (__global const half *)p); }
 
@@ -36,15 +43,15 @@ inline void reduce_rows(__local float *red, int lid, int lane, int grp, float *a
     barrier(CLK_LOCAL_MEM_FENCE);
     if (lane < RPW) {
         float s = 0.f;
-        for (int j = 0; j < 32; j++) s += red[(grp * 32 + j) * RPW + lane];
-        const int row = row0 + lane * (WG / 32);
+        for (int j = 0; j < LPR; j++) s += red[(grp * LPR + j) * RPW + lane];
+        const int row = row0 + lane * GPR;
         if (row < nrows) out[row] = accumulate ? out[row] + s : s;
     }
 }
 
 /* orders this work-item's global writes for the other work-groups (OpenCL 1.2 has no device
  * scope; NVIDIA needs membar.gl, which mem_fence does not emit) */
-#ifdef USE_DP4A
+#ifdef NV_FENCE
 #define DEVICE_FENCE() asm volatile("membar.gl;" ::: "memory")
 #else
 #define DEVICE_FENCE() mem_fence(CLK_GLOBAL_MEM_FENCE)
@@ -82,8 +89,8 @@ inline float wg_max(__local float *red, float v) {
     ulong w_off2, int4 wtype, int4 rows, int4 y_off, int K, int k0, int klen, __global const float *x,                    \
     __global const uchar *NA, int has_norm, ulong nw_off, float eps, __global float *y, int accumulate
 #define MV_PROLOGUE                                                                            \
-    const int lid = get_local_id(0), lane = lid & 31, grp = lid >> 5;                          \
-    const int4 nwg = (rows + 8 * RPW - 1) / (8 * RPW);                                         \
+    const int lid = get_local_id(0), lane = lid % LPR, grp = lid / LPR;                        \
+    const int4 nwg = (rows + GPR * RPW - 1) / (GPR * RPW);                                     \
     int gid = get_group_id(0), seg = 0;                                                        \
     if (gid >= nwg.x) { gid -= nwg.x; seg = 1; if (gid >= nwg.y) { gid -= nwg.y; seg = 2; } }  \
     __global const uchar *W = seg == 0 ? W0 + w_off0 : (seg == 1 ? W1 + w_off1 : W2 + w_off2); \
@@ -98,17 +105,30 @@ inline float wg_max(__local float *red, float v) {
         ns = rsqrt(wg_sum(red, ss) / K + eps);                                                 \
     }                                                                                          \
     const ulong rb = row_bytes(wt, K), skip = row_bytes(wt, k0);                               \
-    const int row0 = gid * (WG / 32) * RPW + grp;
+    const int row0 = gid * GPR * RPW + grp;
 #define XIN(i) (has_norm ? x[k0 + (i)] * ns * nw[k0 + (i)] : x[k0 + (i)])
 
-#ifdef USE_DP4A
-/* ======================================================================= int8 / dp4a path */
+#ifdef USE_INT8
+/* ======================================================================= int8 path */
 
+/* c + dot(4 unsigned bytes of a, 4 signed bytes of b) */
+#ifdef DOT_PTX
 inline int dp4a(uint a, int b, int c) {
     int r;
     asm("dp4a.u32.s32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
     return r;
 }
+#elif defined(DOT_KHR)
+#pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
+inline int dp4a(uint a, int b, int c) { return c + dot_4x8packed_us_int(a, as_uint(b)); }
+#else
+/* DOT_EMU: no int8 dot product in hardware; still cheaper than the f32 path on some GPUs (Intel) */
+inline int dp4a(uint a, int b, int c) {
+    const uchar4 u = as_uchar4(a);
+    const char4 v = as_char4(b);
+    return c + (int)u.x * v.x + (int)u.y * v.y + (int)u.z * v.z + (int)u.w * v.w;
+}
+#endif
 
 /* int8 activations in local memory: 16-byte units are permuted inside every 128-byte block so
  * the 8 lanes of a quarter-warp read distinct banks (both Q4_K and Q6_K layouts). */
@@ -118,7 +138,7 @@ inline int swz8(int b) { return ((((b >> 4) ^ (((b >> 7) & 1) * 6))) << 4) | (b 
 inline float dot_q4k(__global const uchar *row, __local const char *xq, __local const float *xd, int nb, int lane) {
     float acc = 0.f;
     const int sbl = lane >> 3, p8 = lane & 7, c = p8 >> 1, o = (p8 & 1) * 16;
-    for (int i = sbl; i < nb; i += 4) {
+    for (int i = sbl; i < nb; i += LPR / 8) {
         __global const uchar *b = row + i * 144;
         const float d = h2f(b), dmin = h2f(b + 2);
         float s0, m0, s1, m1;
@@ -163,7 +183,7 @@ inline float dot_q6k(__global const uchar *row, __local const char *xq, __local 
     const int sbl = lane >> 3, p8 = lane & 7, n = p8 >> 2, j = (p8 & 3) * 16, hi = j >> 5, jj = j & 31;
     const uint sh = 2u * (uint)hi;
     const int sidx = 8 * n + (jj >> 4) + 2 * hi;
-    for (int i = sbl; i < nb; i += 4) {
+    for (int i = sbl; i < nb; i += LPR / 8) {
         __global const uchar *b = row + i * 210;
         const float d = h2f(b + 208);
         __global const char *sc = (__global const char *)(b + 192);
@@ -226,17 +246,17 @@ void moe_gate_up(__global const uchar *A0, __global const uchar *A1, __global co
                  int wtype, __global float *gu, __local int *xqi, __local float *xd, __local float *red,
                  __global const float *X, ulong x_off) {
     __local char *xq = (__local char *)xqi;
-    const int lid = get_local_id(0), lane = lid & 31, grp = lid >> 5;
+    const int lid = get_local_id(0), lane = lid % LPR, grp = lid / LPR;
     const int ek = get_group_id(1), a = ek >> 1, which = ek & 1;
     if (META_SLOTS(meta)[a] < 0) return; /* expert computed by the CPU */
     __global const float *x = X + x_off + (ulong)META_XIDX(meta, max_assign)[a] * K;
     QUANT_LOCAL(K, x[i])
     __global const uchar *base = slot_ptr(A0, A1, A2, A3, META_SLOTS(meta)[a], spa, slot_bytes) + (which ? up_off : 0);
     const ulong rb = row_bytes(wtype, K);
-    const int row0 = get_group_id(0) * (WG / 32) * RPW + grp;
+    const int row0 = get_group_id(0) * GPR * RPW + grp;
     float acc[RPW];
     for (int r = 0; r < RPW; r++) {
-        const int row = row0 + r * (WG / 32);
+        const int row = row0 + r * GPR;
         acc[r] = row < F ? dot_row(wtype, base + (ulong)row * rb, xq, xd, K, lane) : 0.f;
     }
     reduce_rows(red, lid, lane, grp, acc, gu + ((ulong)a * 2 + which) * F, row0, F, 0);
@@ -248,17 +268,17 @@ void moe_down(__global const uchar *A0, __global const uchar *A1, __global const
               int spa, ulong slot_bytes, __global const int *meta, int F, int D, ulong down_off, int wtype,
               __global const float *gu, __global float *Y, __local int *xqi, __local float *xd, __local float *red) {
     __local char *xq = (__local char *)xqi;
-    const int lid = get_local_id(0), lane = lid & 31, grp = lid >> 5;
+    const int lid = get_local_id(0), lane = lid % LPR, grp = lid / LPR;
     const int a = get_group_id(1);
     if (META_SLOTS(meta)[a] < 0) return;
     __global const float *g = gu + (ulong)a * 2 * F;
     QUANT_LOCAL(F, g[i] / (1.f + exp(-g[i])) * g[F + i])
     __global const uchar *base = slot_ptr(A0, A1, A2, A3, META_SLOTS(meta)[a], spa, slot_bytes) + down_off;
     const ulong rb = row_bytes(wtype, F);
-    const int row0 = get_group_id(0) * (WG / 32) * RPW + grp;
+    const int row0 = get_group_id(0) * GPR * RPW + grp;
     float acc[RPW];
     for (int r = 0; r < RPW; r++) {
-        const int row = row0 + r * (WG / 32);
+        const int row = row0 + r * GPR;
         acc[r] = row < D ? dot_row(wtype, base + (ulong)row * rb, xq, xd, F, lane) : 0.f;
     }
     reduce_rows(red, lid, lane, grp, acc, Y + (ulong)a * D, row0, D, 0);
@@ -273,7 +293,7 @@ void matvec(MV_ARGS, __local int *xqi, __local float *xd, __local float *red) {
     QUANT_LOCAL(klen, XIN(i))
     float acc[RPW];
     for (int r = 0; r < RPW; r++) {
-        const int row = row0 + r * (WG / 32);
+        const int row = row0 + r * GPR;
         acc[r] = row < nrows ? dot_row(wt, W + (ulong)row * rb + skip, xq, xd, klen, lane) : 0.f;
     }
     reduce_rows(red, lid, lane, grp, acc, y + yo, row0, nrows, accumulate);
@@ -297,7 +317,7 @@ inline int swz(int f) {
 inline float dot_q4k(__global const uchar *row, __local const float *x, int nb, int lane) {
     float acc = 0.f;
     const int sbl = lane >> 3, p8 = lane & 7, c = p8 >> 1, o = (p8 & 1) * 16;
-    for (int i = sbl; i < nb; i += 4) {
+    for (int i = sbl; i < nb; i += LPR / 8) {
         __global const uchar *b = row + i * 144;
         const float d = h2f(b), dmin = h2f(b + 2);
         float s0, m0, s1, m1;
@@ -328,7 +348,7 @@ inline float dot_q6k(__global const uchar *row, __local const float *x, int nb, 
     const int sbl = lane >> 3, p8 = lane & 7, n = p8 >> 2, j = (p8 & 3) * 16, hi = j >> 5, jj = j & 31;
     const uint sh = 2u * (uint)hi;
     const int sidx = 8 * n + (jj >> 4) + 2 * hi;
-    for (int i = sbl; i < nb; i += 4) {
+    for (int i = sbl; i < nb; i += LPR / 8) {
         __global const uchar *b = row + i * 210;
         const float d = h2f(b + 208);
         __global const char *sc = (__global const char *)(b + 192);
@@ -355,7 +375,7 @@ void moe_gate_up(__global const uchar *A0, __global const uchar *A1, __global co
                  int spa, ulong slot_bytes, __global const int *meta, int max_assign, int K, int F, ulong up_off,
                  int wtype, __global float *gu, __local float *xl, __local float *red,
                  __global const float *X, ulong x_off) {
-    const int lid = get_local_id(0), lane = lid & 31, grp = lid >> 5;
+    const int lid = get_local_id(0), lane = lid % LPR, grp = lid / LPR;
     const int ek = get_group_id(1), a = ek >> 1, which = ek & 1;
     if (META_SLOTS(meta)[a] < 0) return;
     __global const float *x = X + x_off + (ulong)META_XIDX(meta, max_assign)[a] * K;
@@ -363,10 +383,10 @@ void moe_gate_up(__global const uchar *A0, __global const uchar *A1, __global co
     barrier(CLK_LOCAL_MEM_FENCE);
     __global const uchar *base = slot_ptr(A0, A1, A2, A3, META_SLOTS(meta)[a], spa, slot_bytes) + (which ? up_off : 0);
     const ulong rb = row_bytes(wtype, K);
-    const int row0 = get_group_id(0) * (WG / 32) * RPW + grp;
+    const int row0 = get_group_id(0) * GPR * RPW + grp;
     float acc[RPW];
     for (int r = 0; r < RPW; r++) {
-        const int row = row0 + r * (WG / 32);
+        const int row = row0 + r * GPR;
         acc[r] = row < F ? dot_row(wtype, base + (ulong)row * rb, xl, K, lane) : 0.f;
     }
     reduce_rows(red, lid, lane, grp, acc, gu + ((ulong)a * 2 + which) * F, row0, F, 0);
@@ -376,7 +396,7 @@ __kernel __attribute__((reqd_work_group_size(WG, 1, 1)))
 void moe_down(__global const uchar *A0, __global const uchar *A1, __global const uchar *A2, __global const uchar *A3,
               int spa, ulong slot_bytes, __global const int *meta, int F, int D, ulong down_off, int wtype,
               __global const float *gu, __global float *Y, __local float *al, __local float *red) {
-    const int lid = get_local_id(0), lane = lid & 31, grp = lid >> 5;
+    const int lid = get_local_id(0), lane = lid % LPR, grp = lid / LPR;
     const int a = get_group_id(1);
     if (META_SLOTS(meta)[a] < 0) return;
     __global const float *g = gu + (ulong)a * 2 * F;
@@ -387,10 +407,10 @@ void moe_down(__global const uchar *A0, __global const uchar *A1, __global const
     barrier(CLK_LOCAL_MEM_FENCE);
     __global const uchar *base = slot_ptr(A0, A1, A2, A3, META_SLOTS(meta)[a], spa, slot_bytes) + down_off;
     const ulong rb = row_bytes(wtype, F);
-    const int row0 = get_group_id(0) * (WG / 32) * RPW + grp;
+    const int row0 = get_group_id(0) * GPR * RPW + grp;
     float acc[RPW];
     for (int r = 0; r < RPW; r++) {
-        const int row = row0 + r * (WG / 32);
+        const int row = row0 + r * GPR;
         acc[r] = row < D ? dot_row(wtype, base + (ulong)row * rb, al, F, lane) : 0.f;
     }
     reduce_rows(red, lid, lane, grp, acc, Y + (ulong)a * D, row0, D, 0);
@@ -402,7 +422,7 @@ void matvec(MV_ARGS, __local float *xl, __local float *red) {
     barrier(CLK_LOCAL_MEM_FENCE);
     float acc[RPW];
     for (int r = 0; r < RPW; r++) {
-        const int row = row0 + r * (WG / 32);
+        const int row = row0 + r * GPR;
         acc[r] = row < nrows ? dot_row(wt, W + (ulong)row * rb + skip, xl, klen, lane) : 0.f;
     }
     reduce_rows(red, lid, lane, grp, acc, y + yo, row0, nrows, accumulate);

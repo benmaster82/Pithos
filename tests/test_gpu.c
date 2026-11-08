@@ -27,14 +27,15 @@ static void ref_expert(const Layer *L, int e, const float *x, float *y, int D, i
 int main(int argc, char **argv) {
     Model m;
     char err[512];
-    if (argc < 2 || !model_load(&m, argv[1], err, sizeof(err))) { printf("usage: test_gpu model.gguf\n"); return 1; }
+    if (argc < 2 || !model_load(&m, argv[1], err, sizeof(err))) { printf("usage: test_gpu model.gguf [device]\n"); return 1; }
     quant_init(NULL);
-    Gpu *g = gpu_create(&m, -1, 200, 4, 0, NULL, err, sizeof(err));
+    Gpu *g = gpu_create(&m, argc > 2 ? atoi(argv[2]) : -1, 200, 4, 0, NULL, err, sizeof(err));
     if (!g) { printf("no GPU: %s\n", err); return 0; }
     printf("GPU: %s\n", err);
     /* int8 activations (dp4a path) carry ~1% quantization error, like the CPU Q8_K path */
     const double tol = strstr(err, "int8") ? 3e-2 : 1e-4;
     const int D = m.dim, F = m.ff_exp;
+    const int hi = m.n_expert > 41 ? 41 : m.n_expert - 1; /* a high expert number the model has (32 in the 8B) */
     /* one layer with Q6_K down and one with Q4_K down */
     int layers[2] = { -1, -1 };
     for (int l = 0; l < m.n_layer; l++) {
@@ -46,7 +47,7 @@ int main(int argc, char **argv) {
     for (int li = 0; li < 2; li++) {
         int l = layers[li];
         if (l < 0) continue;
-        int experts[2] = { 3, 41 };
+        int experts[2] = { 3, hi };
         for (int k = 0; k < 2; k++) for (int r = 0; r < 1000; r++) gpu_note_usage(g, l, experts[k]);
         gpu_rebalance(g, 4);
         double t0 = time_sec();
@@ -90,7 +91,7 @@ int main(int argc, char **argv) {
     if (getenv("PITHOS_GPU_SUSTAIN")) {
         /* sustained load for clock inspection (nvidia-smi) */
         int l = layers[0] >= 0 ? layers[0] : layers[1];
-        int experts[2] = { 3, 41 }, at[2] = { 0, 1 };
+        int experts[2] = { 3, hi }, at[2] = { 0, 1 };
         float *x = calloc((size_t)D * 2, sizeof(float)), *y = calloc((size_t)D * 2, sizeof(float));
         double tb = time_sec();
         int it = 0;
