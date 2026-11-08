@@ -112,8 +112,7 @@ inline float wg_max(__local float *red, float v) {
     const int row0 = gid * GPR * RPW + grp;
 #define XIN(i) (has_norm ? x[k0 + (i)] * ns * nw[k0 + (i)] : x[k0 + (i)])
 
-#ifdef USE_INT8
-/* ======================================================================= int8 path */
+/* ======================================================================= int8 helpers (both paths) */
 
 /* c + dot(4 unsigned bytes of a, 4 signed bytes of b) */
 #ifdef DOT_PTX
@@ -126,20 +125,14 @@ inline int dp4a(uint a, int b, int c) {
 #pragma OPENCL EXTENSION cl_khr_integer_dot_product : enable
 inline int dp4a(uint a, int b, int c) { return c + dot_4x8packed_us_int(a, as_uint(b)); }
 #else
-/* DOT_EMU: no int8 dot product in hardware; still cheaper than the f32 path on some GPUs (Intel) */
+/* DOT_EMU (and the f32 path, for mm_q8k): no int8 dot product in hardware; still cheaper than
+ * the f32 path on some GPUs (Intel) */
 inline int dp4a(uint a, int b, int c) {
     const uchar4 u = as_uchar4(a);
     const char4 v = as_char4(b);
     return c + (int)u.x * v.x + (int)u.y * v.y + (int)u.z * v.z + (int)u.w * v.w;
 }
 #endif
-
-#ifdef INTEL_MV
-/* Intel build (as the Vulkan one): every lane takes a 64-value piece of a super-block (32 weight
- * bytes) per step, so the scales and d / dmin are decoded once per 64 weights instead of 32, and
- * the 12 scale bytes come in as three words. x stays in plain order in local memory. */
-inline int swz8(int b) { return b; }
-#define XQ(off) vload4(0, (__local const int *)(xq + (off)))
 
 /* scales and mins (s1, s2, m1, m2) of sub-blocks 2p and 2p+1 from the 12 scale bytes */
 inline uint4 scales_pair(uint3 sc, int p) {
@@ -153,6 +146,28 @@ inline uint4 scales_pair(uint3 sc, int p) {
                          A_ = dp4a((W_).z, (X_).z, A_); A_ = dp4a((W_).w, (X_).w, A_);
 #define SUM4(X_, A_) A_ = dp4a(0x01010101u, (X_).x, A_); A_ = dp4a(0x01010101u, (X_).y, A_); \
                      A_ = dp4a(0x01010101u, (X_).z, A_); A_ = dp4a(0x01010101u, (X_).w, A_);
+
+/* 32 bytes at p as 8 words. Q6_K blocks are 210 bytes, so every other one is only 2-byte aligned:
+ * read 9 aligned words and shift by 16 bits instead of 2-byte loads (slow on Intel); the ninth
+ * word is still inside the block for every piece read here */
+inline void load32_a2(__global const uchar *p, uint4 *w0, uint4 *w1) {
+    const uint s = (uint)((size_t)p & 2) * 8; /* 0 or 16 */
+    __global const uint *q = (__global const uint *)(p - (s >> 3));
+    const uint4 u0 = vload4(0, q), u1 = vload4(1, q);
+    const uint4 n0 = (uint4)(u0.y, u0.z, u0.w, u1.x), n1 = (uint4)(u1.y, u1.z, u1.w, q[8]);
+    *w0 = (u0 >> s) | ((n0 << 16) << (16 - s));
+    *w1 = (u1 >> s) | ((n1 << 16) << (16 - s));
+}
+
+#ifdef USE_INT8
+/* ======================================================================= int8 path */
+
+#ifdef INTEL_MV
+/* Intel build (as the Vulkan one): every lane takes a 64-value piece of a super-block (32 weight
+ * bytes) per step, so the scales and d / dmin are decoded once per 64 weights instead of 32, and
+ * the 12 scale bytes come in as three words. x stays in plain order in local memory. */
+inline int swz8(int b) { return b; }
+#define XQ(off) vload4(0, (__local const int *)(xq + (off)))
 
 /* piece p of block i: sub-block 2p (low nibbles of qs[32p..32p+31]) and 2p+1 (high nibbles) */
 inline float dot_q4k(__global const uchar *row, __local const char *xq, __local const float *xd, int nb, int lane) {
@@ -175,18 +190,6 @@ inline float dot_q4k(__global const uchar *row, __local const char *xq, __local 
                dmin * (dl * (float)((int)sm.z * n1) + dh * (float)((int)sm.w * n2));
     }
     return acc;
-}
-
-/* 32 bytes at p as 8 words. Q6_K blocks are 210 bytes, so every other one is only 2-byte aligned:
- * read 9 aligned words and shift by 16 bits instead of 2-byte loads (slow on Intel); the ninth
- * word is still inside the block for every piece read here */
-inline void load32_a2(__global const uchar *p, uint4 *w0, uint4 *w1) {
-    const uint s = (uint)((size_t)p & 2) * 8; /* 0 or 16 */
-    __global const uint *q = (__global const uint *)(p - (s >> 3));
-    const uint4 u0 = vload4(0, q), u1 = vload4(1, q);
-    const uint4 n0 = (uint4)(u0.y, u0.z, u0.w, u1.x), n1 = (uint4)(u1.y, u1.z, u1.w, q[8]);
-    *w0 = (u0 >> s) | ((n0 << 16) << (16 - s));
-    *w1 = (u1 >> s) | ((n1 << 16) << (16 - s));
 }
 
 /* piece p of block i: half h = p / 2, ql bytes [64h + 32a, +32) with a = p % 2: the low nibbles
@@ -715,3 +718,221 @@ __kernel void moe_combine(__global float *x, __global const float *Y, __global c
     x[i] += v;
 }
 
+/* ======================================================================= prompt matmuls (both builds)
+ * Y[t][r] = W[r] . x[t] for a batch of tokens: weights the dense path keeps in VRAM, x as the
+ * Q8_K rows the CPU path quantizes (float d, int8 qs[256], int16 bsums[16]: 292 bytes per 256
+ * values). A work-group takes GPR * RPW rows and MM_TT tokens: every weight piece is read once for
+ * all its tokens (the decode kernels read the weights once per token). The lanes walk the 64-value
+ * pieces of the super-blocks as in the Intel matvec; the x sums for the Q4_K mins and the Q6_K
+ * offset come from bsums. grid: (ceil(rows / (GPR * RPW)) * MVWG, ceil(nt / MM_TT)) */
+#ifndef MM_TT
+#define MM_TT 8
+#endif
+#define Q8K_BYTES 292
+
+inline int bsum2(__global const uchar *xb, int j) { /* bsums[j] + bsums[j + 1], j even */
+    const uint u = *(__global const uint *)(xb + 260 + 2 * j);
+    return (int)(short)(u & 0xFFFFu) + (int)(short)(u >> 16);
+}
+
+__kernel __attribute__((reqd_work_group_size(MVWG, 1, 1)))
+void mm_q8k(__global const uchar *W, ulong w_off, int wtype, int rows, int K, __global const uchar *X, ulong x_off,
+            int xstride, int nt, __global float *Y, ulong y_off, __local float *red) {
+    const int lid = get_local_id(0), lane = lid % LPR, grp = lid / LPR;
+    const int row0 = get_group_id(0) * GPR * RPW + grp, t0 = get_group_id(1) * MM_TT;
+    const int nb = K / 256;
+    const ulong rb = row_bytes(wtype, K);
+    W += w_off;
+    X += x_off;
+    float acc[MM_TT][RPW];
+    for (int t = 0; t < MM_TT; t++)
+        for (int r = 0; r < RPW; r++) acc[t][r] = 0.f;
+    for (int q = lane; q < nb * 4; q += LPR) {
+        const int i = q >> 2, p = q & 3;
+        for (int r = 0; r < RPW; r++) {
+            const int row = row0 + r * GPR;
+            if (row >= rows) break;
+            __global const uchar *xb = X + (ulong)t0 * xstride + (ulong)i * Q8K_BYTES;
+            if (wtype == 12) {
+                /* Q4_K piece p: sub-blocks 2p (low nibbles of qs[32p..]) and 2p+1 (high nibbles) */
+                __global const uchar *b = W + (ulong)row * rb + (ulong)i * 144;
+                const uint4 sm = scales_pair(vload3(0, (__global const uint *)(b + 4)), p);
+                const uint4 q0 = vload4(0, (__global const uint *)(b + 16 + 32 * p));
+                const uint4 q1 = vload4(1, (__global const uint *)(b + 16 + 32 * p));
+                const uint4 l0 = q0 & 0x0F0F0F0Fu, l1 = q1 & 0x0F0F0F0Fu;
+                const uint4 h0 = (q0 >> 4) & 0x0F0F0F0Fu, h1 = (q1 >> 4) & 0x0F0F0F0Fu;
+                const float d = vload_half(0, (__global const half *)b), dmin = vload_half(1, (__global const half *)b);
+                for (int t = 0; t < MM_TT; t++, xb += xstride) {
+                    if (t0 + t >= nt) break;
+                    __global const int *xs = (__global const int *)(xb + 4 + 64 * p);
+                    int d1 = 0, d2 = 0;
+                    DOT4(l0, vload4(0, xs), d1) DOT4(l1, vload4(1, xs), d1)
+                    DOT4(h0, vload4(2, xs), d2) DOT4(h1, vload4(3, xs), d2)
+                    const int n1 = bsum2(xb, 4 * p), n2 = bsum2(xb, 4 * p + 2);
+                    acc[t][r] += *(__global const float *)xb *
+                                 (d * (float)((int)sm.x * d1 + (int)sm.y * d2) - dmin * (float)((int)sm.z * n1 + (int)sm.w * n2));
+                }
+            } else {
+                /* Q6_K piece: half h, a: values 128h + 32a + l (low nibbles) and + 64 (high nibbles) */
+                const int h = p >> 1, a = p & 1;
+                __global const uchar *b = W + (ulong)row * rb + (ulong)i * 210;
+                uint4 ql0, ql1, qh0, qh1;
+                load32_a2(b + 64 * h + 32 * a, &ql0, &ql1);
+                load32_a2(b + 128 + 32 * h, &qh0, &qh1);
+                const uint s1 = 2u * (uint)a, s2 = s1 + 4u;
+                const uint4 v10 = (ql0 & 0x0F0F0F0Fu) | (((qh0 >> s1) & 0x03030303u) << 4);
+                const uint4 v11 = (ql1 & 0x0F0F0F0Fu) | (((qh1 >> s1) & 0x03030303u) << 4);
+                const uint4 v20 = ((ql0 >> 4) & 0x0F0F0F0Fu) | (((qh0 >> s2) & 0x03030303u) << 4);
+                const uint4 v21 = ((ql1 >> 4) & 0x0F0F0F0Fu) | (((qh1 >> s2) & 0x03030303u) << 4);
+                __global const char *sc = (__global const char *)(b + 192);
+                const int j1 = 2 * (4 * h + a), j2 = j1 + 4; /* 16-value groups: scales and bsums */
+                const float d = vload_half(0, (__global const half *)(b + 208));
+                const int c10 = sc[j1], c11 = sc[j1 + 1], c20 = sc[j2], c21 = sc[j2 + 1];
+                for (int t = 0; t < MM_TT; t++, xb += xstride) {
+                    if (t0 + t >= nt) break;
+                    __global const int *x1 = (__global const int *)(xb + 4 + 128 * h + 32 * a);
+                    __global const int *x2 = x1 + 16; /* + 64 values */
+                    int d10 = 0, d11 = 0, d20 = 0, d21 = 0;
+                    DOT4(v10, vload4(0, x1), d10) DOT4(v11, vload4(1, x1), d11)
+                    DOT4(v20, vload4(0, x2), d20) DOT4(v21, vload4(1, x2), d21)
+                    const uint u1 = *(__global const uint *)(xb + 260 + 2 * j1), u2 = *(__global const uint *)(xb + 260 + 2 * j2);
+                    const int m10 = (short)(u1 & 0xFFFFu), m11 = (short)(u1 >> 16), m20 = (short)(u2 & 0xFFFFu), m21 = (short)(u2 >> 16);
+                    acc[t][r] += *(__global const float *)xb * d *
+                                 (float)(c10 * (d10 - 32 * m10) + c11 * (d11 - 32 * m11) + c20 * (d20 - 32 * m20) + c21 * (d21 - 32 * m21));
+                }
+            }
+        }
+    }
+    for (int t = 0; t < MM_TT; t++) {
+        if (t0 + t >= nt) break; /* uniform across the work-group */
+        reduce_rows(red, lid, lane, grp, acc[t], Y + y_off + (ulong)(t0 + t) * rows, row0, rows, 0);
+        barrier(CLK_LOCAL_MEM_FENCE); /* red is rewritten by the next token */
+    }
+}
+
+/* Tiled version for larger batches: a work-group of 256 threads computes 64 rows x 64 tokens.
+ * Every step takes one 32-value sub-block of K: the 64 weight rows go to local memory as unsigned
+ * int8 (Q4_K nibbles, Q6_K 6-bit values) with an (S, M) pair per 16 values, and the 64 Q8_K token
+ * rows as int8 with their scale and 16-value sums; each thread then adds, per 16 values,
+ *   dx[t] * (S[r] * sum(q x) - M[r] * xs[t])
+ * for 4 rows x 4 tokens (Q4_K: S = d * sc, M = dmin * m; Q6_K: S = d * sc, M = 32 * S).
+ * The global reads of the next step are issued before the current one is computed, so their
+ * latency overlaps the dot products. Rows and tokens are interleaved (r = tr + 16 v, t = tc + 16 u)
+ * and the local rows padded by one word so a warp reads distinct banks. On the GTX 1650 this is
+ * faster than the float tiles of the D3D12 / Vulkan kernels (LFM3 7680 x 2048 x 64: 1.06 vs 1.74 ms).
+ * grid: (ceil(rows / 64) * 256, ceil(nt / 64)) */
+#define MT_ROWS 64
+#define MT_TOK 64
+#define MT_PAD 9
+
+typedef struct { uint2 q, x; float s0, s1, m0, m1, xd, xs0, xs1; } MtLoad;
+
+/* what loader thread (ld, part) brings for step st = 8 * block + sub-block */
+inline MtLoad mt_load(__global const uchar *W, int wtype, ulong rb, int gr, int rows, __global const uchar *X, int xstride,
+                      int gt, int nt, int st, int part) {
+    MtLoad o;
+    o.q = o.x = (uint2)(0u, 0u);
+    o.s0 = o.s1 = o.m0 = o.m1 = o.xd = o.xs0 = o.xs1 = 0.f;
+    const int i = st >> 3, j = st & 7;
+    if (gr < rows) {
+        if (wtype == 12) {
+            __global const uchar *b = W + (ulong)gr * rb + (ulong)i * 144;
+            const uint2 raw = vload2(0, (__global const uint *)(b + 16 + 32 * (j >> 1) + 8 * part));
+            o.q = (j & 1) ? (raw >> 4) & 0x0F0F0F0Fu : raw & 0x0F0F0F0Fu;
+            if (part == 0) {
+                float sc, mn;
+                scale_min_k4(j, b + 4, &sc, &mn);
+                o.s0 = o.s1 = vload_half(0, (__global const half *)b) * sc;
+                o.m0 = o.m1 = vload_half(1, (__global const half *)b) * mn;
+            }
+        } else {
+            __global const uchar *b = W + (ulong)gr * rb + (ulong)i * 210;
+            const int h = j >> 2, l0 = 32 * (j & 3);
+            const ushort4 lo = vload4(0, (__global const ushort *)(b + 64 * h + (l0 & 63) + 8 * part));
+            const ushort4 hi = vload4(0, (__global const ushort *)(b + 128 + 32 * h + 8 * part));
+            const uint2 ql = (uint2)(lo.x | ((uint)lo.y << 16), lo.z | ((uint)lo.w << 16));
+            const uint2 qh = (uint2)(hi.x | ((uint)hi.y << 16), hi.z | ((uint)hi.w << 16));
+            const uint ns = 4u * (uint)(l0 >> 6), hs = 2u * (uint)(j & 3);
+            o.q = ((ql >> ns) & 0x0F0F0F0Fu) | (((qh >> hs) & 0x03030303u) << 4);
+            if (part == 0) {
+                __global const char *sc = (__global const char *)(b + 192);
+                const float d = vload_half(0, (__global const half *)(b + 208));
+                o.s0 = d * (float)sc[2 * j];
+                o.s1 = d * (float)sc[2 * j + 1];
+                o.m0 = 32.f * o.s0;
+                o.m1 = 32.f * o.s1;
+            }
+        }
+    }
+    if (gt < nt) {
+        __global const uchar *xb = X + (ulong)gt * xstride + (ulong)i * Q8K_BYTES;
+        o.x = vload2(0, (__global const uint *)(xb + 4 + 32 * j + 8 * part));
+        if (part == 0) {
+            o.xd = *(__global const float *)xb;
+            const uint bs = *(__global const uint *)(xb + 260 + 4 * j); /* bsums[2j], bsums[2j + 1] */
+            o.xs0 = (float)(short)(bs & 0xFFFFu);
+            o.xs1 = (float)(short)(bs >> 16);
+        }
+    }
+    return o;
+}
+
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void mm_tile(__global const uchar *W, ulong w_off, int wtype, int rows, int K, __global const uchar *X, ulong x_off,
+             int xstride, int nt, __global float *Y, ulong y_off) {
+    __local uint wq[MT_ROWS * MT_PAD], xq[MT_TOK * MT_PAD];
+    __local float4 wsm[MT_ROWS];        /* S0, S1, M0, M1 */
+    __local float4 xsd[MT_TOK];         /* dx, xs0, xs1, - */
+    const int lid = get_local_id(0), tr = lid >> 4, tc = lid & 15;
+    const int row0 = get_group_id(0) * MT_ROWS, t0 = get_group_id(1) * MT_TOK;
+    const int ld = lid >> 2, part = lid & 3; /* loaders: row / token ld, values 8 part .. 8 part + 7 */
+    const int steps = K / 32;
+    const ulong rb = row_bytes(wtype, K);
+    W += w_off;
+    X += x_off;
+    float acc[4][4];
+    for (int v = 0; v < 4; v++)
+        for (int u = 0; u < 4; u++) acc[v][u] = 0.f;
+    const int gr = row0 + ld, gt = t0 + ld;
+    MtLoad nx = mt_load(W, wtype, rb, gr, rows, X, xstride, gt, nt, 0, part);
+    for (int st = 0; st < steps; st++) {
+        wq[ld * MT_PAD + 2 * part] = nx.q.x;
+        wq[ld * MT_PAD + 2 * part + 1] = nx.q.y;
+        xq[ld * MT_PAD + 2 * part] = nx.x.x;
+        xq[ld * MT_PAD + 2 * part + 1] = nx.x.y;
+        if (part == 0) {
+            wsm[ld] = (float4)(nx.s0, nx.s1, nx.m0, nx.m1);
+            xsd[ld] = (float4)(nx.xd, nx.xs0, nx.xs1, 0.f);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (st + 1 < steps) nx = mt_load(W, wtype, rb, gr, rows, X, xstride, gt, nt, st + 1, part);
+        /* ---- 4 rows x 4 tokens */
+        uint wr[4][8];
+        float4 sm[4];
+        for (int v = 0; v < 4; v++) {
+            for (int k = 0; k < 8; k++) wr[v][k] = wq[(tr + 16 * v) * MT_PAD + k];
+            sm[v] = wsm[tr + 16 * v];
+        }
+        for (int u = 0; u < 4; u++) {
+            const int t = tc + 16 * u;
+            uint xv[8];
+            for (int k = 0; k < 8; k++) xv[k] = xq[t * MT_PAD + k];
+            const float4 xx = xsd[t];
+            for (int v = 0; v < 4; v++) {
+                int i0 = 0, i1 = 0;
+                for (int k = 0; k < 4; k++) i0 = dp4a(wr[v][k], (int)xv[k], i0);
+                for (int k = 4; k < 8; k++) i1 = dp4a(wr[v][k], (int)xv[k], i1);
+                acc[v][u] += xx.x * (sm[v].x * (float)i0 + sm[v].y * (float)i1 - sm[v].z * xx.y - sm[v].w * xx.z);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    for (int u = 0; u < 4; u++) {
+        const int t = t0 + tc + 16 * u;
+        if (t >= nt) continue;
+        for (int v = 0; v < 4; v++) {
+            const int r = row0 + tr + 16 * v;
+            if (r < rows) Y[y_off + (ulong)t * rows + r] = acc[v][u];
+        }
+    }
+}

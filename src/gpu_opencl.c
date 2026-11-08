@@ -144,6 +144,7 @@ struct Gpu {
     cl_program prog;
     cl_kernel k_gu, k_down;
     int int8, dot, rpw;     /* int8 path and its dot product (DOT_*); rows per lane group (RPW) */
+    int unified;            /* integrated GPU (shares the host memory) */
     int lpr, rows_wg, mvwg; /* lanes per row (LPR), rows per work-group (MVWG / LPR * RPW), matvec work-group size */
     cl_ulong local_mem;     /* local memory per work-group (32 KB on AMD GCN) */
     cl_mem arena[MAX_ARENAS];
@@ -206,6 +207,14 @@ struct Gpu {
     /* PITHOS_GPU_PROFILE: device time of the dense-path kernels, per name and grid size */
     struct { const char *what; size_t gws; double t; long n; } kp[32];
     int n_kp;
+    /* prompt matmuls (gpu_matmul): own queue, Q8_K activations in, f32 results out */
+    cl_kernel k_mm, k_mt;       /* mm_q8k (a few tokens), mm_tile (64 x 64 tiles) */
+    cl_command_queue qmm;
+    cl_mem mm_x, mm_y;
+    size_t mm_x_cap, mm_y_cap;
+    float *mm_host;
+    size_t mm_host_cap;
+    int mm_min, mm_tt, mt_min;  /* fewest tokens for the GPU; tokens per mm_q8k group; fewest for mm_tile */
 };
 
 static int state_load(volatile int *p) {
@@ -492,6 +501,7 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     if (pick < 0) { snprintf(info, infolen, "no dedicated OpenCL GPU (use --gpu-device for an integrated one)"); free(g); return NULL; }
     DevInfo *dv = &devs[pick];
     g->dev = dv->id;
+    g->unified = dv->unified;
     cl->GetDeviceInfo(g->dev, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(g->local_mem), &g->local_mem, NULL);
     if (g->local_mem < 16384) g->local_mem = 16384; /* the OpenCL 1.2 minimum, if the query fails */
     cl_int err = 0;
@@ -520,12 +530,14 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     if (g->mvwg != 64 && g->mvwg != 128 && g->mvwg != 256) g->mvwg = 256;
     if (g->mvwg < g->lpr * 4) g->mvwg = 256; /* QUANT_LOCAL: 4 threads share a 32-block */
     g->rows_wg = g->mvwg / g->lpr * g->rpw;
+    g->mm_tt = getenv("PITHOS_CL_TT") ? atoi(getenv("PITHOS_CL_TT")) : 8;
+    if (g->mm_tt < 1 || g->mm_tt > 64) g->mm_tt = 8;
     for (;;) {
         /* NV_FENCE: every NVIDIA GPU needs membar.gl for device-wide ordering, whatever the path */
         /* INTEL_MV: the int8 matvecs with 64 values per lane (Intel; PITHOS_GPU_INTELMV=0/1 overrides) */
         const char *imv = getenv("PITHOS_GPU_INTELMV");
         const int intel_mv = g->int8 && (imv ? atoi(imv) > 0 : dv->vendor == 0x8086);
-        snprintf(opts, sizeof(opts), "-cl-mad-enable -DRPW=%d -DLPR=%d -DMVWG=%d%s%s%s", g->rpw, g->lpr, g->mvwg,
+        snprintf(opts, sizeof(opts), "-cl-mad-enable -DRPW=%d -DLPR=%d -DMVWG=%d -DMM_TT=%d%s%s%s", g->rpw, g->lpr, g->mvwg, g->mm_tt,
                  g->dot == DOT_PTX ? " -DUSE_INT8 -DDOT_PTX" : g->dot == DOT_KHR ? " -DUSE_INT8 -DDOT_KHR"
                  : g->dot == DOT_EMU ? " -DUSE_INT8 -DDOT_EMU" : "",
                  intel_mv ? " -DINTEL_MV" : "", dv->vendor == 0x10DE ? " -DNV_FENCE" : "");
@@ -724,7 +736,7 @@ void gpu_destroy(Gpu *g) {
         for (int i = 0; i < g->n_kp; i++) tot += g->kp[i].t;
         fprintf(stderr, "GPU dense kernels (device time):\n");
         for (int i = 0; i < g->n_kp; i++)
-            fprintf(stderr, "  %-12s grid %7zu: %8.1f us x %6ld = %5.1f%%\n", g->kp[i].what, g->kp[i].gws,
+            fprintf(stderr, "  %-12s key %10zu: %8.1f us x %6ld = %5.1f%%\n", g->kp[i].what, g->kp[i].gws,
                     1e6 * g->kp[i].t / g->kp[i].n, g->kp[i].n, 100 * g->kp[i].t / tot);
     }
     if (g->sub_th) {
@@ -1169,6 +1181,16 @@ static int dense_alloc(Gpu *g, int n_ctx, const cl_ulong *big_used, cl_ulong sma
         snprintf(err, (size_t)errlen, "dense kernels missing (%d)", e);
         return 0;
     }
+    /* prompt matmuls on the same weights; without them the CPU keeps doing those */
+    g->k_mm = cl->CreateKernel(g->prog, "mm_q8k", &e);
+    g->k_mt = cl->CreateKernel(g->prog, "mm_tile", &e);
+    g->mt_min = getenv("PITHOS_CL_TILE") ? atoi(getenv("PITHOS_CL_TILE")) : 32;
+    if (g->k_mm) g->qmm = cl->CreateCommandQueue(g->ctx, g->dev, g->profiling ? CL_QUEUE_PROFILING_ENABLE : 0, &e);
+    const char *mmin = getenv("PITHOS_CL_MIN");
+    /* on by default where it was measured to win: dedicated GPUs with an int8 dot product in hardware
+     * (GTX 1650 LFM3 prompt 102 -> 227 tok/s); the emulated dot loses to the CPU (UHD 78 -> 20).
+     * PITHOS_CL_MIN=N: tokens from which they run on the GPU anyway, 0: never */
+    g->mm_min = mmin ? atoi(mmin) : !g->unified && (g->dot == DOT_PTX || g->dot == DOT_KHR) ? 8 : 0;
     return 1;
 }
 
@@ -1179,8 +1201,12 @@ static void dense_free(Gpu *g) {
                       g->pin_out, g->pin_y, g->pin_logits, g->dgate, g->dpost };
     for (size_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) if (bufs[i]) cl->ReleaseMemObject(bufs[i]);
     for (int a = 0; a < g->n_dz; a++) if (g->dz[a]) cl->ReleaseMemObject(g->dz[a]);
-    cl_kernel ks[] = { g->k_mv, g->k_conv, g->k_silu, g->k_attn, g->k_route, g->k_comb, g->k_addn };
+    cl_kernel ks[] = { g->k_mv, g->k_conv, g->k_silu, g->k_attn, g->k_route, g->k_comb, g->k_addn, g->k_mm, g->k_mt };
     for (size_t i = 0; i < sizeof(ks) / sizeof(ks[0]); i++) if (ks[i]) cl->ReleaseKernel(ks[i]);
+    if (g->mm_x) cl->ReleaseMemObject(g->mm_x);
+    if (g->mm_y) cl->ReleaseMemObject(g->mm_y);
+    if (g->qmm) cl->ReleaseCommandQueue(g->qmm);
+    free(g->mm_host);
     free(g->dl);
 }
 
@@ -1193,22 +1219,129 @@ static void arg(Gpu *g, cl_kernel k, cl_uint i, size_t sz, const void *v) { g->c
 #define ARGU(k, i, v) do { const cl_ulong _v = (cl_ulong)(v); arg(g, k, i, sizeof(cl_ulong), &_v); } while (0)
 #define ARGF(k, i, v) do { const float _v = (v); arg(g, k, i, sizeof(float), &_v); } while (0)
 
+/* ------------------------------------------------------------------ prompt matmuls */
+
+/* PITHOS_GPU_PROFILE: wait for ev and add its device time under (what, key) */
+static void prof_add(Gpu *g, cl_command_queue q, cl_event ev, const char *what, size_t key) {
+    cl_ulong t0 = 0, t1 = 0;
+    g->cl.Finish(q);
+    g->cl.GetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(t0), &t0, NULL);
+    g->cl.GetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(t1), &t1, NULL);
+    g->cl.ReleaseEvent(ev);
+    int i = 0;
+    while (i < g->n_kp && (g->kp[i].what != what || g->kp[i].gws != key)) i++;
+    if (i == g->n_kp && i < 32) { g->kp[i].what = what; g->kp[i].gws = key; g->n_kp++; }
+    if (i < 32) { g->kp[i].t += (double)(t1 - t0) * 1e-9; g->kp[i].n++; }
+}
+
+/* the VRAM copy of a weight matrix the dense path holds (Q4_K / Q6_K), or NULL */
+static const DT *mm_find(const Gpu *g, const void *w) {
+    if (g->d_out.src == w && g->d_out.buf >= 0) return &g->d_out;
+    for (int l = 0; l < g->m->n_layer; l++) {
+        const DL *d = &g->dl[l];
+        const DT *all[] = { &d->wq, &d->wk, &d->wv, &d->wo, &d->in_proj, &d->out_proj, &d->wg, &d->wu, &d->wd, &d->wgate };
+        for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
+            if (all[i]->src == w && all[i]->buf >= 0 && (all[i]->type == GGML_Q4_K || all[i]->type == GGML_Q6_K)) return all[i];
+    }
+    return NULL;
+}
+
+int gpu_mm_has(const Gpu *g, const void *w, int nt) {
+    return g && g->dense && g->k_mm && g->qmm && g->mm_min > 0 && nt >= g->mm_min && !g->reported && mm_find(g, w);
+}
+
+/* grow a device buffer to at least n bytes */
+static int mm_reserve(Gpu *g, cl_mem *b, size_t *cap, size_t n) {
+    if (*cap >= n) return 1;
+    if (*b) g->cl.ReleaseMemObject(*b);
+    cl_int e = 0;
+    *b = g->cl.CreateBuffer(g->ctx, CL_MEM_READ_WRITE, n, NULL, &e);
+    *cap = *b ? n : 0;
+    return *b != NULL;
+}
+
+int gpu_matmul(Gpu *g, const GpuMatJob *jobs, int n) {
+    if (!g || !g->k_mm || !g->qmm || n < 1 || n > 16) return 0;
+    CLApi *cl = &g->cl;
+    const DT *t[16];
+    const void *xs[16];
+    size_t xoff[16], yoff[16], xbytes = 0, ybytes = 0;
+    int nx = 0, xi[16];
+    for (int i = 0; i < n; i++) {
+        if (!(t[i] = mm_find(g, jobs[i].w))) return 0;
+        /* jobs on the same input (q | k | v) upload it once */
+        int k = 0;
+        while (k < nx && xs[k] != jobs[i].xq) k++;
+        if (k == nx) {
+            xs[nx] = jobs[i].xq;
+            xoff[nx] = xbytes;
+            xbytes += ceil256((size_t)jobs[i].nt * jobs[i].xstride * 292);
+            nx++;
+        }
+        xi[i] = k;
+        yoff[i] = ybytes / sizeof(float);
+        ybytes += ceil256(sizeof(float) * (size_t)t[i]->rows * jobs[i].nt);
+    }
+    if (!mm_reserve(g, &g->mm_x, &g->mm_x_cap, xbytes) || !mm_reserve(g, &g->mm_y, &g->mm_y_cap, ybytes)) return 0;
+    if (g->mm_host_cap < ybytes) {
+        float *p = (float *)realloc(g->mm_host, ybytes);
+        if (!p) return 0;
+        g->mm_host = p;
+        g->mm_host_cap = ybytes;
+    }
+    cl_int e = 0;
+    for (int k = 0; k < nx; k++) {
+        int i = 0;
+        while (xi[i] != k) i++;
+        e |= cl->EnqueueWriteBuffer(g->qmm, g->mm_x, 0, xoff[k], (size_t)jobs[i].nt * jobs[i].xstride * 292, xs[k], 0, NULL, NULL);
+    }
+    const size_t red = sizeof(float) * g->mvwg * g->rpw;
+    for (int i = 0; i < n && !e; i++) {
+        const DT *w = t[i];
+        const int xstride = jobs[i].xstride * 292;
+        const int tiled = g->k_mt && g->mt_min > 0 && jobs[i].nt >= g->mt_min;
+        cl_kernel k = tiled ? g->k_mt : g->k_mm;
+        ARGM(k, 0, g->dz[w->buf]);
+        ARGU(k, 1, w->off);
+        ARGI(k, 2, w->type);
+        ARGI(k, 3, w->rows);
+        ARGI(k, 4, w->cols);
+        ARGM(k, 5, g->mm_x);
+        ARGU(k, 6, xoff[xi[i]]);
+        ARGI(k, 7, xstride);
+        ARGI(k, 8, jobs[i].nt);
+        ARGM(k, 9, g->mm_y);
+        ARGU(k, 10, yoff[i]);
+        if (!tiled) arg(g, k, 11, red, NULL);
+        const size_t gws[2] = { tiled ? (size_t)((w->rows + 63) / 64) * 256 : (size_t)((w->rows + g->rows_wg - 1) / g->rows_wg) * g->mvwg,
+                                tiled ? (size_t)((jobs[i].nt + 63) / 64) : (size_t)((jobs[i].nt + g->mm_tt - 1) / g->mm_tt) };
+        const size_t lws[2] = { tiled ? 256 : (size_t)g->mvwg, 1 };
+        cl_event ev = NULL;
+        e |= cl->EnqueueNDRangeKernel(g->qmm, k, 2, NULL, gws, lws, 0, NULL, g->profiling ? &ev : NULL);
+        if (ev) prof_add(g, g->qmm, ev, tiled ? "mm_tile" : "mm_q8k", (size_t)w->rows * 100000 + (size_t)w->cols);
+    }
+    cl_event rev = NULL;
+    if (!e) e = cl->EnqueueReadBuffer(g->qmm, g->mm_y, 1, 0, ybytes, g->mm_host, 0, NULL, g->profiling ? &rev : NULL);
+    if (rev) prof_add(g, g->qmm, rev, "mm_read", 0);
+    if (e) {
+        check(g, e, "prompt matmul");
+        cl->Finish(g->qmm);
+        return 0; /* the CPU does it */
+    }
+    for (int i = 0; i < n; i++) {
+        const int rows = t[i]->rows;
+        for (int tk = 0; tk < jobs[i].nt; tk++)
+            memcpy(jobs[i].out + (size_t)tk * jobs[i].ostride, g->mm_host + yoff[i] + (size_t)tk * rows, sizeof(float) * rows);
+    }
+    return 1;
+}
+
 static void run1(Gpu *g, cl_kernel k, size_t gws, size_t lws, const char *what) {
     const size_t gw[1] = { gws }, lw[1] = { lws };
     cl_event ev = NULL;
     check(g, g->cl.EnqueueNDRangeKernel(g->q, k, 1, NULL, gw, lws ? lw : NULL, 0, NULL, g->profiling ? &ev : NULL), what);
     if (g->eager) g->cl.Flush(g->q); /* the GPU starts while the host queues the next command */
-    if (ev) { /* profiling only: serializes the queue */
-        cl_ulong t0 = 0, t1 = 0;
-        g->cl.Finish(g->q);
-        g->cl.GetEventProfilingInfo(ev, CL_PROFILING_COMMAND_START, sizeof(t0), &t0, NULL);
-        g->cl.GetEventProfilingInfo(ev, CL_PROFILING_COMMAND_END, sizeof(t1), &t1, NULL);
-        g->cl.ReleaseEvent(ev);
-        int i = 0;
-        while (i < g->n_kp && (g->kp[i].what != what || g->kp[i].gws != gws)) i++;
-        if (i == g->n_kp && i < 32) { g->kp[i].what = what; g->kp[i].gws = gws; g->n_kp++; }
-        if (i < 32) { g->kp[i].t += (double)(t1 - t0) * 1e-9; g->kp[i].n++; }
-    }
+    if (ev) prof_add(g, g->q, ev, what, gws); /* profiling only: serializes the queue */
 }
 
 /* y[y_off[i]..] (+)= W_i x for up to three weights with the same K (Q4_K / Q6_K in VRAM), in one

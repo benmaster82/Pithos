@@ -57,6 +57,12 @@ void gpu_dense_logits(Gpu *g, float *out);
  * convolution state between the host copy and VRAM */
 void gpu_dense_kv(Gpu *g, uint16_t *kc, uint16_t *vc, int r0, int r1, int to_gpu);
 void gpu_dense_conv(Gpu *g, float *conv, int to_gpu);
+/* ---- prompt matmuls on the dense weights the GPU already holds (needs gpu_dense_on).
+ * out[t * ostride + r] = W[r] . x[t] for t < nt, x as Q8_K rows xstride blocks apart.
+ * gpu_matmul returns 0 (nothing written) when a weight is not in VRAM or the GPU fails. */
+typedef struct { const void *w; const void *xq; int xstride; int nt; float *out; int ostride; } GpuMatJob;
+int gpu_mm_has(const Gpu *g, const void *w, int nt);
+int gpu_matmul(Gpu *g, const GpuMatJob *jobs, int n);
 
 typedef struct {
     int slots, used, ready;

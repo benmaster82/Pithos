@@ -547,6 +547,45 @@ static int vk_run(Context *c) {
     return vk_matmul(c->vk, vj, c->njobs);
 }
 
+static void cpu_run(Context *c);
+
+/* the same through OpenCL, on the dense weights its decode path keeps in VRAM */
+static int cl_run(Context *c) {
+    GpuMatJob gj[16];
+    if (!c->gpu || c->njobs > 16) return 0;
+    for (int ji = 0; ji < c->njobs; ji++) {
+        const MatJob *j = &c->jobs[ji];
+        if (!j->xq || !gpu_mm_has(c->gpu, j->w, j->nt)) return 0;
+        GpuMatJob g = {j->w, j->xq, j->xstride, j->nt, j->out, j->ostride};
+        gj[ji] = g;
+    }
+    if (!gpu_matmul(c->gpu, gj, c->njobs)) return 0;
+    if (getenv("PITHOS_CL_CHECK")) { /* debugging: redo the jobs on the CPU (its results stay) and report differences */
+        float *keep[16];
+        for (int ji = 0; ji < c->njobs; ji++) {
+            const MatJob *j = &c->jobs[ji];
+            keep[ji] = (float *)malloc(sizeof(float) * (size_t)j->rows * j->nt);
+            for (int t = 0; t < j->nt && keep[ji]; t++) memcpy(keep[ji] + (size_t)t * j->rows, j->out + (size_t)t * j->ostride, sizeof(float) * j->rows);
+        }
+        cpu_run(c);
+        for (int ji = 0; ji < c->njobs; ji++) {
+            const MatJob *j = &c->jobs[ji];
+            double num = 0, den = 0;
+            for (int t = 0; t < j->nt && keep[ji]; t++)
+                for (int r = 0; r < j->rows; r++) {
+                    const double a = keep[ji][(size_t)t * j->rows + r], b = j->out[(size_t)t * j->ostride + r];
+                    num += (a - b) * (a - b);
+                    den += b * b;
+                }
+            if (!(num <= 1e-10 * den)) /* NaN too */
+                fprintf(stderr, "PITHOS_CL_CHECK: type %d %dx%d, %d tokens: rel err %.2e\n", (int)j->type, j->rows, j->K, j->nt,
+                        sqrt(num / (den + 1e-30)));
+            free(keep[ji]);
+        }
+    }
+    return 1;
+}
+
 /* split the jobs into row ranges for the thread pool */
 static void cpu_run(Context *c) {
     int nt = 0;
@@ -570,7 +609,7 @@ static void cpu_run(Context *c) {
 
 static void job_run(Context *c, int cat) {
     double t0 = time_sec();
-    if (!dx_run(c) && !vk_run(c)) cpu_run(c);
+    if (!dx_run(c) && !vk_run(c) && !cl_run(c)) cpu_run(c);
     const double dt = time_sec() - t0;
     c->stats.t_matmul += dt;
     c->stats.t_cat[cat] += dt;
