@@ -32,8 +32,9 @@ int main(int argc, char **argv) {
     Gpu *g = gpu_create(&m, argc > 2 ? atoi(argv[2]) : -1, 200, 4, 0, NULL, err, sizeof(err));
     if (!g && m.n_expert > 0) { printf("no GPU: %s\n", err); return 0; }
     printf("GPU: %s\n", g ? err : "dense model, no experts to test");
-    /* int8 activations (dp4a path) carry ~1% quantization error, like the CPU Q8_K path */
-    const double tol = strstr(err, "int8") ? 3e-2 : 1e-4;
+    /* int8 activations (the int8 path, or Q8_K in the prompt tiles: 2+ tokens) carry ~1% quantization
+     * error, like the CPU Q8_K path */
+    const double tol = strstr(err, "int8") || strstr(err, "prompt in tiles") ? 3e-2 : 1e-4;
     const int D = m.dim, F = m.ff_exp;
     const int hi = m.n_expert > 41 ? 41 : m.n_expert - 1; /* a high expert number the model has (32 in the 8B) */
     /* one layer with Q6_K down and one with Q4_K down */
@@ -136,7 +137,12 @@ int main(int argc, char **argv) {
                 for (int r = 0; r < rows; r++)
                     KS.dot[w->type](K, w->data + (size_t)r * w->row_bytes, xq, nb, nt, ref + r, rows);
                 GpuMatJob j = { w->data, xq, nb, nt, got, rows };
-                const int ran = gpu_mm_has(g, w->data, nt) && gpu_matmul(g, &j, 1);
+                if (!gpu_mm_has(g, w->data, nt)) { /* off by default on this GPU (PITHOS_CL_MIN turns them on) */
+                    printf("mm %-8s skipped: prompt matmuls off on this GPU\n", names[wi]);
+                    free(x); free(ref); free(got); free(xq);
+                    break;
+                }
+                const int ran = gpu_matmul(g, &j, 1);
                 double num = 0, den = 0;
                 for (size_t i = 0; i < (size_t)rows * nt; i++) { num += (got[i] - ref[i]) * (got[i] - ref[i]); den += ref[i] * ref[i]; }
                 const double rel = sqrt(num / (den + 1e-30));

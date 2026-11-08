@@ -820,23 +820,23 @@ void mm_q8k(__global const uchar *W, ulong w_off, int wtype, int rows, int K, __
  * latency overlaps the dot products. Rows and tokens are interleaved (r = tr + 16 v, t = tc + 16 u)
  * and the local rows padded by one word so a warp reads distinct banks. On the GTX 1650 this is
  * faster than the float tiles of the D3D12 / Vulkan kernels (LFM3 7680 x 2048 x 64: 1.06 vs 1.74 ms).
- * grid: (ceil(rows / 64) * 256, ceil(nt / 64)) */
+ * mm_tile runs it on a dense matrix, moe_tile on the experts in VRAM (see there). */
 #define MT_ROWS 64
 #define MT_TOK 64
 #define MT_PAD 9
 
 typedef struct { uint2 q, x; float s0, s1, m0, m1, xd, xs0, xs1; } MtLoad;
 
-/* what loader thread (ld, part) brings for step st = 8 * block + sub-block */
-inline MtLoad mt_load(__global const uchar *W, int wtype, ulong rb, int gr, int rows, __global const uchar *X, int xstride,
-                      int gt, int nt, int st, int part) {
+/* what loader thread (ld, part) brings for step st = 8 * block + sub-block; wr / xr: its weight
+ * row and Q8_K token row, NULL past the end */
+inline MtLoad mt_load(__global const uchar *wr, int wtype, __global const uchar *xr, int st, int part) {
     MtLoad o;
     o.q = o.x = (uint2)(0u, 0u);
     o.s0 = o.s1 = o.m0 = o.m1 = o.xd = o.xs0 = o.xs1 = 0.f;
     const int i = st >> 3, j = st & 7;
-    if (gr < rows) {
+    if (wr) {
         if (wtype == 12) {
-            __global const uchar *b = W + (ulong)gr * rb + (ulong)i * 144;
+            __global const uchar *b = wr + (ulong)i * 144;
             const uint2 raw = vload2(0, (__global const uint *)(b + 16 + 32 * (j >> 1) + 8 * part));
             o.q = (j & 1) ? (raw >> 4) & 0x0F0F0F0Fu : raw & 0x0F0F0F0Fu;
             if (part == 0) {
@@ -846,7 +846,7 @@ inline MtLoad mt_load(__global const uchar *W, int wtype, ulong rb, int gr, int 
                 o.m0 = o.m1 = vload_half(1, (__global const half *)b) * mn;
             }
         } else {
-            __global const uchar *b = W + (ulong)gr * rb + (ulong)i * 210;
+            __global const uchar *b = wr + (ulong)i * 210;
             const int h = j >> 2, l0 = 32 * (j & 3);
             const ushort4 lo = vload4(0, (__global const ushort *)(b + 64 * h + (l0 & 63) + 8 * part));
             const ushort4 hi = vload4(0, (__global const ushort *)(b + 128 + 32 * h + 8 * part));
@@ -864,8 +864,8 @@ inline MtLoad mt_load(__global const uchar *W, int wtype, ulong rb, int gr, int 
             }
         }
     }
-    if (gt < nt) {
-        __global const uchar *xb = X + (ulong)gt * xstride + (ulong)i * Q8K_BYTES;
+    if (xr) {
+        __global const uchar *xb = xr + (ulong)i * Q8K_BYTES;
         o.x = vload2(0, (__global const uint *)(xb + 4 + 32 * j + 8 * part));
         if (part == 0) {
             o.xd = *(__global const float *)xb;
@@ -877,24 +877,15 @@ inline MtLoad mt_load(__global const uchar *W, int wtype, ulong rb, int gr, int 
     return o;
 }
 
-__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
-void mm_tile(__global const uchar *W, ulong w_off, int wtype, int rows, int K, __global const uchar *X, ulong x_off,
-             int xstride, int nt, __global float *Y, ulong y_off) {
-    __local uint wq[MT_ROWS * MT_PAD], xq[MT_TOK * MT_PAD];
-    __local float4 wsm[MT_ROWS];        /* S0, S1, M0, M1 */
-    __local float4 xsd[MT_TOK];         /* dx, xs0, xs1, - */
-    const int lid = get_local_id(0), tr = lid >> 4, tc = lid & 15;
-    const int row0 = get_group_id(0) * MT_ROWS, t0 = get_group_id(1) * MT_TOK;
-    const int ld = lid >> 2, part = lid & 3; /* loaders: row / token ld, values 8 part .. 8 part + 7 */
+/* one 64 x 64 tile: wr / xr are this loader thread's rows (NULL past the end); acc[v][u] gets
+ * rows tr + 16 v and tokens tc + 16 u */
+inline void mt_tile(__global const uchar *wr, int wtype, int K, __global const uchar *xr, __local uint *wq, __local uint *xq,
+                    __local float4 *wsm, __local float4 *xsd, float acc[4][4]) {
+    const int lid = get_local_id(0), tr = lid >> 4, tc = lid & 15, ld = lid >> 2, part = lid & 3;
     const int steps = K / 32;
-    const ulong rb = row_bytes(wtype, K);
-    W += w_off;
-    X += x_off;
-    float acc[4][4];
     for (int v = 0; v < 4; v++)
         for (int u = 0; u < 4; u++) acc[v][u] = 0.f;
-    const int gr = row0 + ld, gt = t0 + ld;
-    MtLoad nx = mt_load(W, wtype, rb, gr, rows, X, xstride, gt, nt, 0, part);
+    MtLoad nx = mt_load(wr, wtype, xr, 0, part);
     for (int st = 0; st < steps; st++) {
         wq[ld * MT_PAD + 2 * part] = nx.q.x;
         wq[ld * MT_PAD + 2 * part + 1] = nx.q.y;
@@ -905,12 +896,12 @@ void mm_tile(__global const uchar *W, ulong w_off, int wtype, int rows, int K, _
             xsd[ld] = (float4)(nx.xd, nx.xs0, nx.xs1, 0.f);
         }
         barrier(CLK_LOCAL_MEM_FENCE);
-        if (st + 1 < steps) nx = mt_load(W, wtype, rb, gr, rows, X, xstride, gt, nt, st + 1, part);
+        if (st + 1 < steps) nx = mt_load(wr, wtype, xr, st + 1, part);
         /* ---- 4 rows x 4 tokens */
-        uint wr[4][8];
+        uint w4[4][8];
         float4 sm[4];
         for (int v = 0; v < 4; v++) {
-            for (int k = 0; k < 8; k++) wr[v][k] = wq[(tr + 16 * v) * MT_PAD + k];
+            for (int k = 0; k < 8; k++) w4[v][k] = wq[(tr + 16 * v) * MT_PAD + k];
             sm[v] = wsm[tr + 16 * v];
         }
         for (int u = 0; u < 4; u++) {
@@ -920,13 +911,28 @@ void mm_tile(__global const uchar *W, ulong w_off, int wtype, int rows, int K, _
             const float4 xx = xsd[t];
             for (int v = 0; v < 4; v++) {
                 int i0 = 0, i1 = 0;
-                for (int k = 0; k < 4; k++) i0 = dp4a(wr[v][k], (int)xv[k], i0);
-                for (int k = 4; k < 8; k++) i1 = dp4a(wr[v][k], (int)xv[k], i1);
+                for (int k = 0; k < 4; k++) i0 = dp4a(w4[v][k], (int)xv[k], i0);
+                for (int k = 4; k < 8; k++) i1 = dp4a(w4[v][k], (int)xv[k], i1);
                 acc[v][u] += xx.x * (sm[v].x * (float)i0 + sm[v].y * (float)i1 - sm[v].z * xx.y - sm[v].w * xx.z);
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
+}
+
+/* Y[t][r] = W[r] . x[t] on a dense matrix. grid: (ceil(rows / 64) * 256, ceil(nt / 64)) */
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void mm_tile(__global const uchar *W, ulong w_off, int wtype, int rows, int K, __global const uchar *X, ulong x_off,
+             int xstride, int nt, __global float *Y, ulong y_off) {
+    __local uint wq[MT_ROWS * MT_PAD], xq[MT_TOK * MT_PAD];
+    __local float4 wsm[MT_ROWS], xsd[MT_TOK];
+    const int lid = get_local_id(0), tr = lid >> 4, tc = lid & 15, ld = lid >> 2;
+    const int row0 = get_group_id(0) * MT_ROWS, t0 = get_group_id(1) * MT_TOK;
+    const ulong rb = row_bytes(wtype, K);
+    __global const uchar *wr = row0 + ld < rows ? W + w_off + (ulong)(row0 + ld) * rb : NULL;
+    __global const uchar *xr = t0 + ld < nt ? X + x_off + (ulong)(t0 + ld) * xstride : NULL;
+    float acc[4][4];
+    mt_tile(wr, wtype, K, xr, wq, xq, wsm, xsd, acc);
     for (int u = 0; u < 4; u++) {
         const int t = t0 + tc + 16 * u;
         if (t >= nt) continue;
@@ -934,5 +940,71 @@ void mm_tile(__global const uchar *W, ulong w_off, int wtype, int rows, int K, _
             const int r = row0 + tr + 16 * v;
             if (r < rows) Y[y_off + (ulong)t * rows + r] = acc[v][u];
         }
+    }
+}
+
+/* Experts in VRAM for a batch (prompt): tile g of tiles[] = (slot, first, count, -) covers the
+ * assignments order[first .. first + count) (count <= 64), all of one expert. which = 0: gate and
+ * up (grid y = 2 * n_tiles, odd = up), the token rows of x are XQ[xidx[a]]; which = 1: down, the
+ * rows are AQ[a]. Results per assignment: gate | up into GU[a][2F], down into Y[a][D].
+ * grid: (ceil(rows / 64) * 256, n_tiles (x2 for gate / up)) */
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void moe_tile(__global const uchar *A0, __global const uchar *A1, __global const uchar *A2, __global const uchar *A3,
+              int spa, ulong slot_bytes, __global const int4 *tiles, __global const int *order, __global const int *meta,
+              int max_assign, int which, ulong up_off, ulong down_off, int wtype, int rows, int K,
+              __global const uchar *XQ, int xstride, __global float *Y, int ystride) {
+    __local uint wq[MT_ROWS * MT_PAD], xq[MT_TOK * MT_PAD];
+    __local float4 wsm[MT_ROWS], xsd[MT_TOK];
+    const int lid = get_local_id(0), tr = lid >> 4, tc = lid & 15, ld = lid >> 2;
+    const int g = which ? get_group_id(1) : get_group_id(1) >> 1, up = which ? 0 : get_group_id(1) & 1;
+    const int4 tl = tiles[g];
+    const int row0 = get_group_id(0) * MT_ROWS;
+    const ulong rb = row_bytes(wtype, K);
+    __global const uchar *base = slot_ptr(A0, A1, A2, A3, tl.x, spa, slot_bytes) + (which ? down_off : (up ? up_off : 0));
+    __global const uchar *wr = row0 + ld < rows ? base + (ulong)(row0 + ld) * rb : NULL;
+    __global const uchar *xr = NULL;
+    if (ld < tl.z) {
+        const int a = order[tl.y + ld];
+        xr = XQ + (ulong)(which ? a : META_XIDX(meta, max_assign)[a]) * xstride;
+    }
+    float acc[4][4];
+    mt_tile(wr, wtype, K, xr, wq, xq, wsm, xsd, acc);
+    for (int u = 0; u < 4; u++) {
+        const int t = tc + 16 * u;
+        if (t >= tl.z) continue;
+        __global float *o = Y + (ulong)order[tl.y + t] * ystride + (up ? rows : 0);
+        for (int v = 0; v < 4; v++) {
+            const int r = row0 + tr + 16 * v;
+            if (r < rows) o[r] = acc[v][u];
+        }
+    }
+}
+
+/* Q8_K rows (d, qs, bsums: as the CPU's quantize_q8_K) from n rows of K floats, one work-group
+ * of 256 threads per row; silu = 1: the rows are SiLU(gate) * up of GU rows [gate K | up K] */
+__kernel __attribute__((reqd_work_group_size(256, 1, 1)))
+void quant_q8k(__global const float *src, ulong src_off, int src_stride, int K, int silu, __global uchar *dst, int dst_stride) {
+    __local float red[256];
+    const int lid = get_local_id(0), row = get_group_id(0);
+    __global const float *s = src + src_off + (ulong)row * src_stride;
+    __global uchar *d = dst + (ulong)row * dst_stride;
+    for (int b = 0; b < K / 256; b++) {
+        const int i = b * 256 + lid;
+        const float v = silu ? s[i] / (1.f + exp(-s[i])) * s[K + i] : s[i];
+        const float amax = wg_max(red, fabs(v));
+        const float iscale = amax > 0.f ? 127.f / amax : 0.f;
+        const int q = clamp((int)rint(v * iscale), -127, 127);
+        __global uchar *blk = d + (ulong)b * Q8K_BYTES;
+        ((__global char *)(blk + 4))[lid] = (char)q;
+        /* 16-value sums: lanes 16 g .. 16 g + 15 */
+        red[lid] = (float)q;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (lid < 16) {
+            int sum = 0;
+            for (int k = 0; k < 16; k++) sum += (int)red[lid * 16 + k];
+            ((__global short *)(blk + 260))[lid] = (short)sum;
+        }
+        if (lid == 0) *(__global float *)blk = amax > 0.f ? amax / 127.f : 0.f;
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
 }

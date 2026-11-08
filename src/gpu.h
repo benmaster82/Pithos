@@ -22,6 +22,9 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
                 char *info, int infolen);
 void gpu_destroy(Gpu *g);
 
+/* Prompt batch suited to the OpenCL device gpu_create(device) would pick (0: no preference). */
+int gpu_prompt_batch(int device);
+
 /* List OpenCL devices to stdout. */
 void gpu_list_devices(void);
 

@@ -38,6 +38,7 @@ typedef struct {
     int port, server, cache_mb, open_browser, tools, web, read_only, ctx_set, shell, workspace_set;
     int agent, agent_auto, yolo, max_steps, agent_think;
     int threads, n_ctx, n_batch, n_predict;
+    int batch_set;                  /* -b given */
     int interactive, raw, bench, show_think, keep_think, prefetch, mlock, stats, verbose, ids;
     int gpu_auto, gpu_use;      /* --gpu auto (decided once the model is known) / the USE_* backends */
     int gpu_device, gpu_mem, gpu_dense, vk_device;
@@ -363,7 +364,7 @@ static int parse_args(int argc, char **argv, Args *a) {
         else if (!strcmp(s, "-n") || !strcmp(s, "--n-predict")) a->n_predict = atoi(NEXT());
         else if (!strcmp(s, "-c") || !strcmp(s, "--ctx")) { a->n_ctx = atoi(NEXT()); a->ctx_set = 1; }
         else if (!strcmp(s, "-t") || !strcmp(s, "--threads")) a->threads = atoi(NEXT());
-        else if (!strcmp(s, "-b") || !strcmp(s, "--batch")) a->n_batch = atoi(NEXT());
+        else if (!strcmp(s, "-b") || !strcmp(s, "--batch")) { a->n_batch = atoi(NEXT()); a->batch_set = 1; }
         else if (!strcmp(s, "--temp")) a->sp.temp = (float)atof(NEXT());
         else if (!strcmp(s, "--top-k")) a->sp.top_k = atoi(NEXT());
         else if (!strcmp(s, "--top-p")) a->sp.top_p = (float)atof(NEXT());
@@ -812,6 +813,13 @@ static int real_main(int argc, char **argv) {
         fprintf(stderr, "mlock: %s\n", ok ? "ok" : "failed (continuing without it)");
     }
 
+    /* OpenCL alone on a GPU that takes the prompt in tiles: larger batches fill them (gpu_prompt_batch) */
+    {
+        const int cl_only = a.gpu_auto ? m.n_expert > 0 : a.gpu_use == USE_CL;
+        const int dev = a.gpu_auto ? (a.gpu_device >= 0 ? a.gpu_device : -1) : a.gpu_device;
+        const int pb = !a.batch_set && cl_only ? gpu_prompt_batch(dev) : 0;
+        if (pb > a.n_batch) a.n_batch = pb;
+    }
     ThreadPool *pool = pool_create(a.threads);
     Context *ctx = ctx_create(&m, pool, a.n_ctx, a.n_batch);
     if (!ctx) { fprintf(stderr, "error: not enough memory for the context\n"); return 1; }

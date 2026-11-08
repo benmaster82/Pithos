@@ -152,6 +152,12 @@ struct Gpu {
     size_t slot_bytes;
     /* device buffers: meta = slots[max_assign] | xidx[max_assign] | x[max_tok][dim] */
     cl_mem d_meta, d_gu, d_y;
+    /* prompt batches: the experts as 64 x 64 tiles (moe_tile), x and SiLU(gate) * up quantized to
+     * Q8_K on the GPU (quant_q8k); tiles = (slot, first, count) over the assignments grouped by slot */
+    cl_kernel k_mtile, k_quant;
+    cl_mem d_xq, d_aq, d_tiles, d_order;
+    int *h_order, (*h_tiles)[4];
+    int moe_tiled, job_tiled, n_tiles;
     int max_tok, max_assign, cur_assign;
     /* per MoE layer layout inside a slot */
     size_t up_off[64], down_off[64];
@@ -371,6 +377,26 @@ static int pick_dot(const DevInfo *dv) {
 
 static const char *path_name(int dot) {
     return dot == DOT_PTX ? "int8/dp4a" : dot == DOT_KHR ? "int8/khr dot" : dot == DOT_EMU ? "int8/emulated dot" : "f32";
+}
+
+/* the prompt batch for the device gpu_create(device) would pick: 256 where the GPU takes the prompt
+ * matmuls and the experts in tiles (a dedicated GPU with an int8 dot product in hardware: fuller
+ * tiles, LFM2.5-8B pp512 168 -> 271 tok/s on the GTX 1650), else 0 (keep the default) */
+int gpu_prompt_batch(int device) {
+    CLApi cl;
+    if (!cl_load(&cl)) return 0;
+    const char *mmin = getenv("PITHOS_CL_MIN");
+    if (mmin && atoi(mmin) <= 0) return 0;
+    DevInfo d[32];
+    const int n = list_devices(&cl, d, 32);
+    int pick = -1;
+    if (device >= 0 && device < n) pick = device;
+    else
+        for (int i = 0; i < n; i++)
+            if (d[i].gpu && !d[i].unified && (pick < 0 || d[i].mem > d[pick].mem)) pick = i;
+    if (pick < 0 || d[pick].unified) return 0;
+    const int dot = pick_dot(&d[pick]);
+    return dot == DOT_PTX || dot == DOT_KHR ? 256 : 0;
 }
 
 /* ------------------------------------------------------------------ uploader */
@@ -637,8 +663,8 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
             return NULL;
         }
         g->lk = lock_create(); /* no expert cache: only take_uploads uses it */
-        snprintf(info, infolen, "%s | %s | all layers in VRAM (%.2f GB)", dv->name, path_name(g->dot),
-                 g->dense_bytes / 1073741824.0);
+        snprintf(info, infolen, "%s | %s | all layers in VRAM (%.2f GB)%s", dv->name, path_name(g->dot),
+                 g->dense_bytes / 1073741824.0, g->mm_min > 0 ? " | prompt matmuls" : "");
         return g;
     }
     g->spa = (int)(per_arena / slot);
@@ -682,6 +708,22 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
             g->h_x = (float *)(g->h_meta + 2 * g->max_assign);
         }
     }
+    /* tiled prompt experts: on where the prompt matmuls are (hardware int8 dot, dedicated GPU);
+     * PITHOS_GPU_MOETILE=0/1 overrides */
+    const char *mt = getenv("PITHOS_GPU_MOETILE");
+    g->moe_tiled = (mt ? atoi(mt) > 0 : !g->unified && (g->dot == DOT_PTX || g->dot == DOT_KHR)) && D % 256 == 0 && F % 256 == 0 &&
+                   g->max_tok > 1;
+    if (g->moe_tiled && ok) {
+        g->k_mtile = cl->CreateKernel(g->prog, "moe_tile", &err);
+        g->k_quant = cl->CreateKernel(g->prog, "quant_q8k", &err);
+        g->d_xq = mkbuf(g, CL_MEM_READ_WRITE, (size_t)g->max_tok * (D / 256) * 292, &ok);
+        g->d_aq = mkbuf(g, CL_MEM_READ_WRITE, (size_t)g->max_assign * (F / 256) * 292, &ok);
+        g->d_tiles = mkbuf(g, CL_MEM_READ_ONLY, sizeof(int) * 4 * (size_t)(g->max_assign + 64), &ok);
+        g->d_order = mkbuf(g, CL_MEM_READ_ONLY, sizeof(int) * (size_t)g->max_assign, &ok);
+        g->h_order = (int *)malloc(sizeof(int) * (size_t)g->max_assign);
+        g->h_tiles = (int (*)[4])malloc(sizeof(int) * 4 * (size_t)(g->max_assign + 64));
+        if (!g->k_mtile || !g->k_quant || !g->h_order || !g->h_tiles) g->moe_tiled = 0;
+    }
     if (!ok || !g->h_meta || !g->h_y) {
         snprintf(info, infolen, "GPU buffer allocation failed");
         gpu_destroy(g);
@@ -717,8 +759,9 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     /* with a profile, queue the hottest experts right away: VRAM fills in the background */
     gpu_rebalance(g, g->n_slots);
     double gb = (double)g->n_slots * slot / 1073741824.0;
-    snprintf(info, infolen, "%s | %s | %d expert slots (%.2f GB VRAM, %.0f%% of the experts)%s", dv->name,
-             path_name(g->dot), g->n_slots, gb, 100.0 * g->n_slots / (ok_layers * m->n_expert), dense_note);
+    snprintf(info, infolen, "%s | %s | %d expert slots (%.2f GB VRAM, %.0f%% of the experts)%s%s", dv->name,
+             path_name(g->dot), g->n_slots, gb, 100.0 * g->n_slots / (ok_layers * m->n_expert), dense_note,
+             g->moe_tiled ? " | prompt in tiles" : g->mm_min > 0 ? " | prompt matmuls" : "");
     g->st.slots = g->n_slots;
     return g;
 }
@@ -768,10 +811,10 @@ void gpu_destroy(Gpu *g) {
     for (int i = 0; i < g->n_fresh; i++) cl->ReleaseEvent(g->fresh[i]);
     free(g->fresh);
     if (g->dl) dense_free(g);
-    cl_mem bufs[] = { g->d_meta, g->d_gu, g->d_y, g->p_meta, g->p_y };
+    cl_mem bufs[] = { g->d_meta, g->d_gu, g->d_y, g->p_meta, g->p_y, g->d_xq, g->d_aq, g->d_tiles, g->d_order };
     for (size_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) if (bufs[i]) cl->ReleaseMemObject(bufs[i]);
     for (int a = 0; a < g->n_arenas; a++) if (g->arena[a]) cl->ReleaseMemObject(g->arena[a]);
-    cl_kernel ks[] = { g->k_gu, g->k_down };
+    cl_kernel ks[] = { g->k_gu, g->k_down, g->k_mtile, g->k_quant };
     for (size_t i = 0; i < sizeof(ks) / sizeof(ks[0]); i++) if (ks[i]) cl->ReleaseKernel(ks[i]);
     if (g->prog) cl->ReleaseProgram(g->prog);
     if (g->qup) cl->ReleaseCommandQueue(g->qup);
@@ -779,6 +822,8 @@ void gpu_destroy(Gpu *g) {
     if (g->ctx) cl->ReleaseContext(g->ctx);
     if (g->lk) lock_destroy(g->lk);
     free(g->req);
+    free(g->h_order);
+    free(g->h_tiles);
     free(g->slot_owner);
     free((void *)g->slot_state);
     free(g);
@@ -817,6 +862,70 @@ static void submit_job(Gpu *g) {
 
     const cl_ulong sb = g->slot_bytes, upo = g->up_off[layer], dno = g->down_off[layer];
     const int gt = g->gate_type[layer], dt = g->down_type[layer];
+    if (g->job_tiled) {
+        const int nt = g->n_tiles, xqs = (D / 256) * 292, aqs = (F / 256) * 292, ys_gu = 2 * F;
+        check(g, cl->EnqueueWriteBuffer(g->q, g->d_order, 0, 0, sizeof(int) * (size_t)n_assign, g->h_order, 0, NULL, NULL), "write order");
+        check(g, cl->EnqueueWriteBuffer(g->q, g->d_tiles, 0, 0, sizeof(int) * 4 * (size_t)nt, g->h_tiles, 0, NULL, NULL), "write tiles");
+        const cl_ulong x_off = 2 * (cl_ulong)g->max_assign, zero = 0;
+        const int zi = 0, one = 1;
+        /* x -> Q8_K, one row per token */
+        cl_kernel q = g->k_quant;
+        cl->SetKernelArg(q, 0, sizeof(cl_mem), &g->d_meta);
+        cl->SetKernelArg(q, 1, sizeof(cl_ulong), &x_off);
+        cl->SetKernelArg(q, 2, sizeof(int), &D);
+        cl->SetKernelArg(q, 3, sizeof(int), &D);
+        cl->SetKernelArg(q, 4, sizeof(int), &zi);
+        cl->SetKernelArg(q, 5, sizeof(cl_mem), &g->d_xq);
+        cl->SetKernelArg(q, 6, sizeof(int), &xqs);
+        const size_t qg1[1] = { (size_t)g->job_ntok * 256 }, ql[1] = { 256 };
+        launch(g, q, 1, qg1, ql, 0, "quant x");
+        /* gate and up */
+        cl_kernel k = g->k_mtile;
+        for (int a = 0; a < MAX_ARENAS; a++) cl->SetKernelArg(k, (cl_uint)a, sizeof(cl_mem), &g->arena[a]);
+        cl->SetKernelArg(k, 4, sizeof(int), &g->spa);
+        cl->SetKernelArg(k, 5, sizeof(cl_ulong), &sb);
+        cl->SetKernelArg(k, 6, sizeof(cl_mem), &g->d_tiles);
+        cl->SetKernelArg(k, 7, sizeof(cl_mem), &g->d_order);
+        cl->SetKernelArg(k, 8, sizeof(cl_mem), &g->d_meta);
+        cl->SetKernelArg(k, 9, sizeof(int), &g->max_assign);
+        cl->SetKernelArg(k, 10, sizeof(int), &zi);
+        cl->SetKernelArg(k, 11, sizeof(cl_ulong), &upo);
+        cl->SetKernelArg(k, 12, sizeof(cl_ulong), &dno);
+        cl->SetKernelArg(k, 13, sizeof(int), &gt);
+        cl->SetKernelArg(k, 14, sizeof(int), &F);
+        cl->SetKernelArg(k, 15, sizeof(int), &D);
+        cl->SetKernelArg(k, 16, sizeof(cl_mem), &g->d_xq);
+        cl->SetKernelArg(k, 17, sizeof(int), &xqs);
+        cl->SetKernelArg(k, 18, sizeof(cl_mem), &g->d_gu);
+        cl->SetKernelArg(k, 19, sizeof(int), &ys_gu);
+        const size_t lws[2] = { 256, 1 };
+        const size_t g_gu[2] = { (size_t)((F + 63) / 64) * 256, (size_t)(2 * nt) };
+        launch(g, k, 2, g_gu, lws, 0, "moe_tile gate_up");
+        /* SiLU(gate) * up -> Q8_K, one row per assignment */
+        cl->SetKernelArg(q, 0, sizeof(cl_mem), &g->d_gu);
+        cl->SetKernelArg(q, 1, sizeof(cl_ulong), &zero);
+        cl->SetKernelArg(q, 2, sizeof(int), &ys_gu);
+        cl->SetKernelArg(q, 3, sizeof(int), &F);
+        cl->SetKernelArg(q, 4, sizeof(int), &one);
+        cl->SetKernelArg(q, 5, sizeof(cl_mem), &g->d_aq);
+        cl->SetKernelArg(q, 6, sizeof(int), &aqs);
+        const size_t qg2[1] = { (size_t)n_assign * 256 };
+        launch(g, q, 1, qg2, ql, 0, "quant act");
+        /* down */
+        cl->SetKernelArg(k, 10, sizeof(int), &one);
+        cl->SetKernelArg(k, 13, sizeof(int), &dt);
+        cl->SetKernelArg(k, 14, sizeof(int), &D);
+        cl->SetKernelArg(k, 15, sizeof(int), &F);
+        cl->SetKernelArg(k, 16, sizeof(cl_mem), &g->d_aq);
+        cl->SetKernelArg(k, 17, sizeof(int), &aqs);
+        cl->SetKernelArg(k, 18, sizeof(cl_mem), &g->d_y);
+        cl->SetKernelArg(k, 19, sizeof(int), &D);
+        const size_t g_dn[2] = { (size_t)((D + 63) / 64) * 256, (size_t)nt };
+        launch(g, k, 2, g_dn, lws, 1, "moe_tile down");
+        check(g, cl->EnqueueReadBuffer(g->q, g->d_y, 0, 0, sizeof(float) * D * n_assign, g->h_y, 0, NULL, NULL), "read y");
+        check(g, cl->Finish(g->q), "esecuzione");
+        return;
+    }
     const size_t lws[2] = { (size_t)g->mvwg, 1 };
     const size_t gws_gu[2] = { (size_t)((F + g->rows_wg - 1) / g->rows_wg) * g->mvwg, (size_t)(2 * n_assign) };
     const size_t gws_dn[2] = { (size_t)((D + g->rows_wg - 1) / g->rows_wg) * g->mvwg, (size_t)n_assign };
@@ -907,6 +1016,28 @@ void gpu_moe_begin(Gpu *g, int layer, const float *x, int n_tok, const int *a_ex
         g->h_xidx[i] = a_tok[i];
     }
     memcpy(g->h_x, x, sizeof(float) * D * n_tok);
+    /* a prompt batch: the assignments grouped by slot, in tiles of up to 64 */
+    g->job_tiled = g->moe_tiled && n_tok > 1;
+    if (g->job_tiled) {
+        int *o = g->h_order;
+        for (int i = 0; i < n_assign; i++) { /* insertion sort by slot (a few hundred assignments) */
+            int k = i;
+            while (k > 0 && g->h_slots[o[k - 1]] > g->h_slots[i]) { o[k] = o[k - 1]; k--; }
+            o[k] = i;
+        }
+        int nt = 0;
+        for (int i = 0; i < n_assign;) {
+            int j = i;
+            while (j < n_assign && j - i < 64 && g->h_slots[o[j]] == g->h_slots[o[i]]) j++;
+            g->h_tiles[nt][0] = g->h_slots[o[i]];
+            g->h_tiles[nt][1] = i;
+            g->h_tiles[nt][2] = j - i;
+            g->h_tiles[nt][3] = 0;
+            nt++;
+            i = j;
+        }
+        g->n_tiles = nt;
+    }
     g->job_layer = layer;
     g->job_ntok = n_tok;
     g->cur_assign = n_assign;
