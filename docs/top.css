@@ -23,3 +23,14 @@
   .hero-figures dt{font-size:17px}
   .hero-figures dd{font-size:11px}
 }
+
+/* Pandora presents the figures (mascot.js): a gradient trail along the top line, figures lit in turn */
+.hero-stage{position:relative;margin-top:52px}
+.hero-stage .hero-figures{margin-top:0}
+.hero-trail{position:absolute;left:0;top:-1px;width:0;height:1px;background:linear-gradient(90deg,#7c5cf6,#ec5c8c 55%,#ffc460);pointer-events:none}
+.hero-guide{position:absolute;left:0;top:-32px;width:30px;height:30px;padding:0;border:0;background:none;cursor:pointer;opacity:0;transition:opacity .3s;transform-origin:50% 100%}
+.hero-guide img{display:block;width:30px;height:30px}
+.hero-guide.in,.hero-guide.here{opacity:1}
+.hero-guide:focus-visible{outline:2px solid var(--ink);outline-offset:3px;border-radius:6px}
+.hero-figures dt,.hero-figures dd{transition:opacity .4s}
+.hero-figures.play>div:not(.on) dt,.hero-figures.play>div:not(.on) dd{opacity:.3}
