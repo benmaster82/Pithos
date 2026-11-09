@@ -621,8 +621,9 @@ static char *trim_dup(const char *s) {
     return r;
 }
 
-/* One chat turn. Returns 0 if the context overflowed. */
+/* One chat turn. Returns 0 if the context overflowed or was lost with a failing GPU (ctx_lost). */
 static int chat_turn(Engine *e, const char *user, int first) {
+    const int lost0 = ctx_lost(e->ctx);
     Str p = { 0 };
     if (first) {
         str_add(&p, "<|startoftext|>", -1);
@@ -648,6 +649,11 @@ static int chat_turn(Engine *e, const char *user, int first) {
     }
     int last;
     char *gen = generate(e, think, &last);
+    if (ctx_lost(e->ctx) != lost0) {   /* the answer stopped where the GPU failed */
+        ctx_snapshot_free(&snap);
+        free(gen);
+        return 0;
+    }
     double tp = e->t_prompt - tp0;
     int npr = e->n_prompt - np0;
     print_stats(e, tp, npr, e->t_gen - tg0, e->n_gen - ng0);
@@ -754,6 +760,7 @@ static int tools_cli(const Args *a) {
 /* ------------------------------------------------------------------ main */
 
 static int real_main(int argc, char **argv) {
+    int status = 0;   /* 1: the run failed (the GPU, or a context too small) */
     Args a;
     if (!parse_args(argc, argv, &a)) return 1;
     console_init();
@@ -970,8 +977,13 @@ static int real_main(int argc, char **argv) {
             int save = tk0[0];
             if (bos) tk0[0] = tok_bos(tk);
             ctx_reset(ctx);
-            ctx_forward_all(ctx, tk0, nc, lg);
+            const int ok = ctx_forward_all(ctx, tk0, nc, lg);
             tk0[0] = save;
+            if (!ok) {
+                fprintf(stderr, "\nperplexity aborted: the GPU failed\n");
+                status = 1;
+                break;
+            }
             for (int j = first; j < nc - 1; j++) {
                 const float *l = lg + (size_t)j * m.n_vocab;
                 float mx = l[0];
@@ -984,7 +996,7 @@ static int real_main(int argc, char **argv) {
             printf("[%d]%.4f ", ch + 1, exp(nll / count));
             fflush(stdout);
         }
-        printf("\nPPL = %.4f (%d tokens evaluated, %.1f s)\n", exp(nll / (count ? count : 1)), count, time_sec() - tp);
+        if (!status) printf("\nPPL = %.4f (%d tokens evaluated, %.1f s)\n", exp(nll / (count ? count : 1)), count, time_sec() - tp);
         free(lg); free(ids); free(txt);
     } else if (a.bench) {
         int npp = a.bench_pp, ntg = a.bench_tg;
@@ -1005,11 +1017,12 @@ static int real_main(int argc, char **argv) {
             }
             printf("VRAM cache fill: %.1f s\n", time_sec() - tw);
         }
-        /* warm-up: touch weights once */
+        /* warm-up: touch weights once. A GPU failure stops the benchmark: its numbers would mix two devices */
+        const int lost0 = ctx_lost(ctx);
         ctx_forward(ctx, ids, 1);
         ctx_reset(ctx);
         double tb = 0;
-        for (int pass = 0; pass < 2 && npp > 0; pass++) {
+        for (int pass = 0; pass < 2 && npp > 0 && ctx_lost(ctx) == lost0; pass++) {
             ctx_reset(ctx);
             memset(ctx_stats(ctx), 0, sizeof(Stats));
             uint64_t pf0, rss0, pf1, rss1;
@@ -1017,6 +1030,7 @@ static int real_main(int argc, char **argv) {
             tb = time_sec();
             ctx_forward(ctx, ids, npp);
             double tpp = time_sec() - tb;
+            if (ctx_lost(ctx) != lost0) break;
             proc_mem_stats(&pf1, &rss1);
             printf("pp%d %s: %.2f tok/s (%.2f s) | page fault %.0f (%.2f GB) | working set %.2f GB\n", npp,
                    pass ? "(warm)" : "(first)", npp / tpp, tpp, (double)(pf1 - pf0), (pf1 - pf0) * 4096.0 / 1073741824.0,
@@ -1024,7 +1038,7 @@ static int real_main(int argc, char **argv) {
             if (pass) print_profile(ctx_stats(ctx), npp, "warm prompt");
         }
         /* two identical generation passes: the second one runs with the touched experts resident */
-        for (int pass = 0; pass < 2; pass++) {
+        for (int pass = 0; pass < 2 && ctx_lost(ctx) == lost0; pass++) {
             ctx_reset(ctx);
             if (npp > 0) ctx_forward(ctx, ids, npp < 16 ? npp : 16);
             int tok = 1000;
@@ -1034,29 +1048,45 @@ static int real_main(int argc, char **argv) {
             tb = time_sec();
             for (int i = 0; i < ntg; i++) {
                 float *lg = ctx_forward(ctx, &tok, 1);
+                if (!lg) break;
                 int best = 0;
                 for (int v = 1; v < m.n_vocab; v++) if (lg[v] > lg[best]) best = v;
                 tok = best;
             }
             double ttg = time_sec() - tb;
+            if (ctx_lost(ctx) != lost0) break;
             printf("tg%d %s: %.2f tok/s (%.2f s) | effective weight bandwidth ~%.1f GB/s\n", ntg, pass ? "(warm)" : "(first)",
                    ntg / ttg, ttg, m.bytes_per_token * (ntg / ttg) / 1e9);
             proc_mem_stats(&pf1, &rss1);
             printf("   page fault/token: %.0f | working set %.2f GB\n", (double)(pf1 - pf0) / (ntg ? ntg : 1),
                    rss1 / 1073741824.0);
         }
-        print_profile(ctx_stats(ctx), ntg, "warm generation");
-        if (a.verbose) print_expert_coverage(&m, ctx_stats(ctx));
+        if (ctx_lost(ctx) != lost0) {
+            fprintf(stderr, "benchmark aborted: the GPU failed\n");
+            status = 1;
+        } else {
+            print_profile(ctx_stats(ctx), ntg, "warm generation");
+            if (a.verbose) print_expert_coverage(&m, ctx_stats(ctx));
+        }
         free(ids);
     } else if (a.raw) {
-        if (!feed_text(&e, a.prompt)) { fprintf(stderr, "prompt too long for the context\n"); return 1; }
+        if (!feed_text(&e, a.prompt)) {
+            fprintf(stderr, ctx_lost(ctx) ? "the prompt was lost with the GPU\n" : "prompt too long for the context\n");
+            return 1;
+        }
         out_str(a.prompt);
         int last;
         char *g = generate(&e, 0, &last);
-        print_stats(&e, e.t_prompt, e.n_prompt, e.t_gen, e.n_gen);
+        if (ctx_lost(ctx)) {
+            fprintf(stderr, "\n[generation stopped: the GPU failed]\n");
+            status = 1;
+        } else print_stats(&e, e.t_prompt, e.n_prompt, e.t_gen, e.n_gen);
         free(g);
     } else if (!a.interactive) {
-        if (!chat_turn(&e, a.prompt, 1)) fprintf(stderr, "context full\n");
+        if (!chat_turn(&e, a.prompt, 1)) {
+            fprintf(stderr, ctx_lost(ctx) ? "\n[answer stopped: the GPU failed]\n" : "context full\n");
+            status = 1;
+        }
     } else {
         fprintf(stderr, "chat ready. Commands: /reset new conversation, /exit quit.\n");
         int first = 1;
@@ -1075,8 +1105,10 @@ static int real_main(int argc, char **argv) {
                 out_str("[conversation reset]\n");
                 continue;
             }
+            const int lost0 = ctx_lost(ctx);
             if (!chat_turn(&e, line, first)) {
-                out_str("\n[context full: conversation reset]\n");
+                out_str(ctx_lost(ctx) != lost0 ? "\n[the GPU failed: conversation reset, send the message again]\n"
+                                               : "\n[context full: conversation reset]\n");
                 ctx_reset(ctx);
                 sampler_reset_history(&e.smp);
                 first = 1;
@@ -1094,7 +1126,7 @@ static int real_main(int argc, char **argv) {
     pool_destroy(pool);
     tok_free(tk);
     model_free(&m);
-    return 0;
+    return status;
 }
 
 #if defined(PITHOS_UWP)

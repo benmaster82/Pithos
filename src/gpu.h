@@ -49,13 +49,17 @@ int gpu_pending(Gpu *g);
  * Per token: gpu_dense_begin; then for every MoE layer, in order, gpu_dense_wait gives the
  * residual x, the normalized input h and ret = sel[K] | slot[K] | weight bits[K] (slot < 0:
  * the CPU computes that expert) and gpu_dense_moe_finish adds the CPU part (weighted sum, or
- * NULL); finally gpu_dense_logits. The pointers stay valid until gpu_dense_moe_finish. */
+ * NULL); finally gpu_dense_logits. The pointers stay valid until gpu_dense_moe_finish.
+ * gpu_dense_wait and gpu_dense_logits return 0 once an OpenCL call has failed: the results
+ * are not valid (finish the remaining layers with ycpu NULL, then drop the token). */
 int  gpu_dense_on(const Gpu *g);
+/* Has any OpenCL call failed? The device then stays unusable (sticky). */
+int  gpu_failed(const Gpu *g);
 /* rope_cs: cos[hd/2] | sin[hd/2] of this position; rope_swa: the same for sliding-window layers (NULL: none) */
 void gpu_dense_begin(Gpu *g, const float *x, const float *rope_cs, const float *rope_swa, int pos);
-void gpu_dense_wait(Gpu *g, int layer, const float **x, const float **h, const int **ret);
+int  gpu_dense_wait(Gpu *g, int layer, const float **x, const float **h, const int **ret);
 void gpu_dense_moe_finish(Gpu *g, int layer, const float *ycpu);
-void gpu_dense_logits(Gpu *g, float *out);
+int  gpu_dense_logits(Gpu *g, float *out);
 /* copy KV rows [r0, r1) of every attention layer ([n_attn][n_ctx][kvd] f16 layout) and the
  * convolution state between the host copy and VRAM */
 void gpu_dense_kv(Gpu *g, uint16_t *kc, uint16_t *vc, int r0, int r1, int to_gpu);

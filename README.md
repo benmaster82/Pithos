@@ -1092,6 +1092,7 @@ for each of the 30 convolution layers.
 | `PITHOS_VK_SPIN=MS` | Vulkan: how long the CPU polls a submit before waiting in the driver (default 50) |
 | `PITHOS_VK_MAXBUF=MB` | Vulkan: a lower buffer size limit, to test the splitting of large matrices |
 | `PITHOS_VK_FAIL=N` | Vulkan: simulate a GPU failure at the Nth whole-pass submit, to test the fallback to the CPU |
+| `PITHOS_CL_FAIL=N` | OpenCL: simulate a GPU failure at the Nth generated token, to test the fallback to the CPU |
 
 ## Limitations
 Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).

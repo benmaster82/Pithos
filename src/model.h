@@ -102,10 +102,12 @@ int    ctx_kv_write(const Context *c, int n, FILE *f);
 int    ctx_kv_read(Context *c, int n, int n_file, FILE *f);
 
 /* Feed tokens; returns logits (n_vocab floats, owned by ctx) for the last token,
- * or NULL if the context is full. */
+ * or NULL if the context is full or was lost with a failing GPU (then reset, see ctx_lost). */
 float *ctx_forward(Context *c, const int *tokens, int n);
 /* Like ctx_forward but writes logits for every token into out[n][n_vocab]. */
 int ctx_forward_all(Context *c, const int *tokens, int n, float *out);
+/* How many times the context was lost with a failing GPU (it then goes on on the CPU). */
+int ctx_lost(const Context *c);
 
 Stats *ctx_stats(Context *c);
 

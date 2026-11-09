@@ -1342,6 +1342,7 @@ static void dense_free(Gpu *g) {
 }
 
 int gpu_dense_on(const Gpu *g) { return g && g->dense; }
+int gpu_failed(const Gpu *g) { return g && g->reported; }
 
 
 static void arg(Gpu *g, cl_kernel k, cl_uint i, size_t sz, const void *v) { g->cl.SetKernelArg(k, i, sz, v); }
@@ -1537,7 +1538,9 @@ static void wait_event(Gpu *g, cl_event ev) {
     double t0 = time_sec();
     for (;;) {
         cl_int st = 1;
-        if (g->cl.GetEventInfo(ev, CL_EVENT_COMMAND_EXECUTION_STATUS, sizeof(st), &st, NULL) != 0 || st <= 0) break;
+        cl_int e = g->cl.GetEventInfo(ev, CL_EVENT_COMMAND_EXECUTION_STATUS, sizeof(st), &st, NULL);
+        if (e || st < 0) check(g, e ? e : st, "wait");   /* no event (its enqueue failed) or a failed command */
+        if (e || st <= 0) break;
         cpu_relax();
     }
     g->st.t_wait += time_sec() - t0;
@@ -1774,13 +1777,14 @@ static void dense_enqueue_upto(Gpu *g, int upto) {
     g->cl.Flush(g->q);
 }
 
-void gpu_dense_wait(Gpu *g, int l, const float **x, const float **h, const int **ret) {
+int gpu_dense_wait(Gpu *g, int l, const float **x, const float **h, const int **ret) {
     wait_event(g, g->ev_r[l]);
-    g->cl.ReleaseEvent(g->ev_r[l]);
+    if (g->ev_r[l]) g->cl.ReleaseEvent(g->ev_r[l]);
     g->ev_r[l] = NULL;
     *x = g->h_out;
     *h = g->h_out + g->m->dim;
     *ret = (const int *)(g->h_out + 2 * g->m->dim);
+    return !g->reported;
 }
 
 void gpu_dense_moe_finish(Gpu *g, int l, const float *ycpu) {
@@ -1800,12 +1804,19 @@ void gpu_dense_moe_finish(Gpu *g, int l, const float *ycpu) {
     dense_enqueue_upto(g, next_moe(g->m, l) + 1 + g->lookahead);
 }
 
-void gpu_dense_logits(Gpu *g, float *out) {
+int gpu_dense_logits(Gpu *g, float *out) {
     dense_enqueue_upto(g, g->m->n_layer);
     wait_event(g, g->ev_logits);
-    g->cl.ReleaseEvent(g->ev_logits);
+    if (g->ev_logits) g->cl.ReleaseEvent(g->ev_logits);
     g->ev_logits = NULL;
+    static int tokens;   /* PITHOS_CL_FAIL=N: the readback "fails" at token N, to test the CPU fallback */
+    if (getenv("PITHOS_CL_FAIL") && ++tokens == atoi(getenv("PITHOS_CL_FAIL"))) {
+        fprintf(stderr, "OpenCL: simulated GPU failure (PITHOS_CL_FAIL)\n");
+        check(g, -5, "read logits");   /* CL_OUT_OF_RESOURCES, as reported on Intel (issue 3) */
+    }
+    if (g->reported) return 0;   /* the buffer may never have been written */
     memcpy(out, g->h_logits, sizeof(float) * (size_t)g->m->n_vocab);
+    return 1;
 }
 
 void gpu_dense_finish(Gpu *g) { check(g, g->cl.Finish(g->q), "finish"); }

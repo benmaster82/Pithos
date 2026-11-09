@@ -226,6 +226,7 @@ struct Context {
     int vk_min;                 /* tokens per batch from which matmuls go to vk */
     int vk_dense, vk_chunks;    /* as dx_dense / dx_chunks, on vk */
     int gpu_lost;               /* the whole-pass GPU failed with the KV cache and state on it */
+    int n_lost;                 /* how many times that happened (ctx_lost) */
     float *rope;                /* [2][n_batch][head_dim] RoPE tables of a chunk's positions */
     /* dense decode path: single tokens run on the GPU, which keeps its own copy of the KV cache
      * and of the convolution state. Rows [0, kv_cpu_n) / [0, kv_gpu_n) are valid on each side. */
@@ -383,6 +384,7 @@ static void sync_to_cpu(Context *c, int kv_rows) {
     }
 }
 int ctx_pos(const Context *c) { return c->pos; }
+int ctx_lost(const Context *c) { return c->n_lost; }
 int ctx_n_ctx(const Context *c) { return c->n_ctx; }
 void ctx_set_prefetch(Context *c, int on) {
     if (on && !c->pfq) c->pfq = prefetcher_create();
@@ -951,6 +953,7 @@ static void moe_ffn(Context *c, const Layer *L, int layer, int n) {
         double tw = time_sec();
         gpu_moe_end(c->gpu, c->gy);
         c->stats.t_gpu_wait += time_sec() - tw;
+        if (gpu_failed(c->gpu)) c->gpu_lost = 1;   /* gy is not valid: ctx_forward drops the pass */
         for (int i = 0; i < n * K; i++) {
             if (!c->on_gpu[i]) continue;
             const float w = c->selw[i];
@@ -1076,6 +1079,19 @@ static void forward_vk(Context *c, const int *tokens, int n, float *logits) {
     c->conv_cpu_ok = 0;
 }
 
+/* an OpenCL call failed: the device is not used again. lost: the results of this pass are not
+ * valid (or the KV cache and state were on the GPU), so the context is lost like after a Vulkan
+ * or D3D12 failure (lost_state); otherwise the CPU already redid the work and carries on. */
+static void cl_lost(Context *c, int lost) {
+    if (lost) {
+        memset(c->logits, 0, sizeof(float) * (size_t)c->m->n_vocab);
+        c->gpu_lost = 1;
+    }
+    if (c->gpu) fprintf(stderr, "OpenCL failed: the GPU is not used any more\n");
+    c->gpu_dense = 0;
+    c->gpu = NULL;
+}
+
 static void forward_token_gpu(Context *c, int token, float *all_logits) {
     const Model *m = c->m;
     const int D = m->dim, K = m->n_expert_used, pos = c->pos;
@@ -1099,8 +1115,12 @@ static void forward_token_gpu(Context *c, int token, float *all_logits) {
         const float *gx, *gh;
         const int *ret;
         const double tw = time_sec();
-        gpu_dense_wait(g, l, &gx, &gh, &ret);
+        const int ok = gpu_dense_wait(g, l, &gx, &gh, &ret);
         c->stats.t_gpu_wait += time_sec() - tw;
+        if (!ok) {   /* garbage in ret: let the GPU run out its queue, the token is dropped below */
+            gpu_dense_moe_finish(g, l, NULL);
+            continue;
+        }
         memcpy(c->x, gx, sizeof(float) * D);
         memcpy(c->h, gh, sizeof(float) * D);
         int sel[8], slot[8];
@@ -1129,7 +1149,10 @@ static void forward_token_gpu(Context *c, int token, float *all_logits) {
         const int any = cpu_experts_one(c, L, sel, slot, w, c->out);
         gpu_dense_moe_finish(g, l, any ? c->out : NULL);
     }
-    gpu_dense_logits(g, c->logits);
+    if (!gpu_dense_logits(g, c->logits)) {
+        cl_lost(c, 1);
+        return;
+    }
     if (all_logits) memcpy(all_logits, c->logits, sizeof(float) * (size_t)m->n_vocab);
     c->pos++;
     c->tok_counter++;
@@ -1226,8 +1249,10 @@ static void forward_chunk(Context *c, const int *tokens, int n, int want_logits,
 /* after a failure of the whole-pass GPU its KV cache and state are gone: the context starts
  * again from position 0 on the CPU, and the caller sees the failure (NULL / 0) */
 static int lost_state(Context *c) {
+    if (gpu_failed(c->gpu)) cl_lost(c, 0);
     if (!c->gpu_lost) return 0;
     c->gpu_lost = 0;
+    c->n_lost++;
     ctx_reset(c);
     fprintf(stderr, "the context was lost with the GPU: continuing on the CPU from an empty context\n");
     return 1;
