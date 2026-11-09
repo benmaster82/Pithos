@@ -10,7 +10,8 @@ The English landing page is published automatically by GitHub Pages from
 - `engine.css`: ice-white typography, architecture diagram, and technical tables.
 - `simple.css`: restrained presentation, responsive typography, and flat surfaces.
 - `models.css`: the model picker at the top (its data, as in `../models.tsv`, is in `app.js`).
-- `effects.js` / `effects.css`: decorative ASCII logo projection and inference pulses, with pause and reduced-motion support.
+- `effects.css`: a few pulses in the architecture diagram, then it rests (none with reduced motion).
+- `top.css`: the compact hero at the top of the page, loaded last.
 - `app.js`: model picker (it drives the guide and every command on the page), installation guide, CPU/GPU diagram, tabs, clipboard, and local progress storage.
 - `assets/`: original project graphics and self-hosted fonts with license files.
 - `xbox.html`, `xbox.css`, `xbox.js`: the Pithos.X Server story page (linked as "Xbox" in the top navigation); it reuses the shared stylesheets and the screenshots `xbox-tv.png` and `xbox-pandora-dark.png` from this folder.

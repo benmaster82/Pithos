@@ -1,0 +1,25 @@
+/* Top of the page: a compact, quiet hero. Loaded last, so it overrides the earlier hero rules. */
+.hero{padding-block:clamp(40px,6vh,64px);gap:clamp(28px,4vw,56px);align-items:start}
+.hero-copy{text-shadow:none}
+.hero-copy>.eyebrow{margin-bottom:16px;font:500 12px/1.5 var(--mono);letter-spacing:.6px;text-transform:uppercase;color:var(--muted)}
+.hero h1,.hero h1 em{font-family:var(--sans);font-size:clamp(34px,3.4vw,48px);font-weight:600;letter-spacing:-1.2px;line-height:1.15}
+.hero h1{margin:0 0 18px;text-wrap:balance}
+.hero h1 em{display:inline;color:var(--muted);-webkit-text-fill-color:currentColor;background:none}
+.hero-description{max-width:540px;font-size:16px;line-height:1.7;color:var(--muted)}
+.hero-figures{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0;max-width:540px;margin:28px 0 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.hero-figures>div{padding:14px 16px 14px 0}
+.hero-figures>div+div{padding-left:16px;border-left:1px solid var(--line)}
+.hero-figures dt{font:600 20px/1.2 var(--sans);letter-spacing:-.3px;color:var(--ink);font-variant-numeric:tabular-nums}
+.hero-figures dd{margin:4px 0 0;font:12px/1.45 var(--sans);color:var(--muted)}
+.hero-actions{margin-top:28px}
+.hero-note{margin-top:18px;font-size:12px;color:var(--muted)}
+.hero-visual .model-foot{font-size:12px}
+@media(max-width:680px){
+  .hero{padding-block:32px;gap:28px}
+  .hero h1,.hero h1 em{font-size:clamp(30px,8vw,38px);letter-spacing:-.8px}
+  .hero-description{font-size:15px}
+  .hero-figures>div{padding-right:10px}
+  .hero-figures>div+div{padding-left:10px}
+  .hero-figures dt{font-size:17px}
+  .hero-figures dd{font-size:11px}
+}
