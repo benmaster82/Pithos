@@ -41,7 +41,7 @@ Liquid AI's LFM2 / LFM2-MoE / LFM3 architectures and is tuned for `LFM2.5-24B-A2
 (24 billion parameters, about 2 billion active per token) on an ordinary laptop. Two smaller models
 are validated too: [LFM2.5-8B-A1B](#lfm25-8b-a1b-the-middle-ground), a mixture of experts that fits
 in 8 GB of RAM (about 22 tokens per second on the CPU alone), and the small
-[LFM3-1.7B](#lfm3-17b-small-and-fast): about 55 tokens per second with the GPU, 20 on the CPU alone.
+[LFM3-1.7B](#lfm3-17b-small-and-fast): about 80 tokens per second with the GPU, 20 on the CPU alone.
 
 **Pithos** is the engine and the server (in the myth, the *pithos* is Pandora's jar: it holds the
 model). **Pandora** is the agent in the web interface.

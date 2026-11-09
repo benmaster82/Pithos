@@ -18,7 +18,7 @@ const MODELS = {
   small:{id:'lfm3-1.7b',name:'LFM3-1.7B',file:'LFM3-1.7B-Q4_K_M.gguf',
     url:'https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/bad5729bba61d076fff20d2548e62526665af215/LFM3-1.7B-Q4_K_M.gguf',
     hash:'3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4',
-    download:'1.1 GB',ram:'4',gpu:'~55 tok/s',cpu:'~20 tok/s',
+    download:'1.1 GB',ram:'4',gpu:'~80 tok/s',cpu:'~20 tok/s',
     disk:'At least 2 GB free for the model',diskDetail:'About 1.1 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
     blurb:'1.7 billion parameters with sliding-window attention. Quick answers on modest hardware; the whole model fits in a 4 GB GPU.'}
 };
