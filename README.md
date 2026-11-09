@@ -48,7 +48,8 @@ model). **Pandora** is the agent in the web interface.
 
 - CPU inference with AVX2 / AVX / NEON integer kernels that read the quantized weights in place.
 - Optional OpenCL GPU acceleration: hot experts and all dense layers in VRAM, with the remaining experts
-  computed on the CPU in parallel.
+  computed on the CPU in parallel. On dedicated GPUs the prompt runs there too (LFM2.5-8B: almost 4×
+  the CPU alone).
 - Optional Direct3D 12 GPU acceleration (`--gpu d3d12`, Windows and Xbox): for dense models such as
   LFM3, the whole forward pass, prompt included, runs on the GPU.
 - Optional Vulkan GPU acceleration (`--gpu vulkan`, Windows and Linux; experimental): the same kernels
@@ -196,9 +197,9 @@ it for instructions, tool use and multilingual assistants rather than heavy prog
 
 | LFM2.5-8B-A1B on the reference laptop (`--bench`) | Prompt | Generation |
 |---|---:|---:|
-| CPU only (`--cpu`) | 73 tok/s | 22.5 tok/s |
-| OpenCL (default here): 55% of the experts and the dense layers in VRAM | 80 tok/s | 47 tok/s |
-| **OpenCL, with prompt matmuls on Vulkan (`--gpu opencl+vulkan`)** | **96 tok/s** | **54 tok/s** |
+| CPU only (`--cpu`) | 71–73 tok/s | 22.5 tok/s |
+| **OpenCL (default here): 55% of the experts and the dense layers in VRAM, prompt included** | **250–280 tok/s** | **50–56 tok/s** |
+| OpenCL, with prompt matmuls on Vulkan (`--gpu opencl+vulkan`) | 157 tok/s | 45–54 tok/s |
 | Vulkan (`--gpu vulkan`): dense matmuls only, the experts on the CPU | 79 tok/s | 24 tok/s |
 | Intel UHD Graphics (`--gpu vulkan --gpu-device N`) | 63 tok/s | 7.7 tok/s |
 
@@ -229,8 +230,9 @@ build/pithos -m models/LFM2.5-8B-A1B-Q4_K_M.gguf --server --open
 [LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B) is a 1.7-billion-parameter model
 that fits in 1.1 GB, with the same chat, server, Pandora and terminal agent. With a GPU every layer
 lives in VRAM (1.2 GB with a 8k context) and decoding runs there: about 55 tokens per second on the
-reference laptop (GTX 1650), against about 20 on the CPU alone. With OpenCL the prompt is read on
-the CPU (45-75 tokens per second). Through Vulkan (Windows and Linux, experimental) or Direct3D 12
+reference laptop (GTX 1650), against about 20 on the CPU alone. With OpenCL the prompt runs on the
+GPU too, at about 240 tokens per second (on GPUs without an int8 dot product in hardware, such as
+Intel's integrated ones, it stays on the CPU). Through Vulkan (Windows and Linux, experimental) or Direct3D 12
 (Windows) the whole forward pass runs on the GPU, which is faster on both counts: about 330 tokens
 per second of prompt, and 82 (Vulkan) or 69 (Direct3D 12) of generation. On a discrete NVIDIA GPU
 Pithos uses Vulkan for this model by default; `--gpu d3d12` or `--gpu opencl` choose the others.
@@ -239,8 +241,8 @@ This is also the model that runs on the [Xbox One](#xbox-one).
 | LFM3-1.7B on the reference laptop | Prompt | Generation |
 |---|---:|---:|
 | CPU only (`--cpu`) | 80–100 tok/s | 23 tok/s |
-| OpenCL (`--gpu opencl`) | 67–103 tok/s | 56 tok/s |
-| OpenCL, with prompt matmuls on Direct3D 12 (`--gpu opencl+d3d12`) | 190 tok/s | 56 tok/s |
+| OpenCL (`--gpu opencl`) | 236–245 tok/s | 55 tok/s |
+| OpenCL, with prompt matmuls on Direct3D 12 (`--gpu opencl+d3d12`) | 180–190 tok/s | 56–60 tok/s |
 | Direct3D 12 (`--gpu d3d12`) | 330 tok/s | 69 tok/s |
 | **Vulkan (default here, `--gpu vulkan`; experimental)** | **328 tok/s** | **82 tok/s** |
 
@@ -277,6 +279,10 @@ disk.
 | Real generation, 600-token essay (dense layers on GPU) | — | — | — | **14–18 tok/s** (11.4–14.1 with `--no-gpu-dense`) |
 | Working set (process RAM) | — | 10.7 GB (peak) | ~9.5 GB | **~6.9 GB** |
 | Perplexity (model license text, 4×256 tokens) | 2.683 | — | 2.638 | 2.671 |
+
+Since the prompt matmuls and the resident experts of the prompt run on the GPU (OpenCL, after
+v0.5.1), the warm 512-token prompt (`--bench`) went from about 52 to about 100 tok/s on this
+laptop; how much of the model is in RAM moves it a lot.
 
 Numbers move with the memory state and the temperature. On this laptop the CPU and GPU share one
 heatsink, and under combined load the GPU throttles (88 °C measured). The generation runs with dense
@@ -798,7 +804,7 @@ checkpoint and only processes the rest:
 | `-n N` | max tokens per answer (default 4096, reasoning included) |
 | `-c N` | context in tokens (default 8192, max 131072) |
 | `-t N` | threads (default: physical cores) |
-| `-b N` | prompt-processing batch (default 64) |
+| `-b N` | prompt-processing batch (default 64; 256 when OpenCL alone takes the prompt on a dedicated GPU) |
 | `--temp --top-k --top-p --min-p --repeat-penalty --seed` | sampling (defaults from the model card: 0.1 / 50 / 1.05) |
 | `--reasoning R` | reasoning level: `high` (default), `medium`, `low`, `off`, or a budget in tokens |
 | `--hide-think` | do not print the reasoning (`<think>…</think>`) |
@@ -839,15 +845,15 @@ checkpoint and only processes the rest:
 | `auto` (default) | dense models (LFM3): the whole forward pass through Vulkan, on a **discrete NVIDIA GPU** only; models with experts (LFM2.5-24B and 8B), or without such a GPU: OpenCL as below, on a dedicated GPU; otherwise the CPU | not having to choose |
 | `vulkan` | the whole forward pass of dense models; the matmuls of models with experts (Windows, Linux; experimental) | LFM3, fastest generation measured |
 | `d3d12` | the same through Direct3D 12 (Windows; Xbox in Game mode) | LFM3 on Windows, the Xbox |
-| `opencl` | hot experts and all dense layers in VRAM, the other experts on the CPU in parallel | the MoE models (LFM2.5-24B, 8B) |
-| `opencl+vulkan`, `opencl+d3d12` | OpenCL as above, with the prompt matmuls on the other backend | long prompts with MoE models; LFM2.5-8B, fastest measured |
+| `opencl` | hot experts and all dense layers in VRAM, the other experts on the CPU in parallel; on a dedicated GPU with an int8 dot product in hardware, the prompt matmuls and the resident experts of the prompt too | the MoE models (LFM2.5-24B, 8B), fastest measured |
+| `opencl+vulkan`, `opencl+d3d12` | OpenCL as above, with the prompt matmuls on the other backend | GPUs where OpenCL leaves the prompt on the CPU |
 | `off` (`--cpu`) | nothing | machines without a usable GPU |
 
 Why the models differ: the 24B model (14.5 GB) does not fit in a 4 GB GPU, nor does the 8B one
 (5.2 GB), and only the OpenCL backend keeps the most used experts in VRAM (55% of the 8B's experts
 on the 4 GB GTX 1650); Vulkan and Direct3D 12 hold the dense layers only and
 leave the experts, most of the work, on the CPU. LFM3 fits whole, and there the
-whole-pass backends are 3–5 times faster on the prompt. `auto` uses Vulkan only on NVIDIA, the
+whole-pass backends are about 1.3 times faster than OpenCL on the prompt and 1.5 times in generation. `auto` uses Vulkan only on NVIDIA, the
 vendor it has been measured on; on integrated GPUs it stays off, since the CPU is faster there (on
 the reference laptop's Intel UHD: 10 tokens per second of generation against about 20 on the CPU).
 When a backend asked for explicitly cannot start, Pithos says why and runs on the CPU; it never
@@ -860,8 +866,8 @@ while Vulkan keeps the whole forward pass up to `-c 114688` (212 / 61) and the m
 (`-c 131072`: 170 / 36).
 
 **Other GPUs.** `auto` was measured on the reference laptop only. On AMD or Intel Arc cards it
-chooses OpenCL, because Vulkan has not been tested there; with the 24B model on a GPU with a lot of
-VRAM, `--gpu opencl+vulkan` may read the prompt faster than OpenCL alone. In those cases compare the
+chooses OpenCL, because Vulkan has not been tested there. Where the driver offers no int8 dot product
+in hardware, OpenCL leaves the prompt on the CPU and `--gpu opencl+vulkan` may read it faster. In those cases compare the
 backends on your machine with `--bench` (for example `--gpu vulkan --bench` against
 `--gpu opencl --bench`) and keep the fastest; reports of the numbers are welcome.
 
@@ -968,8 +974,18 @@ for each of the 30 convolution layers.
     - q/k/v in one launch;
     - norm + router + top-k in one kernel (the last work-group picks the experts);
     - q/k preparation inside attention.
-  - **Prompt:** prompt processing stays on the CPU batch path. The KV cache and the convolution state
-    are synced only when switching between the two paths.
+  - **Prompt:** the CPU batch path, with its matmuls on the GPU where the driver has an int8 dot
+    product in hardware (dedicated GPUs: PTX `dp4a` on NVIDIA, `cl_khr_integer_dot_product`
+    elsewhere). They reuse the dense weights already in VRAM: Q8_K activations from the CPU,
+    64 rows × 64 tokens per work-group with int8 tiles in local memory, a matrix-vector kernel
+    below 32 tokens. The resident experts are grouped by expert into tiles of up to 64 tokens,
+    with the activations quantized on the GPU; there the prompt batch grows to 256 tokens (unless
+    `-b` is given) so the tiles fill up. The KV cache and the convolution state are synced only
+    when switching between the prompt and generation paths.
+  - **Portability:** the kernels are built for what the driver reports. The int8 dot product
+    comes from PTX on NVIDIA, from `cl_khr_integer_dot_product` where it is accelerated, and is
+    emulated otherwise; if those builds fail, an f32 build is used. Intel GPUs get their own
+    matrix-vector kernels (64 values per lane, work-groups of 128).
 
 ### GPU through Direct3D 12 (Windows and Xbox)
 - **Runtime loading:** `d3d12.dll` is loaded at runtime, and the shaders are precompiled DXBC
@@ -1056,9 +1072,18 @@ for each of the 30 convolution layers.
 | `PITHOS_GPU_PROFILE=1` | GPU kernel timings |
 | `PITHOS_GPU_SYNC=1` | sync after every kernel (debug) |
 | `PITHOS_GPU_NODP4A=1` | force the f32 path |
+| `PITHOS_GPU_DOT=ptx`, `khr`, `emu`, `f32` | OpenCL: the int8 dot product (default: the best the driver offers) |
+| `PITHOS_GPU_LPR=N` | OpenCL: lanes per matrix row, 8 to 64 (default 8) |
+| `PITHOS_GPU_MVWG=N` | OpenCL: matrix-vector work-group size, 64 to 256 (default 256, 128 on Intel) |
+| `PITHOS_GPU_INTELMV=0` / `1` | OpenCL: Intel matrix-vector kernels off / on (default on Intel) |
+| `PITHOS_GPU_BUILDLOG=1`, `PITHOS_GPU_CLOPTS=...` | OpenCL: print the kernel build log; extra build options |
+| `PITHOS_CL_MIN=N` | OpenCL: prompt matmuls on the GPU from N tokens, 0 never (default 8 on dedicated GPUs with a hardware int8 dot, else 0) |
+| `PITHOS_CL_TILE=N`, `PITHOS_CL_TT=N` | OpenCL: tokens from which the tiled kernel is used (32); tokens per matrix-vector pass (8) |
+| `PITHOS_GPU_MOETILE=0` / `1` | OpenCL: prompt experts in tiles off / on |
+| `PITHOS_CL_CHECK=1` | OpenCL: redo every prompt matmul on the CPU and report the differences (debug) |
 | `PITHOS_GPU_RPW=N` | rows per group of 32 lanes in the GPU kernels |
 | `PITHOS_GPU_DENSE=0` | same as `--no-gpu-dense` |
-| `PITHOS_GPU_EAGER=0` | do not flush the queue after every kernel |
+| `PITHOS_GPU_EAGER=0` / `1` | do not flush / flush the queue after every kernel (default: flush, except on Intel) |
 | `PITHOS_GPU_LOOKAHEAD=1` | queue the next layer behind a user event (slower with NVIDIA drivers on Windows) |
 | `PITHOS_DX_DENSE=0` | Direct3D 12: matmuls only, the rest on the CPU |
 | `PITHOS_DX_CHUNKS=0` | Direct3D 12: prompt chunks go through the CPU path (only single tokens run whole on the GPU) |

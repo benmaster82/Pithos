@@ -162,10 +162,10 @@
           <tr><th scope="row">CPU weight formats</th><td>Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16, F32.</td></tr>
           <tr><th scope="row">CPU kernels</th><td>Scalar fallback; runtime-selected AVX2 / FMA / F16C on x86-64. NEON implemented for ARM64.</td></tr>
           <tr><th scope="row">GPU backend</th><td>Optional, runtime-loaded OpenCL, Q4_K and Q6_K weights. MoE models: hot experts and dense layers in VRAM. Dense models: every layer in VRAM. On Windows and Xbox, <code>--gpu d3d12</code> runs dense models on Direct3D 12, prompt included; on Windows and Linux, the experimental <code>--gpu vulkan</code> does the same through Vulkan, the default for them on a discrete NVIDIA GPU.</td></tr>
-          <tr><th scope="row">Prompt processing</th><td>CPU batch path with expert grouping. VRAM-resident experts may still be offloaded to GPU.</td></tr>
+          <tr><th scope="row">Prompt processing</th><td>CPU batch path with expert grouping. On dedicated GPUs with an int8 dot product, the matmuls and the VRAM-resident experts run on the GPU in 64-token tiles: LFM2.5-8B prompt about 270 tok/s, almost 4&times; the CPU alone.</td></tr>
           <tr><th scope="row">Hybrid generation</th><td>GPU-resident dense decode and cached experts; CPU workers compute non-resident experts in parallel. Expert-only offload is also available.</td></tr>
           <tr><th scope="row">Memory and reuse</th><td>Mapped weights, Q8_K activations for CPU quantized matmuls, asynchronous read-ahead, expert prediction, and KV/convolution checkpoints. Prompt reuse can persist to disk.</td></tr>
-          <tr><th scope="row">Threads / batches</th><td>Configurable worker pool. Defaults: physical-core count; 64-token prompt batch.</td></tr>
+          <tr><th scope="row">Threads / batches</th><td>Configurable worker pool. Defaults: physical-core count; 64-token prompt batch, 256 when OpenCL takes the prompt on a dedicated GPU.</td></tr>
           <tr><th scope="row">Context</th><td>8,192 tokens for CLI by default; 16,384 for server/agent. Configurable up to the model limit; reference documentation lists 131,072. Actual capacity depends on memory.</td></tr>
           <tr><th scope="row">Interfaces</th><td>CLI, embedded Pandora UI, terminal/web agents, MCP client, and OpenAI-compatible HTTP endpoints. Inference requests share one context and are serialized.</td></tr>
           <tr><th scope="row">Reasoning</th><td>High (default), medium and low as reasoning token budgets (2,048 / 512), or off. Set with <code>--reasoning</code>, the API's <code>reasoning_effort</code>, or the selector in Pandora.</td></tr>
@@ -185,7 +185,7 @@
           <tr><th scope="row">Parameters</th><td>8.3 billion total; 1.5 billion active per token. Same architecture and chat format as the reference model.</td></tr>
           <tr><th scope="row">Layers</th><td>24 layers: 6 attention and 18 short-convolution layers; 22 MoE layers, each selecting 4 of 32 experts.</td></tr>
           <tr><th scope="row">Download size</th><td>5,155,564,768 bytes — about 5.2 GB / 4.8 GiB. Fits in 8 GB of RAM.</td></tr>
-          <tr><th scope="row">Speed</th><td>About 22 tokens/s on the CPU alone, about 47 with OpenCL on the 4 GB GPU (benchmark, laptop above).</td></tr>
+          <tr><th scope="row">Speed</th><td>About 22 tokens/s on the CPU alone, about 50 with OpenCL on the 4 GB GPU, which also reads the prompt at about 270 (benchmark, laptop above).</td></tr>
           <tr><th scope="row">Model license</th><td>LFM Open License v1.0; see the <a href="https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF" target="_blank" rel="noopener noreferrer">Liquid AI repository ↗</a>.</td></tr>
         </tbody></table><table class="second-model"><caption>Small and fast: LFM3-1.7B, dense</caption><tbody>
           <tr><th scope="row">GGUF file</th><td><code>LFM3-1.7B-Q4_K_M.gguf</code></td></tr>

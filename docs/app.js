@@ -12,7 +12,7 @@ const MODELS = {
   mid:{id:'lfm2.5-8b',name:'LFM2.5-8B-A1B',file:'LFM2.5-8B-A1B-Q4_K_M.gguf',
     url:'https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/49c14831707011e64d70b2ebd8462ba08d608434/LFM2.5-8B-A1B-Q4_K_M.gguf',
     hash:'4923ec14f06b968b74d663e5949867d2d9c3bf13a20b8be1a9f9af39989b2bb0',
-    download:'5.2 GB',ram:'8',gpu:'~45 tok/s',cpu:'~20 tok/s',
+    download:'5.2 GB',ram:'8',gpu:'~50 tok/s',cpu:'~20 tok/s',
     disk:'At least 6 GB free for the model',diskDetail:'About 5.2 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
     blurb:'8.3 billion parameters, 1.5 billion active per token. A larger model that fits in 8 GB of RAM and stays fast on the CPU alone.'},
   small:{id:'lfm3-1.7b',name:'LFM3-1.7B',file:'LFM3-1.7B-Q4_K_M.gguf',
@@ -231,7 +231,7 @@ renderGuide();
 // Explanatory architecture controls; they do not configure a local engine.
 const executionPaths={
   cpu:{title:'Model execution',cpu:'Tokenization, routing, attention/convolution, and selected experts run through the CPU path.',summary:'CPU-only execution.',detail:'All model compute stays on the CPU. OS-backed paging, read-ahead, and expert prediction help with cold weights.'},
-  hybrid:{title:'Schedule and combine',cpu:'CPU batch processing and routing. During hybrid decode, CPU workers compute selected experts that are not resident in VRAM.',summary:'Hybrid execution for the reference MoE model.',detail:'The prompt uses the CPU batch path, with optional cached-expert GPU offload. In single-token generation, the GPU can run dense decode and resident experts while CPU workers process non-resident experts. Contributions are combined before sampling. A dense model such as LFM3 decodes entirely on the GPU.'}
+  hybrid:{title:'Schedule and combine',cpu:'CPU batch processing and routing. During hybrid decode, CPU workers compute selected experts that are not resident in VRAM.',summary:'Hybrid execution for the reference MoE model.',detail:'The prompt uses the CPU batch path; on a dedicated GPU with an int8 dot product, its matmuls and the cached experts run on the GPU in 64-token tiles. In single-token generation, the GPU can run dense decode and resident experts while CPU workers process non-resident experts. Contributions are combined before sampling. A dense model such as LFM3 decodes entirely on the GPU.'}
 };
 function renderExecution(mode){
   const path=executionPaths[mode];
