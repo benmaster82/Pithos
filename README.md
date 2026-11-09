@@ -280,8 +280,8 @@ disk.
 | Working set (process RAM) | — | 10.7 GB (peak) | ~9.5 GB | **~6.9 GB** |
 | Perplexity (model license text, 4×256 tokens) | 2.683 | — | 2.638 | 2.671 |
 
-Since the prompt matmuls and the resident experts of the prompt run on the GPU (OpenCL, after
-v0.5.1), the warm 512-token prompt (`--bench`) went from about 52 to about 100 tok/s on this
+Since the prompt matmuls and the resident experts of the prompt run on the GPU (OpenCL, since
+v0.6.0), the warm 512-token prompt (`--bench`) went from about 52 to about 100 tok/s on this
 laptop; how much of the model is in RAM moves it a lot.
 
 Numbers move with the memory state and the temperature. On this laptop the CPU and GPU share one
