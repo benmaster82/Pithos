@@ -1,8 +1,6 @@
 <p align="center">
-  <img src="docs/terminal-banner.png" width="760" alt="Pithos: the terminal agent starting up">
+  <img src="docs/readme-banner.svg" width="820" alt="Pithos: local inference engine">
 </p>
-
-<h1 align="center">Pithos</h1>
 
 <p align="center">
   <b>A dependency-free C inference engine for Liquid AI's LFM2 / LFM2.5 / LFM3 models.</b><br>
