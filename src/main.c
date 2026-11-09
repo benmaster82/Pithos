@@ -29,7 +29,7 @@
 #include <sys/auxv.h>
 #endif
 
-#define VERSION "0.6.0"
+#define VERSION "0.6.1"
 
 typedef struct {
     const char *model, *prompt, *system, *kernels, *tokenize, *ppl;
