@@ -1074,6 +1074,7 @@ for each of the 30 convolution layers.
 | `PITHOS_GPU_LPR=N` | OpenCL: lanes per matrix row, 8 to 64 (default 8) |
 | `PITHOS_GPU_MVWG=N` | OpenCL: matrix-vector work-group size, 64 to 256 (default 256, 128 on Intel) |
 | `PITHOS_GPU_INTELMV=0` / `1` | OpenCL: Intel matrix-vector kernels off / on (default on Intel) |
+| `PITHOS_GPU_PINNED=0` / `1` | OpenCL: transfers through ordinary / pinned (mapped) host memory (default: pinned on dedicated GPUs; the Linux Intel driver fails on mapped pointers on integrated GPUs) |
 | `PITHOS_GPU_BUILDLOG=1`, `PITHOS_GPU_CLOPTS=...` | OpenCL: print the kernel build log; extra build options |
 | `PITHOS_CL_MIN=N` | OpenCL: prompt matmuls on the GPU from N tokens, 0 never (default 8 on dedicated GPUs with a hardware int8 dot, else 0) |
 | `PITHOS_CL_TILE=N`, `PITHOS_CL_TT=N` | OpenCL: tokens from which the tiled kernel is used (32); tokens per matrix-vector pass (8) |

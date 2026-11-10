@@ -10,6 +10,7 @@
  * experts chosen by a decayed usage score; the compute path only uses slots marked READY. */
 #include "gpu.h"
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -174,7 +175,10 @@ struct Gpu {
     int req_head, req_count, req_cap, stop;
     cl_event *fresh;            /* completed uploads the compute queue has not waited for yet */
     int n_fresh, cap_fresh;
-    /* pinned (page-locked) host staging: transfers become asynchronous DMA */
+    /* host staging of the transfers (see staging) */
+    int pinned;
+    void *stage[8];             /* ordinary staging blocks, to free */
+    int n_stage;
     cl_mem p_meta, p_y;
     int *h_meta;                /* same layout as d_meta */
     int *h_slots, *h_xidx;      /* views into h_meta */
@@ -500,6 +504,28 @@ static cl_mem mkbuf(Gpu *g, cl_ulong flags, size_t bytes, int *ok) {
     return b;
 }
 
+/* Host staging for the transfers. Pinned, a mapped CL_MEM_ALLOC_HOST_PTR buffer, makes them
+ * asynchronous DMA on dedicated GPUs. On integrated GPUs, ordinary page-aligned memory: the Linux
+ * Intel driver fails non-blocking transfers to or from a mapped pointer with CL_OUT_OF_RESOURCES
+ * (issue 3, intel/compute-runtime#866). PITHOS_GPU_PINNED=0/1 overrides */
+static void *staging(Gpu *g, cl_mem *buf, size_t bytes, cl_ulong map, int *ok) {
+    void *h = NULL;
+    *buf = NULL;
+    if (g->pinned) {
+        cl_int err = 0;
+        *buf = mkbuf(g, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, bytes, ok);
+        if (*buf) h = g->cl.EnqueueMapBuffer(g->q, *buf, 1, map, 0, bytes, 0, NULL, NULL, &err);
+    } else if (g->n_stage < (int)(sizeof(g->stage) / sizeof(g->stage[0]))) {
+        char *raw = (char *)calloc(1, bytes + 4096);
+        if (raw) {
+            g->stage[g->n_stage++] = raw;
+            h = raw + (4096 - (uintptr_t)raw % 4096);
+        }
+    }
+    if (!h) *ok = 0;
+    return h;
+}
+
 static cl_ulong dense_plan(Gpu *g, int n_ctx, cl_ulong arena_cap, cl_ulong *big_used, cl_ulong *small_used);
 static int dense_alloc(Gpu *g, int n_ctx, const cl_ulong *big_used, cl_ulong small_used, char *err, int errlen);
 static void dense_free(Gpu *g);
@@ -528,6 +554,8 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     DevInfo *dv = &devs[pick];
     g->dev = dv->id;
     g->unified = dv->unified;
+    const char *pin = getenv("PITHOS_GPU_PINNED");
+    g->pinned = pin ? atoi(pin) > 0 : !g->unified; /* see staging */
     cl->GetDeviceInfo(g->dev, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(g->local_mem), &g->local_mem, NULL);
     if (g->local_mem < 16384) g->local_mem = 16384; /* the OpenCL 1.2 minimum, if the query fails */
     cl_int err = 0;
@@ -697,11 +725,9 @@ Gpu *gpu_create(const Model *m, int device, int vram_mb, int max_tokens, int den
     g->d_meta = mkbuf(g, CL_MEM_READ_ONLY, meta_bytes, &ok);
     g->d_gu = mkbuf(g, CL_MEM_READ_WRITE, sizeof(float) * 2 * F * g->max_assign, &ok);
     g->d_y = mkbuf(g, CL_MEM_READ_WRITE, sizeof(float) * D * g->max_assign, &ok);
-    g->p_meta = mkbuf(g, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, meta_bytes, &ok);
-    g->p_y = mkbuf(g, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, sizeof(float) * D * g->max_assign, &ok);
     if (ok) {
-        g->h_meta = (int *)cl->EnqueueMapBuffer(g->q, g->p_meta, 1, CL_MAP_WRITE, 0, meta_bytes, 0, NULL, NULL, &err);
-        g->h_y = (float *)cl->EnqueueMapBuffer(g->q, g->p_y, 1, CL_MAP_READ, 0, sizeof(float) * D * g->max_assign, 0, NULL, NULL, &err);
+        g->h_meta = (int *)staging(g, &g->p_meta, meta_bytes, CL_MAP_WRITE, &ok);
+        g->h_y = (float *)staging(g, &g->p_y, sizeof(float) * D * g->max_assign, CL_MAP_READ, &ok);
         if (g->h_meta) {
             g->h_slots = g->h_meta;
             g->h_xidx = g->h_meta + g->max_assign;
@@ -826,6 +852,7 @@ void gpu_destroy(Gpu *g) {
     free(g->h_tiles);
     free(g->slot_owner);
     free((void *)g->slot_state);
+    for (int i = 0; i < g->n_stage; i++) free(g->stage[i]);
     free(g);
 }
 
@@ -1260,19 +1287,14 @@ static int dense_alloc(Gpu *g, int n_ctx, const cl_ulong *big_used, cl_ulong sma
     g->dy2 = mkbuf(g, CL_MEM_READ_WRITE, sizeof(float) * D * K, &ok);
     g->dycpu = mkbuf(g, CL_MEM_READ_ONLY, sizeof(float) * D, &ok);
     g->dlogits = mkbuf(g, CL_MEM_READ_WRITE, sizeof(float) * (size_t)m->n_vocab, &ok);
-    /* pinned staging */
+    /* host staging */
     const size_t in_bytes = sizeof(float) * (D + 2 * m->head_dim) + sizeof(int) * 64 * 64;
     const size_t out_bytes = sizeof(float) * 2 * D + sizeof(int) * 3 * K;
-    g->pin_in = mkbuf(g, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, in_bytes, &ok);
-    g->pin_out = mkbuf(g, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, out_bytes, &ok);
-    g->pin_y = mkbuf(g, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, sizeof(float) * D, &ok);
-    g->pin_logits = mkbuf(g, CL_MEM_READ_WRITE | CL_MEM_ALLOC_HOST_PTR, sizeof(float) * (size_t)m->n_vocab, &ok);
     if (!ok) { snprintf(err, (size_t)errlen, "VRAM allocation failed"); return 0; }
-    g->h_in = (float *)cl->EnqueueMapBuffer(g->q, g->pin_in, 1, CL_MAP_WRITE, 0, in_bytes, 0, NULL, NULL, &e);
-    g->h_out = (float *)cl->EnqueueMapBuffer(g->q, g->pin_out, 1, CL_MAP_READ, 0, out_bytes, 0, NULL, NULL, &e);
-    g->h_yc = (float *)cl->EnqueueMapBuffer(g->q, g->pin_y, 1, CL_MAP_WRITE, 0, sizeof(float) * D, 0, NULL, NULL, &e);
-    g->h_logits = (float *)cl->EnqueueMapBuffer(g->q, g->pin_logits, 1, CL_MAP_READ, 0, sizeof(float) * (size_t)m->n_vocab, 0,
-                                               NULL, NULL, &e);
+    g->h_in = (float *)staging(g, &g->pin_in, in_bytes, CL_MAP_WRITE, &ok);
+    g->h_out = (float *)staging(g, &g->pin_out, out_bytes, CL_MAP_READ, &ok);
+    g->h_yc = (float *)staging(g, &g->pin_y, sizeof(float) * D, CL_MAP_WRITE, &ok);
+    g->h_logits = (float *)staging(g, &g->pin_logits, sizeof(float) * (size_t)m->n_vocab, CL_MAP_READ, &ok);
     if (!g->h_in || !g->h_out || !g->h_yc || !g->h_logits) { snprintf(err, (size_t)errlen, "pinned buffers failed"); return 0; }
     /* upload the weights (read from the mapped model file) */
     for (int l = 0; l <= m->n_layer; l++) {
