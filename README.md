@@ -433,6 +433,11 @@ when chosen by number with `--gpu vulkan --gpu-device N`: it is useful for testi
 several, and a KV cache that does not fit makes Pithos fall back to the matmuls only, with a
 message suggesting a smaller `-c`.
 
+**OpenCL on Linux.** If Pithos exits right after loading the model, with no message, check that
+the temporary folder is writable: NVIDIA's OpenCL compiler writes there and ends the program when
+it cannot (for example when `/tmp` is a tmpfs with a full quota). Pointing it elsewhere is enough:
+`mkdir -p ~/.cache/pithos-tmp && TMPDIR=~/.cache/pithos-tmp ./build/pithos ...`.
+
 To work on another project, run the agent from that project's folder and give
 absolute paths to the executable and model (replace `/path/to/Pithos`):
 
@@ -882,7 +887,8 @@ without its reasoning is processed again.
 ### Other models
 Any GGUF of the `lfm2` (dense), `lfm2moe` or `lfm3` architecture loads, as long as its tensors use
 the supported formats: Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16, F32. BF16, Q2_K, Q3_K and IQ formats are
-not supported. GPU acceleration needs Q4_K / Q6_K weights: MoE models keep their hot experts and
+not supported. GPU acceleration needs Q4_K / Q6_K weights (the Q4_K_M files; a Q4_0 file runs on
+the CPU): MoE models keep their hot experts and
 dense layers in VRAM, dense models (LFM3) all their layers. Validated so far: LFM2.5-24B-A2B,
 LFM2.5-8B-A1B and LFM3-1.7B.
 
