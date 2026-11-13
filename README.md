@@ -267,9 +267,10 @@ build/pithos -m models/LFM3-1.7B-Q4_K_M.gguf --server --open
 [LiquidAI/LFM3-Audio-2B](https://huggingface.co/LiquidAI/LFM3-Audio-2B) is LFM3 with a speech
 encoder: it hears audio and answers in text. Transcription works in 18 languages, Italian
 included; it can also answer questions about what it hears or translate it. Pithos reads the audio
-from a WAV file (`--audio`). Speech output (TTS, voice chat) is not supported yet. Two files are
-needed: the model, whose text part is the same architecture as LFM3-1.7B and runs on the same GPU
-paths, and its audio projector (`mmproj-...`), which Pithos looks for next to the model.
+from a WAV file (`--audio`, or the [API](#server-and-web-chat)). Speech output (TTS, voice chat) is
+not supported yet. Two files are needed: the model, whose text part is the same architecture as
+LFM3-1.7B and runs on the same GPU paths, and its audio projector (`mmproj-...`), which Pithos
+looks for next to the model.
 
 ```
 build\pithos.exe -m models\LFM3-Audio-2B-Q4_K_M.gguf --audio speech.wav -s "Perform ASR in English."
@@ -281,8 +282,9 @@ These are the system prompts of the model card: `-s "Perform ASR."` lets the mod
 language; for questions the card suggests `-s "Answer questions about the provided audio clip.
 Base every answer only on what can be heard."`. Without a system prompt the model would rather
 answer with speech, which Pithos cannot produce yet, so speech output is turned off as the card
-does for text-only answers. With `-i` the audio goes into the first message of the chat. The WAV can be PCM (8, 16, 24 or 32-bit) or 32-bit float, at any sample rate
-and with any number of channels: Pithos mixes it to mono and resamples it to 16 kHz.
+does for text-only answers. With `-i` the audio goes into the first message of the chat. The WAV
+can be PCM (8, 16, 24 or 32-bit) or 32-bit float, at any sample rate and with any number of
+channels: Pithos mixes it to mono and resamples it to 16 kHz.
 
 | | Model | Audio projector |
 |---|---|---|
@@ -625,11 +627,16 @@ dependency-free HTTP server (Winsock / POSIX sockets) with:
     `chat_template_kwargs.preserve_thinking`, the reasoning controls described below;
   - `POST /v1/completions` and `GET /v1/models`;
   - like llama-server, also `GET /health`, `GET /props`, `POST /tokenize`, `POST /apply-template`
-    and the `timings` / `prompt_progress` fields (`return_progress: true`).
+    and the `timings` / `prompt_progress` fields (`return_progress: true`);
+  - with [LFM3-Audio](#lfm3-audio-2b-speech-input-experimental) and its projector next to it, speech
+    input: `input_audio` parts (base64 WAV) in chat messages, and `POST /v1/audio/transcriptions`
+    (form fields `file`, `language` as an ISO code such as `it`, `response_format` `json`, `text` or
+    `verbose_json`, `temperature`). `GET /props` says so under `modalities`.
 
 ```
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
      -d '{"messages":[{"role":"user","content":"Hello!"}]}'
+curl http://127.0.0.1:8080/v1/audio/transcriptions -F file=@speech.wav -F language=en
 ```
 
 **Reasoning levels.** None of the models has official effort levels: LFM3 has an on/off switch in its
@@ -1167,8 +1174,8 @@ Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
 - The server handles one request at a time and the others wait in a queue, because the context and
   the expert cache are shared.
 - Web interface conversations live in the browser's `localStorage`.
-- Speech input only, for LFM3-Audio, from WAV files on the command line (not yet in the server):
-  no speech output, no vision models.
+- Speech input only, for LFM3-Audio, from WAV files (command line and API; Pandora has no
+  microphone button yet): no speech output, no vision models.
 
 ## License
 Pithos is released under the [MIT License](LICENSE). The license covers the engine's code only; the

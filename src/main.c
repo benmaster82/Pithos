@@ -961,21 +961,26 @@ static int real_main(int argc, char **argv) {
         sampler_ban(&e.smp, sp, tok_speech_ids(tk, sp));
     }
     Audio *au = NULL;
-    if (a.audio) {
-        char mp[1024];
-        e.tok_audio = tok_find(tk, "<|audio|>");
+    char mp[1024];
+    e.tok_audio = tok_find(tk, "<|audio|>");
+    /* the server hears audio when the model's projector is next to it, or given with --mmproj */
+    const int srv_audio = a.server && e.tok_audio >= 0 && find_mmproj(a.model, a.mmproj, mp, sizeof(mp));
+    if (a.audio || srv_audio) {
         if (e.tok_audio < 0) { fprintf(stderr, "error: --audio needs an audio model (LFM3-Audio): this one has no <|audio|> token\n"); return 1; }
         if (!find_mmproj(a.model, a.mmproj, mp, sizeof(mp))) {
             fprintf(stderr, "error: --audio needs the model's audio projector: no mmproj-*.gguf next to %s (see --mmproj)\n", a.model);
             return 1;
         }
-        const double ta = time_sec();
         uint64_t bl = 0;
         const char *bn = gguf_get_str(&m.gguf, "general.basename", &bl);
         char base[128] = "";
         if (bn && bl < sizeof(base)) { memcpy(base, bn, bl); base[bl] = 0; }
         au = audio_load(mp, pool, m.dim, base, err, sizeof(err));
         if (!au) { fprintf(stderr, "error: %s\n", err); return 1; }
+    }
+    if (au && !a.audio) fprintf(stderr, "audio input: on (%s)\n", mp);
+    if (a.audio) {
+        const double ta = time_sec();
         int ns = 0;
         float *pcm = audio_read_wav(a.audio, &ns, err, sizeof(err));
         if (!pcm) { fprintf(stderr, "error: %s\n", err); return 1; }
@@ -1022,6 +1027,7 @@ static int real_main(int argc, char **argv) {
         sc.verbose = a.verbose || a.stats;
         sc.open_browser = a.open_browser;
         sc.think_budget = a.think_budget;
+        sc.audio = au;
         Tools *tools = NULL;
         if (a.tools || a.agent) {
             ToolsConfig tc = tools_config(&a);

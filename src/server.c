@@ -44,6 +44,7 @@ typedef int sock_t;
 #include "json.h"
 #include "platform.h"
 #include "server.h"
+#include "audio.h"
 #include "webui_html.h"
 
 #define MAX_HEADER (64 * 1024)
@@ -60,6 +61,15 @@ typedef struct {
     PithosLock *lock;
     int t_im_end, t_eot, t_eos, t_think_end, t_tc_start, t_tc_end;
     int lfm3;                   /* LFM3 template: XML tool calls, <tools> block, <think></think> on past turns */
+    int t_audio, t_think_start;
+    /* Audio of the request being rendered, under the lock (audio_begin / audio_end): render_content
+     * turns input_audio parts into clips and toks_text each <|audio|> into the clip's token ids
+     * -1, -2... (ctx_set_embeds); prompts with them are not reused (the ids repeat). Only the thread
+     * serving that request (t_collect) does so: /tokenize and /apply-template run without the lock. */
+    struct { float *pcm; int n, ntok; } clip[16];
+    int n_clips, clip_used, clip_ids;
+    char clip_err[160];
+    float *emb;
     uint64_t rng;
     volatile int busy;
     char *ui;
@@ -67,6 +77,7 @@ typedef struct {
 } Server;
 
 static Server S;
+static PITHOS_THREAD_LOCAL int t_collect;   /* this thread renders an audio request (audio_begin) */
 
 /* ------------------------------------------------------------------ connection */
 
@@ -143,6 +154,7 @@ typedef struct {
     char *body;
     int body_len;
     char auth[512];
+    char ctype[256];
 } Req;
 
 static const char *status_text(int code) {
@@ -208,6 +220,7 @@ static int read_request(Conn *c, Req *r) {
     if (header_value(hdr, "Content-Length", v, sizeof(v))) clen = atoll(v);
     if (clen < 0 || clen > MAX_BODY) { free(buf); return 413; }
     header_value(hdr, "Authorization", r->auth, sizeof(r->auth));
+    header_value(hdr, "Content-Type", r->ctype, sizeof(r->ctype));
     if (clen > n - hlen && header_value(hdr, "Expect", v, sizeof(v)) && strstr(v, "100"))
         conn_send(c, "HTTP/1.1 100 Continue\r\n\r\n", -1);
     r->body = (char *)malloc((size_t)clen + 1);
@@ -283,6 +296,128 @@ static void toks_text(Toks *t, const char *s, int len) {
         k = tok_encode(S.tk, s, len, 1, t->v + t->n, t->cap - t->n);
     }
     t->n += k;
+    for (int i = t->n - k; i < t->n && t_collect; i++) {
+        if (t->v[i] != S.t_audio || S.clip_used >= S.n_clips) continue;
+        const int nt = S.clip[S.clip_used].ntok;
+        if (t->n + nt > t->cap) {
+            t->cap = t->n + nt + 1024;
+            t->v = (int *)realloc(t->v, sizeof(int) * (size_t)t->cap);
+        }
+        memmove(t->v + i + nt, t->v + i + 1, sizeof(int) * (size_t)(t->n - i - 1));
+        for (int j = 0; j < nt; j++) t->v[i + j] = -1 - (S.clip_ids + j);
+        S.clip_ids += nt;
+        S.clip_used++;
+        t->n += nt - 1;
+        i += nt - 1;
+    }
+}
+
+/* ------------------------------------------------------------------ audio input */
+
+static int b64_val(int ch) {
+    if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+    if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+    if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+    if (ch == '+' || ch == '-') return 62;
+    if (ch == '/' || ch == '_') return 63;
+    return -1;
+}
+
+/* base64 (standard or URL alphabet, padding and whitespace ignored); the caller frees */
+static unsigned char *b64_decode(const char *s, int len, size_t *out_len) {
+    unsigned char *o = (unsigned char *)malloc((size_t)len / 4 * 3 + 3);
+    size_t n = 0;
+    unsigned acc = 0;
+    int bits = 0;
+    for (int i = 0; i < len; i++) {
+        const int v = b64_val((unsigned char)s[i]);
+        if (v < 0) continue;
+        acc = (acc << 6) | (unsigned)v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            o[n++] = (unsigned char)(acc >> bits);
+        }
+    }
+    *out_len = n;
+    return o;
+}
+
+static void add_clip(const unsigned char *wav, size_t len) {
+    if (S.clip_err[0]) return;
+    if (S.n_clips >= (int)(sizeof(S.clip) / sizeof(S.clip[0]))) { snprintf(S.clip_err, sizeof(S.clip_err), "too many audio parts"); return; }
+    char e[120];
+    int n = 0;
+    float *pcm = audio_decode_wav(wav, len, &n, e, sizeof(e));
+    if (!pcm || n <= 0) {
+        snprintf(S.clip_err, sizeof(S.clip_err), "audio part %d: %s", S.n_clips + 1, pcm ? "no samples" : e);
+        free(pcm);
+        return;
+    }
+    S.clip[S.n_clips].pcm = pcm;
+    S.clip[S.n_clips].n = n;
+    S.clip[S.n_clips].ntok = audio_n_tokens(n);
+    S.n_clips++;
+}
+
+/* an OpenAI input_audio part: {"data": base64 WAV, "format": "wav"} */
+static void audio_part(Buf *b, const Json *in) {
+    buf_add(b, "<|audio|>", -1);
+    if (!t_collect) return;
+    const char *fmt = json_str(json_get(in, "format"), "wav");
+    const Json *d = json_get(in, "data");
+    if (strcmp(fmt, "wav") || !d || d->t != J_STR) {
+        if (!S.clip_err[0]) snprintf(S.clip_err, sizeof(S.clip_err), "input_audio needs \"data\": base64 WAV, \"format\": \"wav\"");
+        return;
+    }
+    size_t len = 0;
+    unsigned char *wav = b64_decode(d->s, d->len, &len);
+    add_clip(wav, len);
+    free(wav);
+}
+
+static int has_audio_parts(const Json *messages) {
+    for (const Json *m = messages ? messages->child : NULL; m; m = m->next) {
+        const Json *c = json_get(m, "content");
+        for (const Json *it = c && c->t == J_ARR ? c->child : NULL; it; it = it->next)
+            if (it->t == J_OBJ && !strcmp(json_str(json_get(it, "type"), ""), "input_audio")) return 1;
+    }
+    return 0;
+}
+
+/* under the lock: from here render_content and toks_text collect the request's audio */
+static void audio_begin(void) {
+    t_collect = 1;
+    S.n_clips = S.clip_used = S.clip_ids = 0;
+    S.clip_err[0] = 0;
+}
+
+/* the embeddings of the collected clips, in token order; 0 with err on a mismatch */
+static int audio_encode(char *err, int errlen) {
+    if (S.clip_used != S.n_clips) { snprintf(err, (size_t)errlen, "%d audio parts but %d <|audio|> placeholders", S.n_clips, S.clip_used); return 0; }
+    const int D = S.m->dim;
+    S.emb = (float *)malloc(sizeof(float) * (size_t)(S.clip_ids ? S.clip_ids : 1) * D);
+    int off = 0;
+    for (int i = 0; i < S.n_clips; i++) {
+        int n = 0;
+        float *e = audio_embed(S.cfg.audio, S.clip[i].pcm, S.clip[i].n, &n);
+        if (n != S.clip[i].ntok) { free(e); snprintf(err, (size_t)errlen, "audio part %d: encoding failed", i + 1); return 0; }
+        memcpy(S.emb + (size_t)off * D, e, sizeof(float) * (size_t)n * D);
+        off += n;
+        free(e);
+    }
+    ctx_set_embeds(S.ctx, S.emb, S.clip_ids);
+    return 1;
+}
+
+static void audio_end(void) {
+    for (int i = 0; i < S.n_clips; i++) free(S.clip[i].pcm);
+    S.n_clips = S.clip_used = S.clip_ids = 0;
+    t_collect = 0;
+    S.clip_err[0] = 0;
+    ctx_set_embeds(S.ctx, NULL, 0);
+    free(S.emb);
+    S.emb = NULL;
 }
 
 /* ------------------------------------------------------------------ chat template (LFM2) */
@@ -308,6 +443,7 @@ static void render_content(Buf *b, const Json *c) {
             const char *type = json_str(json_get(it, "type"), NULL);
             if (type && !strcmp(type, "image")) buf_add(b, S.lfm3 ? "<|vision_start|><|image|><|vision_end|>" : "<image>", -1);
             else if (type && !strcmp(type, "text")) buf_add(b, json_str(json_get(it, "text"), ""), -1);
+            else if (type && !strcmp(type, "input_audio")) audio_part(b, json_get(it, "input_audio"));
             else json_write(b, it);
         }
         return;
@@ -638,7 +774,8 @@ static int render_chat(const Json *messages, const Json *tools, int preserve_thi
     }
     if (nb == cap) { cap++; *bounds = (int *)realloc(*bounds, sizeof(int) * (size_t)cap); }
     (*bounds)[nb++] = out->n;
-    const char *gp = think ? "<|im_start|>assistant\n<think>" : think_off_prompt(S.lfm3);
+    /* after audio, the generation prompt of LFM3-Audio's template (the model may open <think> itself) */
+    const char *gp = t_collect && S.n_clips ? "<|im_start|>assistant\n" : think ? "<|im_start|>assistant\n<think>" : think_off_prompt(S.lfm3);
     toks_text(out, gp, -1);
     if (text) buf_add(text, gp, -1);
     *nbounds = nb;
@@ -1064,6 +1201,10 @@ static void flush_text(Gen *g, int final) {
 
 /* Appends a token's text to the right channel. Returns 1 when generation must stop. */
 static int on_token(Gen *g, int tok) {
+    if (g->chat && tok == S.t_think_start && g->state == ST_CONTENT && !g->content.n && !g->ncalls) {
+        g->state = ST_THINK;   /* the model opens its reasoning itself (after audio) */
+        return 0;
+    }
     if (g->chat && tok == S.t_think_end && g->state == ST_THINK) {
         g->state = ST_CONTENT;
         g->skip_ws = 1;
@@ -1350,25 +1491,45 @@ static void handle_chat(Conn *c, const Json *body) {
         g.state = ST_CONTENT;
         g.skip_ws = 1; /* the answer usually starts with a newline after the empty block */
     }
+    const int audio = has_audio_parts(messages);
+    if (audio && !S.cfg.audio) {
+        send_error(c, 400, "invalid_request_error", "this model takes no audio (it needs LFM3-Audio and its mmproj file)");
+        gen_free(&g);
+        return;
+    }
+    if (audio) { /* the clips are decoded while rendering and encoded with the model's threads: one request at a time */
+        lock_acquire(S.lock);
+        audio_begin();
+    }
     Toks t = { 0 };
     int *bounds = NULL, nb = 0;
-    if (!render_chat(messages, json_get(body, "tools"), preserve, g.think_budget != THINK_OFF, &t, &bounds, &nb, NULL,
-                     err, sizeof(err))) {
-        send_error(c, 400, "invalid_request_error", err[0] ? err : "cannot render the conversation");
-        free(t.v); free(bounds);
+    int rendered = render_chat(messages, json_get(body, "tools"), preserve, g.think_budget != THINK_OFF, &t, &bounds, &nb,
+                               NULL, err, sizeof(err));
+    if (rendered && S.clip_err[0]) { snprintf(err, sizeof(err), "%s", S.clip_err); rendered = 0; }
+    if (!rendered || t.n >= ctx_n_ctx(S.ctx)) {
+        if (rendered) {
+            snprintf(err, sizeof(err), "the conversation (%d tokens) exceeds the context size (%d tokens)", t.n, ctx_n_ctx(S.ctx));
+            send_error(c, 400, "exceed_context_size_error", err);
+        } else send_error(c, 400, "invalid_request_error", err[0] ? err : "cannot render the conversation");
+        if (audio) { audio_end(); lock_release(S.lock); }
+        free(t.v); free(bounds); gen_free(&g);
         return;
     }
     g.n_prompt = t.n;
-    if (t.n >= ctx_n_ctx(S.ctx)) {
-        snprintf(err, sizeof(err), "the conversation (%d tokens) exceeds the context size (%d tokens)", t.n, ctx_n_ctx(S.ctx));
-        send_error(c, 400, "exceed_context_size_error", err);
-        free(t.v); free(bounds);
+    if (audio) {
+        g.state = ST_CONTENT;
+        g.skip_ws = 1;
+    } else lock_acquire(S.lock);
+    S.busy = 1;
+    if (audio && !audio_encode(err, sizeof(err))) {
+        send_error(c, 400, "invalid_request_error", err);
+        audio_end();
+        S.busy = 0;
+        lock_release(S.lock);
+        free(t.v); free(bounds); gen_free(&g);
         return;
     }
-
-    lock_acquire(S.lock);
-    S.busy = 1;
-    if (!json_bool(json_get(body, "cache_prompt"), 1)) pcache_clear(S.pc);
+    if (audio || !json_bool(json_get(body, "cache_prompt"), 1)) pcache_clear(S.pc);
     if (g.stream) send_head(c, 200, "text/event-stream; charset=utf-8", -1);
     float *lg = prefill(&g, &t, bounds, nb);
     if (lg) {
@@ -1388,7 +1549,10 @@ static void handle_chat(Conn *c, const Json *body) {
     conn_close(c);
     log_request("chat", &g);
 
-    if (lg) {
+    if (audio) {   /* the state holds this request's audio: nothing to keep */
+        pcache_clear(S.pc);
+        audio_end();
+    } else if (lg) {
         /* rewrite the answer as the template renders past turns, then persist the session */
         double t0 = time_sec();
         Buf a = { 0 }, mj = { 0 };
@@ -1493,6 +1657,7 @@ static void handle_props(Conn *c) {
     buf_printf(&b, ",\"build_info\":\"pithos\",\"total_slots\":1,\"is_busy\":%s,\"n_ctx\":%d,\"cached_sessions\":%d,"
                    "\"agent_tools\":%d,",
                S.busy ? "true" : "false", ctx_n_ctx(S.ctx), pcache_n_files(S.pc), S.cfg.tools ? tools_count(S.cfg.tools) : 0);
+    buf_printf(&b, "\"modalities\":{\"vision\":false,\"audio\":%s},", S.cfg.audio ? "true" : "false");
     buf_add(&b, "\"system_info\":", -1);
     buf_json_str(&b, S.cfg.info ? S.cfg.info : "", -1);
     buf_printf(&b, ",\"default_generation_settings\":{\"n_ctx\":%d,\"params\":{\"temperature\":%g,\"top_k\":%d,"
@@ -1623,6 +1788,157 @@ static int authorized(const Req *r) {
 
 static int is_path(const char *p, const char *a, const char *b) { return !strcmp(p, a) || (b && !strcmp(p, b)); }
 
+/* ------------------------------------------------------------------ /v1/audio/transcriptions */
+
+static const char *mem_find(const char *h, size_t hn, const char *n, size_t nn) {
+    if (nn == 0 || hn < nn) return NULL;
+    for (size_t i = 0; i + nn <= hn; i++)
+        if (h[i] == n[0] && !memcmp(h + i, n, nn)) return h + i;
+    return NULL;
+}
+
+typedef struct { char name[64]; const char *data; size_t len; } Part;
+
+/* the parts of a multipart/form-data body, by their form field name */
+static int multipart(const Req *r, Part *parts, int cap) {
+    const char *bp = strstr(r->ctype, "boundary=");
+    if (!bp || strncmp(r->ctype, "multipart/form-data", 19)) return -1;
+    char delim[200];
+    bp += 9;
+    int bl = 0;
+    if (*bp == '"') bp++;
+    while (bp[bl] && bp[bl] != '"' && bp[bl] != ';' && bl < 150) bl++;
+    const int dl = snprintf(delim, sizeof(delim), "\r\n--%.*s", bl, bp);
+    /* the first delimiter may start the body without the CRLF */
+    const char *body = r->body;
+    const size_t blen = (size_t)r->body_len;
+    const char *p = mem_find(body, blen, delim + 2, (size_t)dl - 2);
+    int n = 0;
+    while (p && n < cap) {
+        p += p == body || p[0] == '-' ? (size_t)dl - 2 : (size_t)dl;
+        if ((size_t)(p - body) + 2 > blen || !memcmp(p, "--", 2)) break;   /* the closing delimiter */
+        const char *h = p + 2, *he = mem_find(h, blen - (size_t)(h - body), "\r\n\r\n", 4);
+        if (!he) break;
+        const char *d = he + 4, *e = mem_find(d, blen - (size_t)(d - body), delim, (size_t)dl);
+        if (!e) break;
+        Part *pt = &parts[n++];
+        pt->name[0] = 0;
+        const char *nm = mem_find(h, (size_t)(he - h), "name=\"", 6);
+        if (nm) {
+            nm += 6;
+            int k = 0;
+            while (nm + k < he && nm[k] != '"' && k < (int)sizeof(pt->name) - 1) k++;
+            memcpy(pt->name, nm, (size_t)k);
+            pt->name[k] = 0;
+        }
+        pt->data = d;
+        pt->len = (size_t)(e - d);
+        p = e;
+    }
+    return n;
+}
+
+static const Part *part_get(const Part *parts, int n, const char *name) {
+    for (int i = 0; i < n; i++)
+        if (!strcmp(parts[i].name, name)) return &parts[i];
+    return NULL;
+}
+
+/* "it" -> "Italian": the language names of the model's prompts (ISO 639-1 codes) */
+static const char *language_name(const char *code) {
+    static const char *const map[][2] = {
+        { "ar", "Arabic" }, { "da", "Danish" }, { "de", "German" }, { "el", "Greek" }, { "en", "English" },
+        { "es", "Spanish" }, { "fi", "Finnish" }, { "fr", "French" }, { "he", "Hebrew" }, { "it", "Italian" },
+        { "ja", "Japanese" }, { "ko", "Korean" }, { "nl", "Dutch" }, { "pl", "Polish" }, { "pt", "Portuguese" },
+        { "sv", "Swedish" }, { "tr", "Turkish" }, { "zh", "Chinese" },
+    };
+    for (size_t i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+        if (!strcmp(code, map[i][0])) return map[i][1];
+    return code;
+}
+
+/* OpenAI's speech-to-text: form fields file (WAV), language, response_format (json, text,
+ * verbose_json), temperature; model and prompt are accepted and ignored */
+static void handle_transcription(Conn *c, const Req *r) {
+    if (!S.cfg.audio) { send_error(c, 400, "invalid_request_error", "this model takes no audio (it needs LFM3-Audio and its mmproj file)"); return; }
+    Part parts[16];
+    const int np = multipart(r, parts, 16);
+    if (np < 0) { send_error(c, 400, "invalid_request_error", "expected a multipart/form-data body"); return; }
+    const Part *file = part_get(parts, np, "file");
+    if (!file) { send_error(c, 400, "invalid_request_error", "missing the 'file' field (a WAV file)"); return; }
+    char lang[64] = "", fmt[32] = "json", temp[32] = "";
+    const Part *v;
+    if ((v = part_get(parts, np, "language")) && v->len < sizeof(lang)) { memcpy(lang, v->data, v->len); lang[v->len] = 0; }
+    if ((v = part_get(parts, np, "response_format")) && v->len < sizeof(fmt)) { memcpy(fmt, v->data, v->len); fmt[v->len] = 0; }
+    if ((v = part_get(parts, np, "temperature")) && v->len < sizeof(temp)) { memcpy(temp, v->data, v->len); temp[v->len] = 0; }
+    if (strcmp(fmt, "json") && strcmp(fmt, "text") && strcmp(fmt, "verbose_json")) {
+        send_error(c, 400, "invalid_request_error", "response_format must be json, text or verbose_json");
+        return;
+    }
+    Gen g;
+    begin_gen(&g, c, 1);
+    g.sp = S.cfg.sp;
+    g.sp.temp = temp[0] ? (float)atof(temp) : 0.f;   /* OpenAI's default: 0 */
+    g.max_tokens = S.cfg.n_predict;
+    g.state = ST_CONTENT;
+    g.skip_ws = 1;
+    lock_acquire(S.lock);
+    S.busy = 1;
+    audio_begin();
+    add_clip((const unsigned char *)file->data, file->len);
+    char err[200] = "";
+    Toks t = { 0 };
+    float *lg = NULL;
+    double secs = S.n_clips ? S.clip[0].n / (double)AUDIO_RATE : 0;
+    if (S.clip_err[0]) snprintf(err, sizeof(err), "%s", S.clip_err + (strncmp(S.clip_err, "audio part 1: ", 14) ? 0 : 14));
+    else {
+        char sys[200];
+        if (lang[0]) snprintf(sys, sizeof(sys), "Perform ASR in %s.", language_name(lang));
+        else snprintf(sys, sizeof(sys), "Perform ASR.");
+        Buf p = { 0 };
+        buf_add(&p, "<|startoftext|><|im_start|>system\n", -1);
+        buf_add(&p, sys, -1);
+        buf_add(&p, "<|im_end|>\n<|im_start|>user\n<|audio|><|im_end|>\n<|im_start|>assistant\n", -1);
+        toks_text(&t, p.s, p.n);
+        buf_free(&p);
+        if (t.n >= ctx_n_ctx(S.ctx)) snprintf(err, sizeof(err), "the audio (%d tokens) exceeds the context size (%d tokens)", t.n, ctx_n_ctx(S.ctx));
+        else if (audio_encode(err, sizeof(err))) {
+            pcache_clear(S.pc);
+            g.n_prompt = t.n;
+            lg = prefill(&g, &t, NULL, 0);
+            if (lg) generate(&g, lg, &t);
+            else snprintf(err, sizeof(err), "context full");
+        }
+    }
+    if (err[0]) send_error(c, 400, "invalid_request_error", err);
+    else if (!strcmp(fmt, "text")) send_body(c, 200, "text/plain; charset=utf-8", g.content.s, g.content.n);
+    else {
+        Buf b = { 0 };
+        if (!strcmp(fmt, "verbose_json")) {
+            buf_printf(&b, "{\"task\":\"transcribe\",\"duration\":%.2f,", secs);
+            if (lang[0]) {
+                buf_add(&b, "\"language\":", -1);
+                buf_json_str(&b, language_name(lang), -1);
+                buf_add(&b, ",", 1);
+            }
+        } else buf_add(&b, "{", 1);
+        buf_add(&b, "\"text\":", -1);
+        buf_json_str(&b, g.content.s, g.content.n);
+        buf_printf(&b, ",\"usage\":{\"type\":\"tokens\",\"input_tokens\":%d,\"output_tokens\":%d,\"total_tokens\":%d}}",
+                   g.n_prompt, g.n_gen, g.n_prompt + g.n_gen);
+        send_json(c, 200, &b);
+        buf_free(&b);
+    }
+    conn_close(c);
+    if (!err[0]) log_request("transcription", &g);
+    pcache_clear(S.pc);
+    audio_end();
+    S.busy = 0;
+    lock_release(S.lock);
+    gen_free(&g);
+    free(t.v);
+}
+
 static void route(Conn *c, Req *r) {
     if (!strcmp(r->method, "OPTIONS")) { send_head(c, 204, NULL, 0); return; }
     int get = !strcmp(r->method, "GET"), post = !strcmp(r->method, "POST");
@@ -1642,8 +1958,10 @@ static void route(Conn *c, Req *r) {
     int tokn = is_path(r->path, "/tokenize", NULL);
     int tmpl = is_path(r->path, "/apply-template", NULL);
     int tcall = is_path(r->path, "/v1/tools/call", "/tools/call");
-    if (!chat && !compl && !tokn && !tmpl && !tcall) { send_error(c, 404, "not_found_error", "unknown endpoint"); return; }
+    int trans = is_path(r->path, "/v1/audio/transcriptions", "/audio/transcriptions");
+    if (!chat && !compl && !tokn && !tmpl && !tcall && !trans) { send_error(c, 404, "not_found_error", "unknown endpoint"); return; }
     if (!post) { send_error(c, 405, "invalid_request_error", "use POST"); return; }
+    if (trans) { handle_transcription(c, r); return; }
     char err[160];
     Json *body = json_parse(r->body, r->body_len, err, sizeof(err));
     if (!body || body->t != J_OBJ) {
@@ -1686,6 +2004,8 @@ void server_attach(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *t
     S.t_eot = tok_find(tk, "<|endoftext|>");
     S.t_eos = tok_eos(tk);
     S.t_think_end = tok_find(tk, "</think>");
+    S.t_think_start = tok_find(tk, "<think>");
+    S.t_audio = tok_find(tk, "<|audio|>");
     S.lfm3 = !strcmp(m->arch, "lfm3");
     S.t_tc_start = tok_find(tk, S.lfm3 ? "<tool_call>" : "<|tool_call_start|>");
     S.t_tc_end = tok_find(tk, S.lfm3 ? "</tool_call>" : "<|tool_call_end|>");

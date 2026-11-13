@@ -201,11 +201,20 @@ float *audio_read_wav(const char *path, int *n_out, char *err, int errlen) {
     uint8_t *d = (uint8_t *)malloc((size_t)len + 1);
     len = (long)fread(d, 1, (size_t)len, f);
     fclose(f);
+    char e2[200];
+    float *pcm = audio_decode_wav(d, (size_t)len, n_out, e2, sizeof(e2));
+    if (!pcm) snprintf(err, errlen, "%s: %s", path, e2);
+    free(d);
+    return pcm;
+}
+
+float *audio_decode_wav(const unsigned char *d, size_t size, int *n_out, char *err, int errlen) {
+    const long len = (long)size;
     float *pcm = NULL;
     int fmt = 0, ch = 0, rate = 0, bits = 0;
     const uint8_t *data = NULL;
     uint32_t dlen = 0;
-    if (len < 12 || memcmp(d, "RIFF", 4) || memcmp(d + 8, "WAVE", 4)) { snprintf(err, errlen, "%s: not a WAV file", path); goto done; }
+    if (len < 12 || memcmp(d, "RIFF", 4) || memcmp(d + 8, "WAVE", 4)) { snprintf(err, errlen, "not a WAV file"); return NULL; }
     for (long p = 12; p + 8 <= len;) {
         const uint32_t cl = rd32(d + p + 4);
         const uint8_t *c = d + p + 8;
@@ -223,8 +232,8 @@ float *audio_read_wav(const char *path, int *n_out, char *err, int errlen) {
         p += 8 + (long)cl + (cl & 1);
     }
     if (!data || ch <= 0 || rate <= 0 || !((fmt == 1 && (bits == 8 || bits == 16 || bits == 24 || bits == 32)) || (fmt == 3 && bits == 32))) {
-        snprintf(err, errlen, "%s: unsupported WAV (need PCM 8/16/24/32-bit or float 32-bit)", path);
-        goto done;
+        snprintf(err, errlen, "unsupported WAV (need PCM 8/16/24/32-bit or float 32-bit)");
+        return NULL;
     }
     const int bps = bits / 8, nf = (int)(dlen / ((uint32_t)bps * ch));
     pcm = (float *)malloc(sizeof(float) * (size_t)(nf > 0 ? nf : 1));
@@ -248,9 +257,14 @@ float *audio_read_wav(const char *path, int *n_out, char *err, int errlen) {
         free(pcm);
         pcm = r;
     }
-done:
-    free(d);
     return pcm;
+}
+
+int audio_n_tokens(int n) {
+    if (n <= 0) return 0;
+    const int np = n <= N_FFT ? N_FFT : n + (HOP - (n - N_FFT) % HOP) % HOP;
+    const int t0 = 1 + (np - N_FFT) / HOP, t1 = (t0 + 1) / 2, t2 = (t1 + 1) / 2;
+    return (t2 + 1) / 2;
 }
 
 /* ------------------------------------------------------------------ log-mel */
