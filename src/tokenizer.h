@@ -11,7 +11,7 @@ Tokenizer *tok_load(const GGUF *g, char *err, int errlen);
 void tok_free(Tokenizer *t);
 
 /* Encode UTF-8 text. If parse_special, control tokens written literally
- * (e.g. "<|im_start|>") become single tokens. Returns number of tokens written
+ * (e.g. "<|im_start|>") become single tokens; user-defined ones ("<think>") always do. Returns number of tokens written
  * (may be > max_out: then only max_out were written). */
 int tok_encode(const Tokenizer *t, const char *text, int len, int parse_special, int *out, int max_out);
 

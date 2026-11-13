@@ -961,6 +961,11 @@ static int real_main(int argc, char **argv) {
         fl = (long)fread(txt, 1, (size_t)fl, f);
         txt[fl] = 0;
         fclose(f);
+        /* CRLF as LF, as llama-perplexity reads the file in text mode on Windows */
+        long w = 0;
+        for (long r = 0; r < fl; r++)
+            if (!(txt[r] == '\r' && txt[r + 1] == '\n')) txt[w++] = txt[r];
+        txt[fl = w] = 0;
         int *ids = (int *)malloc(sizeof(int) * ((size_t)fl + 2));
         /* like llama-perplexity: a BOS only where the model asks for one (LFM3 does not) */
         const int bos = m.add_bos;

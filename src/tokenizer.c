@@ -379,24 +379,25 @@ static int encode_plain(const Tokenizer *t, const unsigned char *s, int n, int *
 int tok_encode(const Tokenizer *t, const char *text, int len, int parse_special, int *out, int max_out) {
     const unsigned char *s = (const unsigned char *)text;
     int count = 0, seg = 0;
-    if (parse_special) {
-        for (int i = 0; i < len;) {
-            int matched = -1;
-            if (s[i] == '<') {
-                for (int k = 0; k < t->n_special; k++) {
-                    int id = t->special[k], l = t->text_len[id];
-                    if (l <= len - i && memcmp(s + i, t->text[id], (size_t)l) == 0) { matched = id; break; }
-                }
+    /* user-defined tokens (<think>, <tool_call>...) are matched always, as llama.cpp and the
+     * tokenizer.json added tokens do; control tokens only if parse_special */
+    for (int i = 0; i < len;) {
+        int matched = -1;
+        if (s[i] == '<') {
+            for (int k = 0; k < t->n_special; k++) {
+                int id = t->special[k], l = t->text_len[id];
+                if (!parse_special && t->type[id] != TT_USER) continue;
+                if (l <= len - i && memcmp(s + i, t->text[id], (size_t)l) == 0) { matched = id; break; }
             }
-            if (matched >= 0) {
-                count = encode_plain(t, s + seg, i - seg, out, max_out, count);
-                if (count < max_out) out[count] = matched;
-                count++;
-                i += t->text_len[matched];
-                seg = i;
-            } else {
-                i++;
-            }
+        }
+        if (matched >= 0) {
+            count = encode_plain(t, s + seg, i - seg, out, max_out, count);
+            if (count < max_out) out[count] = matched;
+            count++;
+            i += t->text_len[matched];
+            seg = i;
+        } else {
+            i++;
         }
     }
     count = encode_plain(t, s + seg, len - seg, out, max_out, count);
