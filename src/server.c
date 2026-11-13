@@ -37,6 +37,7 @@ typedef int sock_t;
 #endif
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,7 @@ typedef int sock_t;
 #include "audio.h"
 #include "speech.h"
 #include "webui_html.h"
+#include "talk_html.h"
 
 #define MAX_HEADER (64 * 1024)
 #define MAX_BODY (64 * 1024 * 1024)
@@ -62,7 +64,7 @@ typedef struct {
     PithosLock *lock;
     int t_im_end, t_eot, t_eos, t_think_end, t_tc_start, t_tc_end;
     int lfm3;                   /* LFM3 template: XML tool calls, <tools> block, <think></think> on past turns */
-    int t_audio, t_think_start;
+    int t_audio, t_think_start, t_audio_out, t_text_end, t_mixed_start, t_audio_start;
     /* Audio of the request being rendered, under the lock (audio_begin / audio_end): render_content
      * turns input_audio parts into clips and toks_text each <|audio|> into the clip's token ids
      * -1, -2... (ctx_set_embeds); prompts with them are not reused (the ids repeat). Only the thread
@@ -79,6 +81,7 @@ typedef struct {
 
 static Server S;
 static PITHOS_THREAD_LOCAL int t_collect;   /* this thread renders an audio request (audio_begin) */
+static PITHOS_THREAD_LOCAL int t_voice;     /* this thread renders a request answered in speech (handle_chat) */
 
 /* ------------------------------------------------------------------ connection */
 
@@ -776,7 +779,8 @@ static int render_chat(const Json *messages, const Json *tools, int preserve_thi
     if (nb == cap) { cap++; *bounds = (int *)realloc(*bounds, sizeof(int) * (size_t)cap); }
     (*bounds)[nb++] = out->n;
     /* after audio, the generation prompt of LFM3-Audio's template (the model may open <think> itself) */
-    const char *gp = t_collect && S.n_clips ? "<|im_start|>assistant\n" : think ? "<|im_start|>assistant\n<think>" : think_off_prompt(S.lfm3);
+    const char *gp = t_voice ? "<|im_start|>assistant\n<|mixed_start|>"
+                     : t_collect && S.n_clips ? "<|im_start|>assistant\n" : think ? "<|im_start|>assistant\n<think>" : think_off_prompt(S.lfm3);
     toks_text(out, gp, -1);
     if (text) buf_add(text, gp, -1);
     *nbounds = nb;
@@ -1353,6 +1357,145 @@ static void generate(Gen *g, float *lg, const Toks *prompt) {
     sampler_free(&smp);
 }
 
+/* ------------------------------------------------------------------ spoken answers */
+
+static void b64_encode(Buf *b, const unsigned char *d, size_t n) {
+    static const char tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char q[4];
+    for (size_t i = 0; i < n; i += 3) {
+        const unsigned v = (unsigned)d[i] << 16 | (i + 1 < n ? (unsigned)d[i + 1] << 8 : 0) | (i + 2 < n ? d[i + 2] : 0);
+        q[0] = tab[v >> 18 & 63];
+        q[1] = tab[v >> 12 & 63];
+        q[2] = i + 1 < n ? tab[v >> 6 & 63] : '=';
+        q[3] = i + 2 < n ? tab[v & 63] : '=';
+        buf_add(b, q, 4);
+    }
+}
+
+/* n samples of speech as an SSE event: delta.audio.data, base64 of 16-bit 24 kHz mono PCM */
+static void send_audio(Gen *g, const float *pcm, int n) {
+    if (n <= 0 || !g->stream) return;
+    unsigned char *raw = (unsigned char *)malloc(2 * (size_t)n);
+    for (int i = 0; i < n; i++) {
+        float x = pcm[i] * 32767.f;
+        x = x > 32767.f ? 32767.f : x < -32768.f ? -32768.f : x;
+        const short v = (short)lrintf(x);
+        raw[2 * i] = (unsigned char)v;
+        raw[2 * i + 1] = (unsigned char)((unsigned short)v >> 8);
+    }
+    Buf b = { 0 };
+    chunk_open(g, &b);
+    buf_add(&b, "{\"index\":0,\"delta\":{\"audio\":{\"data\":\"", -1);
+    b64_encode(&b, raw, 2 * (size_t)n);
+    buf_add(&b, "\"}},\"logprobs\":null,\"finish_reason\":null}]}\n\n", -1);
+    conn_send(g->c, b.s, b.n);
+    buf_free(&b);
+    free(raw);
+}
+
+/* The model's interleaved answer (prompt ending with <|mixed_start|>): 6 text tokens, then 12
+ * frames of speech, and so on; <|text_end|> ends the text, the speech goes on to its end code,
+ * after which the model writes text again (usually <|im_end|>). As generate() in the reference.
+ * The text streams as content (the captions), the speech as audio. */
+static void generate_voice(Gen *g, float *lg, const Toks *prompt) {
+    enum { TEXT, AUDIO, MIXED };
+    Sampler smp;
+    sampler_init(&smp, &g->sp, S.m->n_vocab);
+    const int ban[2] = { S.t_audio, S.t_audio_out };   /* placeholders, never sampled */
+    sampler_ban(&smp, ban, 2);
+    int from = prompt->n > g->sp.repeat_last_n ? prompt->n - g->sp.repeat_last_n : 0;
+    for (int i = from; i < prompt->n; i++)
+        if (prompt->v[i] >= 0) sampler_accept(&smp, prompt->v[i]);
+    Speech *sp = S.cfg.speech;
+    SpeechParams spp = speech_defaults();
+    uint64_t rng = S.rng = S.rng * 6364136223846793005ull + 1442695040888963407ull;
+    float *pcm = (float *)malloc(sizeof(float) * 2 * SPEECH_FRAME);
+    float *row = (float *)malloc(sizeof(float) * (size_t)S.m->dim);
+    ctx_set_embeds(S.ctx, row, 1);
+    speech_reset(sp);
+    int mode = MIXED, slots = 6, speaking = 0, text_done = 0, frames = 0, in_speech = 0;
+    const float *h = ctx_hidden(S.ctx);
+    const int limit = g->max_tokens > 0 ? g->max_tokens : ctx_n_ctx(S.ctx);
+    const double t0 = time_sec();
+    double tt[5] = { 0 };   /* PITHOS_SPEECH_PROFILE: text steps, depth decoder, codec, sending, audio steps of the model */
+    g->finish = FIN_LENGTH;
+    for (int i = 0; i < limit && lg && h; i++) {
+        const int interleaving = mode == MIXED;
+        double ta = time_sec();
+        if (mode == TEXT || (interleaving && !speaking)) {
+            const int tok = sampler_sample(&smp, lg);
+            g->n_gen++;
+            if (tok == S.t_im_end || tok == S.t_eot || tok == S.t_eos) { g->finish = FIN_STOP; break; }
+            if (interleaving && tok == S.t_text_end) {
+                text_done = 1;
+                speaking = 1;
+            } else if (!interleaving && tok == S.t_text_end) {
+                g->finish = FIN_STOP;
+                break;
+            } else if (!interleaving && tok == S.t_audio_start) {
+                mode = AUDIO;
+            } else if (!interleaving && tok == S.t_mixed_start) {
+                mode = MIXED;
+                slots = 6;
+                speaking = text_done = 0;
+            } else {
+                on_token(g, tok);
+                flush_text(g, 0);
+            }
+            sampler_accept(&smp, tok);
+            if (ctx_pos(S.ctx) + 1 >= ctx_n_ctx(S.ctx)) break;
+            lg = pcache_feed(S.pc, &tok, 1);
+            tt[0] += time_sec() - ta;
+        } else {
+            int codes[SPEECH_CODEBOOKS];
+            const int eos = speech_frame(sp, h, &spp, &rng, codes);
+            double tb = time_sec();
+            tt[1] += tb - ta;
+            frames++;
+            int np;
+            if (eos) {   /* the end of this stretch of speech: its tail, and back to text */
+                np = speech_flush(sp, pcm);
+                in_speech = 0;
+                mode = TEXT;
+                speaking = 0;
+            } else {
+                np = speech_decode(sp, codes, pcm);
+                in_speech = 1;
+            }
+            double tc = time_sec();
+            tt[2] += tc - tb;
+            send_audio(g, pcm, np);
+            double td = time_sec();
+            tt[3] += td - tc;
+            speech_embed(sp, codes, row);
+            if (ctx_pos(S.ctx) + 1 >= ctx_n_ctx(S.ctx)) break;
+            const int id = -1;
+            lg = pcache_feed(S.pc, &id, 1);
+            tt[4] += time_sec() - td;
+        }
+        h = ctx_hidden(S.ctx);
+        if (interleaving && !text_done && --slots == 0) {
+            speaking = !speaking;
+            slots = speaking ? 12 : 6;
+        }
+        if (g->c->dead || ((i & 7) == 7 && conn_gone(g->c))) { g->finish = FIN_ABORT; break; }
+    }
+    if (in_speech) send_audio(g, pcm, speech_flush(sp, pcm));   /* stopped mid-speech */
+    else speech_reset(sp);
+    ctx_set_embeds(S.ctx, NULL, 0);
+    if (!g->content.s) buf_add(&g->content, "", 0);
+    if (!g->reasoning.s) buf_add(&g->reasoning, "", 0);
+    g->t_gen = time_sec() - t0;
+    if (S.cfg.verbose) fprintf(stderr, "  spoken answer: %d frames (%.1f s)\n", frames, frames * 0.08);
+    if (getenv("PITHOS_SPEECH_PROFILE"))
+        fprintf(stderr, "  text steps %.0f ms | per frame: depth %.1f ms, codec %.1f ms, sending %.1f ms, model %.1f ms\n",
+                1e3 * tt[0], 1e3 * tt[1] / (frames ? frames : 1), 1e3 * tt[2] / (frames ? frames : 1),
+                1e3 * tt[3] / (frames ? frames : 1), 1e3 * tt[4] / (frames ? frames : 1));
+    sampler_free(&smp);
+    free(pcm);
+    free(row);
+}
+
 static void send_final(Gen *g) {
     Buf b = { 0 };
     if (g->stream) {
@@ -1492,6 +1635,17 @@ static void handle_chat(Conn *c, const Json *body) {
         g.state = ST_CONTENT;
         g.skip_ws = 1; /* the answer usually starts with a newline after the empty block */
     }
+    const Json *mods = json_get(body, "modalities");
+    int voice = 0;
+    for (const Json *mo = mods && mods->t == J_ARR ? mods->child : NULL; mo; mo = mo->next)
+        voice |= mo->t == J_STR && !strcmp(mo->s, "audio");
+    if (voice && (!S.cfg.speech || !g.stream)) {
+        send_error(c, 400, "invalid_request_error", !S.cfg.speech ? "this model does not speak (it needs LFM3-Audio and its mmproj file)"
+                                                                  : "spoken answers (modalities: audio) need \"stream\": true");
+        gen_free(&g);
+        return;
+    }
+    t_voice = voice;
     const int audio = has_audio_parts(messages);
     if (audio && !S.cfg.audio) {
         send_error(c, 400, "invalid_request_error", "this model takes no audio (it needs LFM3-Audio and its mmproj file)");
@@ -1506,6 +1660,7 @@ static void handle_chat(Conn *c, const Json *body) {
     int *bounds = NULL, nb = 0;
     int rendered = render_chat(messages, json_get(body, "tools"), preserve, g.think_budget != THINK_OFF, &t, &bounds, &nb,
                                NULL, err, sizeof(err));
+    t_voice = 0;
     if (rendered && S.clip_err[0]) { snprintf(err, sizeof(err), "%s", S.clip_err); rendered = 0; }
     if (!rendered || t.n >= ctx_n_ctx(S.ctx)) {
         if (rendered) {
@@ -1517,10 +1672,11 @@ static void handle_chat(Conn *c, const Json *body) {
         return;
     }
     g.n_prompt = t.n;
-    if (audio) {
+    if (audio || voice) {
         g.state = ST_CONTENT;
         g.skip_ws = 1;
-    } else lock_acquire(S.lock);
+    }
+    if (!audio) lock_acquire(S.lock);
     S.busy = 1;
     if (audio && !audio_encode(err, sizeof(err))) {
         send_error(c, 400, "invalid_request_error", err);
@@ -1530,7 +1686,8 @@ static void handle_chat(Conn *c, const Json *body) {
         free(t.v); free(bounds); gen_free(&g);
         return;
     }
-    if (audio || !json_bool(json_get(body, "cache_prompt"), 1)) pcache_clear(S.pc);
+    if (audio || voice || !json_bool(json_get(body, "cache_prompt"), 1)) pcache_clear(S.pc);
+    if (voice) ctx_need_hidden(S.ctx, 1);
     if (g.stream) send_head(c, 200, "text/event-stream; charset=utf-8", -1);
     float *lg = prefill(&g, &t, bounds, nb);
     if (lg) {
@@ -1541,7 +1698,8 @@ static void handle_chat(Conn *c, const Json *body) {
             conn_send(c, b.s, b.n);
             buf_free(&b);
         }
-        generate(&g, lg, &t);
+        if (voice) generate_voice(&g, lg, &t);
+        else generate(&g, lg, &t);
         send_final(&g);
     } else if (g.finish != FIN_ABORT) {
         if (g.stream) conn_send(c, "data: {\"error\":{\"code\":500,\"message\":\"context full\"}}\n\n", -1);
@@ -1550,9 +1708,10 @@ static void handle_chat(Conn *c, const Json *body) {
     conn_close(c);
     log_request("chat", &g);
 
-    if (audio) {   /* the state holds this request's audio: nothing to keep */
+    if (voice) ctx_need_hidden(S.ctx, 0);
+    if (audio || voice) {   /* the state holds this request's audio: nothing to keep */
         pcache_clear(S.pc);
-        audio_end();
+        if (audio) audio_end();
     } else if (lg) {
         /* rewrite the answer as the template renders past turns, then persist the session */
         double t0 = time_sec();
@@ -2018,6 +2177,10 @@ static void route(Conn *c, Req *r) {
     if (!strcmp(r->method, "OPTIONS")) { send_head(c, 204, NULL, 0); return; }
     int get = !strcmp(r->method, "GET"), post = !strcmp(r->method, "POST");
     if (get && is_path(r->path, "/", "/index.html")) { handle_ui(c); return; }
+    if (get && is_path(r->path, "/talk", "/talk.html")) {   /* the voice conversation page */
+        send_body(c, 200, "text/html; charset=utf-8", (const char *)TALK_HTML, (int)sizeof(TALK_HTML) - 1);
+        return;
+    }
     if (get && is_path(r->path, "/health", "/v1/health")) {
         const char *ok = "{\"status\":\"ok\"}";
         send_body(c, 200, "application/json", ok, (int)strlen(ok));
@@ -2083,6 +2246,10 @@ void server_attach(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *t
     S.t_think_end = tok_find(tk, "</think>");
     S.t_think_start = tok_find(tk, "<think>");
     S.t_audio = tok_find(tk, "<|audio|>");
+    S.t_audio_out = tok_find(tk, "<|audio_out|>");
+    S.t_text_end = tok_find(tk, "<|text_end|>");
+    S.t_mixed_start = tok_find(tk, "<|mixed_start|>");
+    S.t_audio_start = tok_find(tk, "<|audio_start|>");
     S.lfm3 = !strcmp(m->arch, "lfm3");
     S.t_tc_start = tok_find(tk, S.lfm3 ? "<tool_call>" : "<|tool_call_start|>");
     S.t_tc_end = tok_find(tk, S.lfm3 ? "</tool_call>" : "<|tool_call_end|>");

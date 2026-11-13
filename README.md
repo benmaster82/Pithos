@@ -267,7 +267,8 @@ build/pithos -m models/LFM3-1.7B-Q4_K_M.gguf --server --open
 [LiquidAI/LFM3-Audio-2B](https://huggingface.co/LiquidAI/LFM3-Audio-2B) is LFM3 with a speech
 encoder and a speech decoder: it hears audio and speaks, in 18 languages, Italian included. Pithos
 transcribes speech, answers questions about it or translates it, reads text aloud with a female or
-male voice, and lets [Pandora](#server-and-web-chat) hold a spoken conversation. Two files are
+male voice, and holds spoken conversations: [Pandora's voice page](#voice-conversation-talk) at
+`/talk`. Two files are
 needed: the model, whose text part is the same architecture as LFM3-1.7B and runs on the same GPU
 paths, and its audio projector (`mmproj-...`), which Pithos looks for next to the model.
 
@@ -284,6 +285,22 @@ answer with speech, which Pithos cannot produce yet, so speech output is turned 
 does for text-only answers. With `-i` the audio goes into the first message of the chat. The WAV
 can be PCM (8, 16, 24 or 32-bit) or 32-bit float, at any sample rate and with any number of
 channels: Pithos mixes it to mono and resamples it to 16 kHz.
+
+#### Voice conversation (`/talk`)
+With LFM3-Audio the server also serves a page for spoken conversations at
+**http://127.0.0.1:8080/talk** (a button next to the context counter in Pandora opens it). Press
+Start and talk: Pandora notices when you stop, answers aloud and listens again; speaking while it
+talks interrupts it. In English the model answers in speech directly (its interleaved mode: text
+and speech alternate as it generates), so the voice starts about a second after you stop. The
+model's spoken chat is English only, so in other languages (Italian, French, German... chosen in
+the page's settings, or the browser's language) Pandora transcribes what you say, writes a short
+answer and speaks it a sentence at a time, about two seconds after you stop. The page needs the
+microphone, which browsers give to `localhost` or https pages only.
+
+Over the API, a spoken answer is a chat completion with `"modalities": ["text", "audio"]` and
+`"stream": true`: the events carry the text as `delta.content` and the speech as
+`delta.audio.data` (base64 of 16-bit 24 kHz mono PCM), as in OpenAI's audio chat. The model card
+recommends the system prompt `Respond with interleaved text and audio.`
 
 **Speech output.** `--tts` speaks a text into a WAV file (24 kHz):
 
@@ -993,10 +1010,13 @@ for each of the 30 convolution layers.
 | `src/platform.c` | mmap, thread pool, prefetch, system info (Win32 / POSIX) |
 | `src/sampler.c`, `src/main.c` | sampling, CLI, terminal chat |
 | `src/server.c`, `src/json.c` | HTTP server, OpenAI API, chat template, tool calls, JSON |
+| `src/audio.c` | LFM3-Audio speech input: WAV, resampling, log-mel features, the speech encoder and projector |
+| `src/speech.c` | LFM3-Audio speech output: the depth decoder (MaskGIT), the LiquidCodec decoder, inverse STFT, WAV |
 | `src/pcache.c` | prompt reuse: recurrent-state checkpoints, sessions on disk |
 | `src/tools.c`, `src/proc.c` | agent tools (files, web, shell commands, background processes), MCP client (JSON-RPC over stdio), child processes with pipes |
 | `src/agent.c` | terminal agent: conversation, approvals, safe / autonomous modes (talks to the server in-process) |
 | `web/index.html` | web interface (embedded into `src/webui_html.h` by `tools/embed.py`) |
+| `web/talk.html` | the voice conversation page `/talk` (embedded into `src/talk_html.h`) |
 | `web/brand/` | Pandora logo: vector mark (`currentColor`), dark version for light UIs and light version for dark UIs (SVG, 512 px PNG), original in `pandora-logo.jpg` |
 
 ### CPU optimizations
@@ -1204,9 +1224,10 @@ Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
 - The server handles one request at a time and the others wait in a queue, because the context and
   the expert cache are shared.
 - Web interface conversations live in the browser's `localStorage`.
-- LFM3-Audio: WAV files only (no MP3 / Opus); Pandora's spoken conversation reads the text answer
-  aloud rather than letting the model answer in speech directly (its interleaved mode), so the
-  voice starts once the answer's first sentence is written. No vision models.
+- LFM3-Audio: WAV files only (no MP3 / Opus). The model's own spoken answers are English only;
+  other languages go through transcription and speech synthesis. In a spoken conversation the
+  model hears the last three exchanges again at each turn (their audio is not kept in the prompt
+  cache). No vision models.
 
 ## License
 Pithos is released under the [MIT License](LICENSE). The license covers the engine's code only; the

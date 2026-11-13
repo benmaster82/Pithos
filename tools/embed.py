@@ -1,13 +1,15 @@
 """Embed text resources into C headers as NUL-terminated byte arrays (outputs are committed):
     src/kernels.cl   -> src/kernels_cl.h  (KERNELS_CL)
     web/index.html   -> src/webui_html.h  (WEBUI_HTML)
+    web/talk.html    -> src/talk_html.h   (TALK_HTML)
 Run after editing either file:  python tools/embed.py"""
 import os
 
 here = os.path.dirname(os.path.abspath(__file__))
 root = os.path.normpath(os.path.join(here, '..'))
 items = [('src/kernels.cl', 'src/kernels_cl.h', 'KERNELS_CL', 'char'),
-         ('web/index.html', 'src/webui_html.h', 'WEBUI_HTML', 'unsigned char')]
+         ('web/index.html', 'src/webui_html.h', 'WEBUI_HTML', 'unsigned char'),
+         ('web/talk.html', 'src/talk_html.h', 'TALK_HTML', 'unsigned char')]
 for src, dst, name, ctype in items:
     data = open(os.path.join(root, src), 'rb').read().replace(b'\r\n', b'\n')
     lines = ['/* generated from %s by tools/embed.py - do not edit */' % src,

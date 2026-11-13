@@ -1,0 +1,530 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pandora Voice</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='40' fill='%237c5cff'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #fbfbfc; --text: #18181b; --muted: #6b6b76; --faint: #a1a1aa; --border: #e4e4e8; --surface: #f3f3f5;
+  --mark: #18181b; --eye: #fbfbfc; --danger: #dc2626; --btn: #18181b; --btn-text: #fff;
+  --listen: #2f9e6e; --think: #d08a1f; --speak: #6d5df5; --idle: #a1a1aa;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e0e10; --text: #ececf0; --muted: #9d9da8; --faint: #6b6b76; --border: #2c2c31; --surface: #1c1c20;
+    --mark: #f4f4f5; --eye: #0e0e10; --danger: #f87171; --btn: #f4f4f5; --btn-text: #111113;
+    --listen: #4cc38a; --think: #f0b44c; --speak: #9b8cff; --idle: #6b6b76;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+       display: flex; flex-direction: column; overflow: hidden; -webkit-font-smoothing: antialiased; }
+button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; }
+svg.i { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+header { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; gap: 12px; }
+.back { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); text-decoration: none; font-size: 14px; padding: 6px 10px 6px 6px; border-radius: 10px; }
+.back:hover { background: var(--surface); color: var(--text); }
+.title { font-weight: 650; letter-spacing: -.01em; }
+.title small { color: var(--faint); font-weight: 450; margin-left: 6px; }
+.icon-btn { width: 38px; height: 38px; border-radius: 12px; display: grid; place-items: center; color: var(--muted); }
+.icon-btn:hover { background: var(--surface); color: var(--text); }
+
+main { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px; padding: 0 20px; min-height: 0; }
+
+/* the mascot and its aura */
+.stage { --lvl: 0; --col: var(--idle); position: relative; width: min(300px, 62vw); aspect-ratio: 1; display: grid; place-items: center; }
+.aura { position: absolute; inset: 6%; border-radius: 50%;
+        background: radial-gradient(circle, color-mix(in srgb, var(--col) 38%, transparent) 0%, color-mix(in srgb, var(--col) 14%, transparent) 45%, transparent 70%);
+        transform: scale(calc(.82 + var(--lvl) * .55)); transition: background .5s, transform .08s linear; }
+.ring { position: absolute; inset: 14%; border-radius: 50%; border: 2px solid color-mix(in srgb, var(--col) 55%, transparent);
+        transform: scale(calc(1 + var(--lvl) * .25)); opacity: calc(.35 + var(--lvl) * .9); transition: border-color .5s, transform .08s linear; }
+.mark { position: relative; width: 52%; color: var(--mark); transform: scale(calc(1 + var(--lvl) * .1)) rotate(var(--tilt, 0deg));
+        transition: transform .12s ease-out; filter: drop-shadow(0 10px 24px color-mix(in srgb, var(--col) 30%, transparent)); }
+.mark svg { width: 100%; height: auto; display: block; overflow: visible; }
+.lid { fill: var(--mark); transform-box: fill-box; transform-origin: center; transform: scaleY(0); transition: transform .09s; }
+.blink .lid { transform: scaleY(1); }
+body[data-state="off"] .stage { --col: var(--idle); }
+body[data-state="off"] .mark { animation: breathe 5s ease-in-out infinite; }
+body[data-state="listening"] .stage { --col: var(--listen); }
+body[data-state="thinking"] .stage { --col: var(--think); }
+body[data-state="thinking"] .mark { animation: ponder 1.6s ease-in-out infinite; }
+body[data-state="thinking"] .ring { animation: spin 1.4s linear infinite; border-style: dashed; }
+body[data-state="speaking"] .stage { --col: var(--speak); }
+@keyframes breathe { 50% { transform: scale(1.04) translateY(-3px); } }
+@keyframes ponder { 0%, 100% { transform: rotate(-4deg) translateY(0); } 50% { transform: rotate(4deg) translateY(-4px); } }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.status { font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); min-height: 20px; font-weight: 550; }
+.captions { width: min(680px, 100%); min-height: 120px; max-height: 32vh; overflow-y: auto; text-align: center; display: flex; flex-direction: column; gap: 10px; }
+.cap-user { color: var(--muted); font-size: 15px; }
+.cap-user:empty { display: none; }
+.cap-bot { font-size: 21px; line-height: 1.45; font-weight: 450; letter-spacing: -.005em; text-wrap: pretty; }
+.note { color: var(--muted); font-size: 14px; text-align: center; max-width: 520px; }
+.note.bad { color: var(--danger); }
+
+footer { display: flex; align-items: center; justify-content: center; gap: 18px; padding: 18px 20px 30px; }
+.ctl { width: 54px; height: 54px; border-radius: 50%; display: grid; place-items: center; background: var(--surface); color: var(--text); border: 1px solid var(--border); }
+.ctl:hover { filter: brightness(.97); }
+.ctl.on { background: var(--danger); color: #fff; border-color: transparent; }
+.ctl[disabled] { opacity: .35; cursor: default; }
+.main-btn { min-width: 168px; height: 58px; border-radius: 999px; background: var(--btn); color: var(--btn-text); font-weight: 600; font-size: 16px;
+            display: inline-flex; align-items: center; justify-content: center; gap: 10px; padding: 0 26px; }
+.main-btn.end { background: var(--danger); color: #fff; }
+.main-btn[disabled] { opacity: .4; cursor: default; }
+.lang { font-size: 12.5px; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 6px 12px; }
+
+dialog { border: 1px solid var(--border); border-radius: 16px; padding: 18px 20px; background: var(--bg); color: var(--text); width: min(380px, calc(100vw - 32px)); }
+dialog::backdrop { background: rgba(0, 0, 0, .35); }
+dialog h2 { margin: 0 0 14px; font-size: 16px; }
+.field { margin-bottom: 14px; }
+.field label { display: block; font-size: 13px; font-weight: 500; margin-bottom: 6px; }
+.field select { width: 100%; padding: 8px 10px; border-radius: 9px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; }
+.help { font-size: 12px; color: var(--muted); margin-top: 5px; }
+.dlg-foot { display: flex; justify-content: flex-end; }
+.btn { padding: 8px 16px; border-radius: 10px; background: var(--btn); color: var(--btn-text); font-weight: 550; }
+@media (max-width: 520px) { .cap-bot { font-size: 18px; } .main-btn { min-width: 140px; } footer { gap: 12px; } }
+</style>
+</head>
+<body data-state="off">
+<header>
+  <a class="back" href="/"><svg class="i" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></svg>Chat</a>
+  <div class="title">Pandora<small>voice</small></div>
+  <button class="icon-btn" id="settingsBtn" aria-label="Settings"><svg class="i" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg></button>
+</header>
+<main>
+  <div class="stage" id="stage">
+    <div class="aura"></div>
+    <div class="ring"></div>
+    <div class="mark" id="mark">
+      <svg viewBox="0 0 100 100" aria-hidden="true">
+        <path fill="currentColor" fill-rule="evenodd" d="M56.56 8.18C55.87 8.21 55.09 8.26 54.36 8.33C53.63 8.40 52.90 8.47 52.18 8.59C51.46 8.70 50.73 8.84 50.02 9.00C49.30 9.16 48.59 9.34 47.88 9.53C47.18 9.73 46.47 9.93 45.78 10.17C45.09 10.41 44.40 10.67 43.72 10.95C43.05 11.23 42.37 11.53 41.72 11.85C41.06 12.18 40.41 12.53 39.78 12.89C39.14 13.25 38.51 13.64 37.89 14.03C37.27 14.42 36.66 14.82 36.06 15.24C35.46 15.66 34.86 16.09 34.29 16.55C33.72 17.00 33.17 17.49 32.62 17.98C32.07 18.46 31.53 18.96 31.01 19.47C30.48 19.99 29.97 20.51 29.48 21.06C28.99 21.60 28.51 22.16 28.04 22.72C27.58 23.29 27.12 23.87 26.68 24.45C26.24 25.04 25.81 25.63 25.40 26.24C24.99 26.85 24.62 27.48 24.24 28.11C23.87 28.74 23.51 29.38 23.15 30.02C22.80 30.66 22.45 31.31 22.12 31.96C21.79 32.62 21.48 33.28 21.19 33.95C20.89 34.63 20.63 35.31 20.36 35.99C20.09 36.68 19.83 37.36 19.58 38.05C19.34 38.74 19.09 39.43 18.87 40.13C18.65 40.83 18.46 41.54 18.26 42.25C18.06 42.95 17.87 43.66 17.67 44.37C17.47 45.07 17.28 45.78 17.06 46.48C16.85 47.18 16.61 47.88 16.38 48.57C16.15 49.27 15.93 49.97 15.68 50.66C15.43 51.35 15.15 52.03 14.88 52.71C14.60 53.39 14.33 54.07 14.04 54.74C13.74 55.41 13.43 56.07 13.11 56.73C12.79 57.39 12.46 58.05 12.13 58.70C11.80 59.36 11.48 60.02 11.13 60.66C10.77 61.30 10.39 61.93 10.03 62.56C9.66 63.20 9.29 63.83 8.91 64.46C8.54 65.09 8.17 65.72 7.78 66.34C7.38 66.96 6.97 67.57 6.57 68.18C6.17 68.80 5.78 69.42 5.39 70.04C5.01 70.67 4.62 71.29 4.25 71.92C3.87 72.55 3.48 73.18 3.16 73.83C2.83 74.49 2.50 75.16 2.31 75.86C2.12 76.56 1.90 77.35 2.03 78.03C2.15 78.70 2.55 79.44 3.04 79.92C3.53 80.40 4.30 80.67 4.98 80.91C5.66 81.15 6.41 81.25 7.13 81.36C7.86 81.47 8.59 81.53 9.32 81.59C10.05 81.64 10.79 81.66 11.52 81.71C12.25 81.75 12.98 81.80 13.71 81.85C14.44 81.89 15.18 81.94 15.91 81.99C16.64 82.05 17.37 82.12 18.10 82.18C18.83 82.24 19.56 82.30 20.29 82.37C21.02 82.45 21.75 82.53 22.48 82.62C23.20 82.72 23.93 82.82 24.65 82.94C25.38 83.06 26.10 83.19 26.82 83.33C27.54 83.48 28.25 83.64 28.97 83.81C29.68 83.98 30.39 84.16 31.10 84.36C31.80 84.55 32.51 84.75 33.21 84.96C33.91 85.17 34.62 85.39 35.31 85.62C36.00 85.86 36.69 86.12 37.38 86.38C38.06 86.63 38.75 86.90 39.43 87.16C40.12 87.42 40.81 87.68 41.49 87.93C42.18 88.19 42.86 88.45 43.55 88.70C44.24 88.95 44.94 89.19 45.63 89.42C46.33 89.65 47.03 89.87 47.73 90.07C48.44 90.27 49.15 90.45 49.87 90.61C50.58 90.78 51.30 90.93 52.02 91.07C52.74 91.20 53.46 91.34 54.19 91.44C54.91 91.54 55.64 91.60 56.37 91.66C57.10 91.72 57.84 91.77 58.57 91.79C59.30 91.82 60.04 91.81 60.77 91.80C61.50 91.78 62.24 91.76 62.97 91.70C63.70 91.63 64.43 91.54 65.15 91.43C65.87 91.31 66.59 91.17 67.31 91.02C68.03 90.86 68.74 90.69 69.45 90.50C70.16 90.31 70.86 90.10 71.55 89.86C72.25 89.62 72.93 89.35 73.61 89.07C74.28 88.79 74.95 88.49 75.61 88.17C76.27 87.85 76.93 87.51 77.57 87.16C78.21 86.80 78.84 86.43 79.46 86.03C80.07 85.64 80.67 85.21 81.26 84.78C81.85 84.34 82.43 83.89 83.00 83.43C83.57 82.97 84.14 82.50 84.68 82.01C85.22 81.52 85.75 81.01 86.26 80.48C86.77 79.95 87.24 79.39 87.71 78.83C88.19 78.27 88.65 77.70 89.10 77.12C89.55 76.54 89.99 75.96 90.41 75.35C90.83 74.75 91.22 74.13 91.60 73.50C91.98 72.88 92.34 72.24 92.69 71.59C93.05 70.95 93.40 70.31 93.72 69.65C94.04 68.99 94.33 68.32 94.61 67.64C94.90 66.96 95.16 66.28 95.41 65.59C95.66 64.90 95.89 64.20 96.10 63.50C96.31 62.80 96.51 62.09 96.68 61.38C96.86 60.67 97.03 59.95 97.17 59.23C97.30 58.51 97.40 57.78 97.49 57.06C97.59 56.33 97.68 55.60 97.75 54.87C97.82 54.14 97.88 53.41 97.91 52.68C97.94 51.95 97.96 51.21 97.94 50.48C97.92 49.75 97.86 49.01 97.81 48.28C97.76 47.55 97.72 46.82 97.64 46.09C97.55 45.36 97.44 44.64 97.32 43.91C97.19 43.19 97.04 42.47 96.89 41.76C96.73 41.04 96.57 40.32 96.39 39.61C96.22 38.90 96.03 38.19 95.81 37.49C95.59 36.79 95.34 36.10 95.08 35.42C94.82 34.73 94.52 34.06 94.23 33.39C93.94 32.72 93.65 32.04 93.33 31.38C93.01 30.72 92.67 30.07 92.30 29.44C91.94 28.80 91.55 28.18 91.16 27.56C90.77 26.94 90.38 26.31 89.96 25.71C89.55 25.11 89.11 24.52 88.66 23.94C88.21 23.36 87.74 22.79 87.26 22.24C86.78 21.69 86.28 21.15 85.78 20.62C85.27 20.08 84.77 19.55 84.24 19.05C83.71 18.54 83.16 18.05 82.60 17.58C82.04 17.10 81.47 16.65 80.89 16.20C80.31 15.75 79.72 15.31 79.12 14.89C78.52 14.46 77.92 14.04 77.29 13.66C76.67 13.28 76.02 12.93 75.38 12.58C74.73 12.24 74.07 11.91 73.41 11.60C72.75 11.28 72.08 10.98 71.40 10.71C70.72 10.43 70.03 10.18 69.33 9.95C68.64 9.72 67.93 9.53 67.22 9.35C66.51 9.17 65.79 9.01 65.07 8.87C64.35 8.73 63.63 8.61 62.90 8.51C62.18 8.40 61.45 8.32 60.71 8.26C59.98 8.20 59.21 8.17 58.52 8.15C57.83 8.14 57.25 8.15 56.56 8.18ZM79.13 59.95A10.83 11.61 10.8 1 0 57.85 55.90A10.83 11.61 10.8 1 0 79.13 59.95ZM88.24 45.30A3.03 10.64 169.1 1 0 94.19 44.15A3.03 10.64 169.1 1 0 88.24 45.30Z"/>
+        <ellipse class="lid" cx="68.49" cy="57.93" rx="11.2" ry="12" transform="rotate(10.8 68.49 57.93)"/>
+      </svg>
+    </div>
+  </div>
+  <div class="status" id="status"></div>
+  <div class="captions" id="captions"><div class="cap-user" id="capUser"></div><div class="cap-bot" id="capBot"></div></div>
+  <div class="note" id="note"></div>
+</main>
+<footer>
+  <button class="ctl" id="muteBtn" aria-label="Mute the microphone" disabled></button>
+  <button class="main-btn" id="mainBtn"></button>
+  <span class="lang" id="langChip"></span>
+</footer>
+<dialog id="settings">
+  <form method="dialog">
+    <h2>Voice settings</h2>
+    <div class="field"><label for="sLang">Language</label><select id="sLang"></select>
+      <div class="help">English uses the model's own spoken answers (fastest). Other languages go through transcription and speech synthesis.</div></div>
+    <div class="field"><label for="sVoice">Voice</label><select id="sVoice"><option value="female">Female</option><option value="male">Male</option></select>
+      <div class="help">For the synthesized languages; in English the model speaks with its own voice.</div></div>
+    <div class="dlg-foot"><button class="btn" value="save">Done</button></div>
+  </form>
+</dialog>
+<script>
+"use strict";
+/* Pandora voice: a spoken conversation with an LFM3-Audio model served by Pithos.
+ * The browser listens all the time and decides when a turn ends (a pause after speech). English:
+ * the turn's audio goes to /v1/chat/completions with modalities ["text", "audio"], and the model
+ * answers in speech directly (streamed 16-bit 24 kHz PCM, plus its text as captions). Other
+ * languages: /v1/audio/transcriptions, a text answer, then /v1/audio/speech a sentence at a time.
+ * Speaking while Pandora talks interrupts it. Nothing is stored but the settings. */
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
+  set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} },
+};
+const LANGS = [["en", "English"], ["it", "Italiano"], ["fr", "Français"], ["de", "Deutsch"], ["es", "Español"], ["pt", "Português"],
+               ["nl", "Nederlands"], ["pl", "Polski"], ["sv", "Svenska"], ["da", "Dansk"], ["fi", "Suomi"], ["el", "Ελληνικά"],
+               ["tr", "Türkçe"], ["ar", "العربية"], ["he", "עברית"], ["ja", "日本語"], ["ko", "한국어"], ["zh", "中文"]];
+const NAMES = { en: "English", it: "Italian", fr: "French", de: "German", es: "Spanish", pt: "Portuguese", nl: "Dutch", pl: "Polish",
+                sv: "Swedish", da: "Danish", fi: "Finnish", el: "Greek", tr: "Turkish", ar: "Arabic", he: "Hebrew", ja: "Japanese",
+                ko: "Korean", zh: "Chinese" };
+const cfg = Object.assign({ lang: "", voice: "female" }, store.get("pithos.talk", {}));
+const lang = () => cfg.lang || (LANGS.some((l) => l[0] === (navigator.language || "en").slice(0, 2)) ? navigator.language.slice(0, 2) : "en");
+const native = () => lang() === "en";
+
+const I = {
+  mic: '<svg class="i" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>',
+  micOff: '<svg class="i" viewBox="0 0 24 24"><path d="M15 9.3V6a3 3 0 0 0-5.7-1.3M9 9v2a3 3 0 0 0 5.1 2.1M5.5 11a6.5 6.5 0 0 0 11 4.7M18.5 11a6.5 6.5 0 0 1-.4 2.2M12 17.5V21M3 3l18 18"/></svg>',
+  phone: '<svg class="i" viewBox="0 0 24 24"><path d="M5 4h3l2 5-2.5 1.5a11 11 0 0 0 6 6L15 14l5 2v3a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2"/></svg>',
+};
+
+let props = null;          /* /props of the server */
+let state = "off";         /* off, listening, thinking, speaking */
+let ac = null;             /* AudioContext (made on the first click) */
+let out = null, analyser = null;
+let mic = null;            /* { stream, node } while the conversation is on */
+let muted = false;
+let history = [];          /* the conversation sent with each turn */
+let turn = 0;              /* the turn being answered; late events of older turns are ignored */
+let ctrl = null;           /* AbortController of the turn's requests */
+
+/* ---------------- interface ---------------- */
+const STATUS = { off: "Tap Start to talk", listening: "Listening", thinking: "Thinking", speaking: "Speaking" };
+function setState(s) {
+  state = s;
+  document.body.dataset.state = s;
+  $("status").textContent = muted && s === "listening" ? "Microphone muted" : STATUS[s];
+  const b = $("mainBtn");
+  b.innerHTML = s === "off" ? I.phone + "Start" : I.phone + "End";
+  b.classList.toggle("end", s !== "off");
+  $("muteBtn").disabled = s === "off";
+}
+function renderMute() {
+  const b = $("muteBtn");
+  b.innerHTML = muted ? I.micOff : I.mic;
+  b.classList.toggle("on", muted);
+  b.setAttribute("aria-label", muted ? "Unmute the microphone" : "Mute the microphone");
+  if (state === "listening") setState("listening");
+}
+function renderLang() {
+  const l = lang();
+  $("langChip").textContent = (LANGS.find((x) => x[0] === l) || ["", l])[1] + (native() ? " · native" : "");
+}
+function note(t, bad) {
+  $("note").textContent = t || "";
+  $("note").classList.toggle("bad", !!bad);
+}
+
+/* the mascot: the aura follows the voice heard or spoken, the eye blinks now and then */
+let level = 0, micLevel = 0;
+function animate() {
+  let target = 0;
+  if (state === "speaking" && analyser) {
+    const d = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(d);
+    let e = 0;
+    for (const v of d) e += v * v;
+    target = Math.min(1, Math.sqrt(e / d.length) * 6);
+  } else if (state === "listening" && !muted) target = Math.min(1, micLevel * 9);
+  level += (target - level) * (target > level ? .5 : .15);
+  $("stage").style.setProperty("--lvl", level.toFixed(3));
+  requestAnimationFrame(animate);
+}
+(function blink() {
+  setTimeout(() => {
+    $("mark").classList.add("blink");
+    setTimeout(() => { $("mark").classList.remove("blink"); blink(); }, 140);
+  }, 2500 + Math.random() * 3500);
+})();
+
+/* ---------------- playback ---------------- */
+let nextT = 0, sources = [], answerDone = true, ttsPending = 0;
+function play(buffer, t) {
+  if (t !== turn) return;
+  const s = ac.createBufferSource();
+  s.buffer = buffer;
+  s.connect(out);
+  nextT = Math.max(nextT, ac.currentTime + 0.05);
+  s.start(nextT);
+  nextT += buffer.duration;
+  sources.push(s);
+  s.onended = () => { sources = sources.filter((x) => x !== s); maybeDone(t); };
+  if (state === "thinking") setState("speaking");
+}
+function playPCM16(b64, t) {
+  const bin = atob(b64), n = bin.length >> 1;
+  if (!n) return;
+  const buf = ac.createBuffer(1, n, 24000), ch = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) {
+    let v = bin.charCodeAt(2 * i) | (bin.charCodeAt(2 * i + 1) << 8);
+    if (v > 32767) v -= 65536;
+    ch[i] = v / 32768;
+  }
+  play(buf, t);
+}
+/* the answer has been said: listen again */
+function maybeDone(t) {
+  if (t !== turn || !answerDone || ttsPending || sources.length) return;
+  if (state === "speaking" || state === "thinking") setState("listening");
+}
+function stopSpeaking() {
+  turn++;
+  if (ctrl) ctrl.abort();
+  ctrl = null;
+  for (const s of sources) { try { s.stop(); } catch (e) {} }
+  sources = [];
+  nextT = 0;
+  ttsPending = 0;
+  answerDone = true;
+}
+
+/* ---------------- listening ---------------- */
+/* Turn-taking: a turn starts when the level stays above the noise floor, and ends after 0.9 s of
+ * quiet. While Pandora speaks it takes a louder, longer voice (echo cancellation does the rest). */
+const vad = { noise: 0.004, loud: 0, quiet: 0, rec: null, pre: [] };
+function onMic(e) {
+  const d = e.inputBuffer.getChannelData(0), rate = e.inputBuffer.sampleRate, dt = d.length / rate;
+  let en = 0;
+  for (let i = 0; i < d.length; i++) en += d[i] * d[i];
+  const lv = Math.sqrt(en / d.length);
+  micLevel = lv;
+  const chunk = new Float32Array(d);
+  if (muted || state === "off") { vad.rec = null; return; }
+  if (!vad.rec) {
+    vad.pre.push(chunk);
+    while (vad.pre.length * dt > 0.4) vad.pre.shift();   /* the start of the words, before they were detected */
+    if (state === "thinking") return;
+    const thr = Math.max(0.012, vad.noise * 3) * (state === "speaking" ? 2.5 : 1);
+    if (lv > thr) vad.loud += dt;
+    else { vad.loud = Math.max(0, vad.loud - dt); vad.noise += (lv - vad.noise) * 0.05; }
+    if (vad.loud > (state === "speaking" ? 0.35 : 0.12)) {
+      if (state === "speaking") stopSpeaking();   /* barge-in */
+      vad.rec = { chunks: vad.pre.slice(), rate, quiet: 0, len: 0 };
+      vad.pre = [];
+      vad.loud = 0;
+      setState("listening");
+    }
+    return;
+  }
+  const r = vad.rec;
+  r.chunks.push(chunk);
+  r.len += dt;
+  const thr = Math.max(0.012, vad.noise * 3) * 0.7;
+  r.quiet = lv > thr ? 0 : r.quiet + dt;
+  if (r.quiet > 0.9 || r.len > 30) { vad.rec = null; endTurn(r); }
+}
+
+/* 16 kHz 16-bit mono WAV of the recorded chunks (box filter, then linear interpolation) */
+function wav16k(chunks, rate) {
+  const n = chunks.reduce((a, c) => a + c.length, 0), x = new Float32Array(n);
+  let o = 0;
+  for (const c of chunks) { x.set(c, o); o += c.length; }
+  const step = rate / 16000, m = Math.floor(n / step), half = Math.max(0, Math.round(step / 2) - 1);
+  const v = new DataView(new ArrayBuffer(44 + m * 2));
+  const str = (p, s) => { for (let i = 0; i < s.length; i++) v.setUint8(p + i, s.charCodeAt(i)); };
+  str(0, "RIFF"); v.setUint32(4, 36 + m * 2, true); str(8, "WAVE"); str(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, 16000, true); v.setUint32(28, 32000, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, "data"); v.setUint32(40, m * 2, true);
+  for (let i = 0; i < m; i++) {
+    const c = Math.round(i * step);
+    let s = 0, k = 0;
+    for (let j = c - half; j <= c + half; j++) if (j >= 0 && j < n) { s += x[j]; k++; }
+    v.setInt16(44 + 2 * i, Math.max(-1, Math.min(1, k ? s / k : 0)) * 32767, true);
+  }
+  return new Uint8Array(v.buffer);
+}
+function b64(bytes) {
+  let s = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+
+/* ---------------- a turn ---------------- */
+async function endTurn(rec) {
+  if (rec.len - rec.quiet < 0.3) return;   /* a noise, not words */
+  const wav = wav16k(rec.chunks, rec.rate);
+  stopSpeaking();
+  const t = turn;
+  ctrl = new AbortController();
+  answerDone = false;
+  setState("thinking");
+  $("capBot").textContent = "";
+  try {
+    if (native()) await answerNative(wav, t);
+    else await answerPipeline(wav, t);
+  } catch (e) {
+    if (e.name !== "AbortError" && t === turn) note("Something went wrong: " + e.message, true);
+  }
+  if (t !== turn) return;
+  answerDone = true;
+  maybeDone(t);   /* listening again once everything has been said */
+}
+
+/* reads an SSE stream, calling on(json) for every event */
+async function sse(r, on) {
+  if (!r.ok) {
+    let m = "HTTP " + r.status;
+    try { m = (await r.json()).error.message; } catch (e) {}
+    throw new Error(m);
+  }
+  const rd = r.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await rd.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let k;
+    while ((k = buf.indexOf("\n\n")) >= 0) {
+      const ev = buf.slice(0, k);
+      buf = buf.slice(k + 2);
+      for (const line of ev.split("\n")) {
+        if (!line.startsWith("data: ") || line === "data: [DONE]") continue;
+        const j = JSON.parse(line.slice(6));
+        if (j.error) throw new Error(j.error.message);
+        on(j);
+      }
+    }
+  }
+}
+
+/* English: the model hears the turn and answers in speech */
+async function answerNative(wav, t) {
+  $("capUser").textContent = "";
+  history.push({ role: "user", content: [{ type: "input_audio", input_audio: { data: b64(wav), format: "wav" } }] });
+  history = history.slice(-6);   /* the last three exchanges: their audio goes with each turn */
+  while (history.length && history[0].role !== "user") history.shift();
+  let text = "";
+  const r = await fetch("/v1/chat/completions", {
+    method: "POST", headers: { "Content-Type": "application/json" }, signal: ctrl.signal,
+    body: JSON.stringify({ messages: [{ role: "system", content: "Respond with interleaved text and audio." }, ...history],
+                           modalities: ["text", "audio"], audio: { voice: cfg.voice, format: "pcm16" }, stream: true }),
+  });
+  await sse(r, (j) => {
+    if (t !== turn) return;
+    for (const c of j.choices || []) {
+      const d = c.delta || {};
+      if (d.content) { text += d.content; $("capBot").textContent = text; }
+      if (d.audio && d.audio.data) playPCM16(d.audio.data, t);
+    }
+  });
+  if (t === turn) history.push({ role: "assistant", content: text.trim() });
+}
+
+/* other languages: transcription, a short text answer, its sentences spoken one after another */
+async function answerPipeline(wav, t) {
+  const fd = new FormData();
+  fd.append("file", new Blob([wav], { type: "audio/wav" }), "turn.wav");
+  fd.append("language", lang());
+  let r = await fetch("/v1/audio/transcriptions", { method: "POST", body: fd, signal: ctrl.signal });
+  const tj = await r.json();
+  if (!r.ok) throw new Error((tj.error && tj.error.message) || "HTTP " + r.status);
+  const heard = (tj.text || "").trim();
+  if (t !== turn || !heard) return;
+  $("capUser").textContent = heard;
+  history.push({ role: "user", content: heard });
+  history = history.slice(-12);
+  const sys = "You are Pandora, a friendly voice assistant. Answer in " + NAMES[lang()] +
+              ", in one to three short sentences meant to be spoken: no lists, no code, no Markdown.";
+  r = await fetch("/v1/chat/completions", {
+    method: "POST", headers: { "Content-Type": "application/json" }, signal: ctrl.signal,
+    body: JSON.stringify({ messages: [{ role: "system", content: sys }, ...history], stream: true, reasoning_effort: "off" }),
+  });
+  let text = "", said = 0;
+  const speakTo = (end) => {   /* sentences from said to end */
+    const part = text.slice(said, end).replace(/[*_#`>]+/g, " ").replace(/\s+/g, " ").trim();
+    said = end;
+    if (/[\p{L}\p{N}]/u.test(part)) speak(part, t);
+  };
+  await sse(r, (j) => {
+    if (t !== turn) return;
+    for (const c of j.choices || []) {
+      const d = c.delta || {};
+      if (!d.content) continue;
+      text += d.content;
+      $("capBot").textContent = text;
+      const re = /(?<=[\p{L}\p{N})"'»”][.!?…]+["')»”]*)\s+/gu;
+      re.lastIndex = said;
+      let m, end = said;
+      while ((m = re.exec(text))) end = m.index + m[0].length;
+      if (end > said) speakTo(end);
+    }
+  });
+  if (t !== turn) return;
+  speakTo(text.length);
+  history.push({ role: "assistant", content: text.trim() });
+}
+
+/* one sentence through /v1/audio/speech; the requests run one at a time, in order */
+let ttsChain = Promise.resolve();
+function speak(text, t) {
+  ttsPending++;
+  ttsChain = ttsChain.then(async () => {
+    try {
+      if (t !== turn) return;
+      const r = await fetch("/v1/audio/speech", {
+        method: "POST", headers: { "Content-Type": "application/json" }, signal: ctrl ? ctrl.signal : undefined,
+        body: JSON.stringify({ input: text, voice: cfg.voice, language: lang() }),
+      });
+      if (!r.ok) throw new Error((await r.json()).error.message);
+      const buf = await ac.decodeAudioData(await r.arrayBuffer());
+      play(buf, t);
+    } catch (e) {
+      if (e.name !== "AbortError" && t === turn) note("Speech failed: " + e.message, true);
+    } finally {
+      if (t === turn) { ttsPending--; maybeDone(t); }
+    }
+  });
+}
+
+/* ---------------- start / end ---------------- */
+async function start() {
+  note("");
+  try {
+    if (!ac) {
+      ac = new AudioContext();
+      out = ac.createGain();
+      analyser = ac.createAnalyser();
+      analyser.fftSize = 1024;
+      out.connect(analyser);
+      analyser.connect(ac.destination);
+    }
+    await ac.resume();
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const node = ac.createScriptProcessor(2048, 1, 1);
+    ac.createMediaStreamSource(stream).connect(node);
+    node.connect(ac.destination);   /* a script processor runs only when connected; it outputs silence */
+    node.onaudioprocess = onMic;
+    mic = { stream, node };
+  } catch (e) {
+    note("Microphone not available: " + (e.message || e.name), true);
+    return;
+  }
+  history = [];
+  vad.rec = null; vad.pre = []; vad.loud = 0;
+  $("capUser").textContent = "";
+  $("capBot").textContent = "Say something…";
+  setState("listening");
+}
+function end() {
+  stopSpeaking();
+  if (mic) {
+    mic.node.disconnect();
+    mic.stream.getTracks().forEach((t) => t.stop());
+    mic = null;
+  }
+  vad.rec = null;
+  setState("off");
+}
+
+async function init() {
+  setState("off");
+  renderMute();
+  renderLang();
+  for (const [code, name] of LANGS) $("sLang").add(new Option(name + (code === "en" ? " (native voice)" : ""), code));
+  $("sLang").add(new Option("As the browser", ""), 0);
+  try {
+    props = await (await fetch("/props")).json();
+  } catch (e) {
+    note("The Pithos server is not reachable.", true);
+  }
+  const m = (props && props.modalities) || {};
+  if (props && !(m.audio && m.speech)) {
+    note("This model cannot talk: start Pithos with LFM3-Audio and its mmproj file next to it.", true);
+    $("mainBtn").disabled = true;
+  } else if (!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)) {
+    note("The browser gives the microphone only to pages on localhost or https.", true);
+    $("mainBtn").disabled = true;
+  }
+  requestAnimationFrame(animate);
+}
+
+$("mainBtn").addEventListener("click", () => (state === "off" ? start() : end()));
+$("muteBtn").addEventListener("click", () => { muted = !muted; vad.rec = null; renderMute(); });
+$("stage").addEventListener("click", () => { if (state === "speaking") { stopSpeaking(); setState("listening"); } });
+$("settingsBtn").addEventListener("click", () => { $("sLang").value = cfg.lang; $("sVoice").value = cfg.voice; $("settings").showModal(); });
+$("settings").addEventListener("close", () => {
+  cfg.lang = $("sLang").value;
+  cfg.voice = $("sVoice").value;
+  store.set("pithos.talk", cfg);
+  renderLang();
+});
+init();
+</script>
+</body>
+</html>

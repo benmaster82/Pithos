@@ -80,6 +80,7 @@ svg { width: 18px; height: 18px; flex: none; stroke: currentColor; fill: none; s
 @media (prefers-reduced-motion: reduce) { .state.busy i { animation: none; transform: scaleY(.7); } }
 .icon-btn { width: 32px; height: 32px; border-radius: 8px; display: grid; place-items: center; color: var(--muted); }
 .icon-btn:hover { background: var(--surface-2); color: var(--text); }
+.talk-link[hidden] { display: none; }
 
 /* main */
 .main { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
@@ -289,6 +290,7 @@ dialog::backdrop { background: rgba(0,0,0,.35); }
     <header class="top" id="top">
       <button class="icon-btn menu-btn" id="menuBtn" aria-label="Conversations"><svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
       <div class="top-title" id="title"></div>
+      <a class="icon-btn talk-link" id="talkLink" href="/talk" hidden title="Voice conversation" aria-label="Voice conversation"><svg viewBox="0 0 24 24"><path d="M4 10v4M8 7v10M12 4v16M16 8v8M20 11v2"/></svg></a>
       <div class="ctx" id="ctx" title="Tokens in context"></div>
     </header>
     <div class="scroll" id="scroll"><div id="thread"></div></div>
@@ -947,6 +949,7 @@ async function loadProps() {
     server.reasoning = p.reasoning || null;
     server.audio = !!(p.modalities && p.modalities.audio);
     server.speech = !!(p.modalities && p.modalities.speech);
+    $("talkLink").hidden = !(server.speech && server.audio);
     renderThinkSel();
     renderMic();
     renderVoiceBtn();
