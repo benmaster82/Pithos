@@ -218,6 +218,16 @@ svg { width: 18px; height: 18px; flex: none; stroke: currentColor; fill: none; s
 .send svg { width: 17px; height: 17px; stroke-width: 2.2; }
 .send .stop { width: 11px; height: 11px; background: currentColor; border-radius: 2px; }
 .hint { max-width: 768px; margin: 7px auto 0; text-align: center; font-size: 12px; color: var(--faint); }
+.hint.bad { color: var(--danger); }
+.composer-right { display: flex; align-items: center; gap: 4px; flex: none; }
+.mic { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; flex: none; color: var(--muted); }
+.mic:hover { background: var(--surface); color: var(--text); }
+.mic[hidden], .mic-time[hidden] { display: none; }
+.mic.rec { background: var(--danger); color: #fff; animation: rec 1.4s ease-in-out infinite; }
+.mic.wait { cursor: progress; }
+.mic.wait svg { animation: rot 1s linear infinite; }
+.mic-time { font-size: 12px; color: var(--danger); font-variant-numeric: tabular-nums; padding-right: 2px; }
+@keyframes rec { 50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--danger) 25%, transparent); } }
 
 /* settings dialog */
 dialog { border: 1px solid var(--border); border-radius: 16px; padding: 0; width: min(560px, calc(100vw - 32px)); background: var(--bg); color: var(--text); box-shadow: var(--shadow); }
@@ -290,7 +300,11 @@ dialog::backdrop { background: rgba(0,0,0,.35); }
             <button type="button" class="chip" id="agentBtn" hidden title="Agent mode: the model can use tools (web, files, MCP)"></button>
             <label class="chip think-chip" id="thinkChip" hidden title="How much the model reasons before it answers"><span id="thinkIcon"></span><select id="thinkSel" aria-label="Reasoning"></select></label>
           </div>
-          <button class="send" id="send" type="submit" aria-label="Send" disabled></button>
+          <div class="composer-right">
+            <span class="mic-time" id="micTime" hidden></span>
+            <button type="button" class="mic" id="mic" hidden aria-label="Dictate" title="Dictate: speak, then click again to write what you said"></button>
+            <button class="send" id="send" type="submit" aria-label="Send" disabled></button>
+          </div>
         </div>
       </form>
       <div class="hint">Enter to send · Shift+Enter for a new line · the model can make mistakes, check important information</div>
@@ -363,6 +377,8 @@ const I = {
   plug: '<svg viewBox="0 0 24 24"><path d="M9 2v6M15 2v6M6 8h12v3a6 6 0 0 1-12 0zM12 17v5"/></svg>',
   pen: '<svg viewBox="0 0 24 24"><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4z"/></svg>',
   term: '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/></svg>',
+  mic: '<svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>',
+  spin: '<svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-8-8"/></svg>',
 };
 
 /* ---------------- storage (per browser) ---------------- */
@@ -914,7 +930,9 @@ async function loadProps() {
     server.n_ctx = p.n_ctx || 0;
     server.params = (p.default_generation_settings && p.default_generation_settings.params) || {};
     server.reasoning = p.reasoning || null;
+    server.audio = !!(p.modalities && p.modalities.audio);
     renderThinkSel();
+    renderMic();
     $("modelName").textContent = server.alias;
     $("modelName").title = p.system_info || "";
     setStatus(busy ? "busy" : "ok");
@@ -1027,6 +1045,108 @@ function saveSettings() {
   renderAgentBtn();
 }
 
+/* ---------------- dictation ---------------- */
+/* With an audio model (LFM3-Audio) the server transcribes speech: the browser records the
+ * microphone, the WAV goes to /v1/audio/transcriptions and the text lands in the message box, to
+ * check before sending. The conversation stays text. Browsers give the microphone to pages on
+ * localhost or https only. */
+const MIC_MAX = 300;   /* seconds */
+let mic = null;        /* the recording ({stream, ctx, node, chunks, n, rate, t0, timer}), or "wait" while transcribing */
+
+function renderMic() {
+  const b = $("mic"), t = $("micTime");
+  b.hidden = !server.audio || !(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+  const rec = !!mic && mic !== "wait";
+  b.classList.toggle("rec", rec);
+  b.classList.toggle("wait", mic === "wait");
+  b.innerHTML = mic === "wait" ? I.spin : I.mic;
+  b.disabled = mic === "wait";
+  b.setAttribute("aria-label", rec ? "Stop and transcribe" : mic === "wait" ? "Transcribing" : "Dictate");
+  t.hidden = !rec;
+  if (rec) {
+    const sec = Math.floor((performance.now() - mic.t0) / 1000);
+    t.textContent = Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
+  }
+}
+
+function notice(text) {
+  const h = document.querySelector(".hint");
+  if (!h.dataset.text) h.dataset.text = h.textContent;
+  h.textContent = text;
+  h.classList.add("bad");
+  clearTimeout(notice.t);
+  notice.t = setTimeout(() => { h.textContent = h.dataset.text; h.classList.remove("bad"); }, 6000);
+}
+
+async function micStart() {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+  } catch (e) {
+    notice("Microphone not available: " + (e.message || e.name));
+    return;
+  }
+  const ctx = new AudioContext();
+  const node = ctx.createScriptProcessor(4096, 1, 1);
+  const m = { stream, ctx, node, chunks: [], n: 0, rate: ctx.sampleRate, t0: performance.now() };
+  node.onaudioprocess = (e) => {
+    if (mic !== m) return;
+    const d = e.inputBuffer.getChannelData(0);
+    m.chunks.push(new Float32Array(d));
+    m.n += d.length;
+    if (m.n >= m.rate * MIC_MAX) micStop();
+  };
+  ctx.createMediaStreamSource(stream).connect(node);
+  node.connect(ctx.destination);   /* a script processor runs only when connected; it outputs silence */
+  mic = m;
+  m.timer = setInterval(renderMic, 250);
+  renderMic();
+}
+
+/* 16-bit mono WAV at the recording's rate (the server resamples to 16 kHz) */
+function wavBlob(chunks, n, rate) {
+  const v = new DataView(new ArrayBuffer(44 + n * 2));
+  const str = (o, x) => { for (let i = 0; i < x.length; i++) v.setUint8(o + i, x.charCodeAt(i)); };
+  str(0, "RIFF"); v.setUint32(4, 36 + n * 2, true); str(8, "WAVE"); str(12, "fmt ");
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, rate, true);
+  v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, "data"); v.setUint32(40, n * 2, true);
+  let o = 44;
+  for (const c of chunks)
+    for (let i = 0; i < c.length; i++, o += 2) v.setInt16(o, Math.max(-1, Math.min(1, c[i])) * 32767, true);
+  return new Blob([v.buffer], { type: "audio/wav" });
+}
+
+async function micStop() {
+  const m = mic;
+  if (!m || m === "wait") return;
+  clearInterval(m.timer);
+  m.node.disconnect();
+  m.stream.getTracks().forEach((t) => t.stop());
+  m.ctx.close();
+  mic = "wait";
+  renderMic();
+  if (m.n >= m.rate / 4) {   /* under a quarter of a second: nothing to transcribe */
+    const fd = new FormData();
+    fd.append("file", wavBlob(m.chunks, m.n, m.rate), "dictation.wav");
+    try {
+      const r = await fetch("/v1/audio/transcriptions", { method: "POST", body: fd });
+      const j = await r.json();
+      if (!r.ok) throw new Error((j.error && j.error.message) || "HTTP " + r.status);
+      const el = $("input"), text = (j.text || "").trim();
+      if (text) {
+        el.value += (el.value && !/\s$/.test(el.value) ? " " : "") + text;
+        autosize();
+        el.focus();
+      }
+    } catch (e) {
+      notice("Transcription failed: " + e.message);
+    }
+  }
+  mic = null;
+  renderMic();
+}
+
 /* ---------------- events ---------------- */
 function autosize() {
   const t = $("input");
@@ -1036,6 +1156,7 @@ function autosize() {
 }
 
 $("input").addEventListener("input", autosize);
+$("mic").addEventListener("click", () => (mic ? micStop() : micStart()));
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send($("input").value); }
 });

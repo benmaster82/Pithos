@@ -617,6 +617,9 @@ dependency-free HTTP server (Winsock / POSIX sockets) with:
   - multi-turn conversations saved in the browser;
   - streaming answers with Markdown (tables, code with a Copy button) and a collapsible reasoning section;
   - a reasoning level selector next to the message box (High, Medium, Low, Off);
+  - with [LFM3-Audio](#lfm3-audio-2b-speech-input-experimental), a microphone button for dictation:
+    speak, click again, and the transcription lands in the message box to check before sending
+    (browsers allow the microphone on `localhost` or https only);
   - prompt-processing progress, stop, regenerate, edit the last message;
   - system prompt and sampling parameters, light/dark theme.
 
@@ -1174,8 +1177,8 @@ Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
 - The server handles one request at a time and the others wait in a queue, because the context and
   the expert cache are shared.
 - Web interface conversations live in the browser's `localStorage`.
-- Speech input only, for LFM3-Audio, from WAV files (command line and API; Pandora has no
-  microphone button yet): no speech output, no vision models.
+- Speech input only, for LFM3-Audio: WAV files (command line and API) and dictation in Pandora,
+  where the conversation itself stays text. No speech output, no vision models.
 
 ## License
 Pithos is released under the [MIT License](LICENSE). The license covers the engine's code only; the
