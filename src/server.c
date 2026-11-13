@@ -2124,7 +2124,9 @@ static void handle_transcription(Conn *c, const Req *r) {
     Toks t = { 0 };
     float *lg = NULL;
     double secs = S.n_clips ? S.clip[0].n / (double)AUDIO_RATE : 0;
+    const int heard = S.n_clips && audio_has_speech(S.clip[0].pcm, S.clip[0].n);
     if (S.clip_err[0]) snprintf(err, sizeof(err), "%s", S.clip_err + (strncmp(S.clip_err, "audio part 1: ", 14) ? 0 : 14));
+    else if (!heard) buf_add(&g.content, "", 0);   /* no speech: an empty transcription, not made-up words */
     else {
         char sys[200];
         if (lang[0]) snprintf(sys, sizeof(sys), "Perform ASR in %s.", language_name(lang));

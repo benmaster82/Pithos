@@ -260,6 +260,30 @@ float *audio_decode_wav(const unsigned char *d, size_t size, int *n_out, char *e
     return pcm;
 }
 
+static int cmp_float(const void *a, const void *b) {
+    const float x = *(const float *)a, y = *(const float *)b;
+    return (x > y) - (x < y);
+}
+
+int audio_has_speech(const float *pcm, int n) {
+    const int fl = AUDIO_RATE * 30 / 1000, nf = n / fl;
+    if (nf <= 0) return 0;
+    float *rms = (float *)malloc(sizeof(float) * (size_t)nf), *sorted = (float *)malloc(sizeof(float) * (size_t)nf);
+    for (int f = 0; f < nf; f++) {
+        double e = 0;
+        for (int i = 0; i < fl; i++) e += (double)pcm[f * fl + i] * pcm[f * fl + i];
+        rms[f] = sorted[f] = (float)sqrt(e / fl);
+    }
+    qsort(sorted, (size_t)nf, sizeof(float), cmp_float);
+    const float room = sorted[nf / 10] > 1e-4f ? sorted[nf / 10] : 1e-4f;
+    const float thr = 3 * room > 0.006f ? 3 * room : 0.006f;
+    int loud = 0;
+    for (int f = 0; f < nf; f++) loud += rms[f] > thr;
+    free(rms);
+    free(sorted);
+    return loud * 30 >= 200;
+}
+
 int audio_n_tokens(int n) {
     if (n <= 0) return 0;
     const int np = n <= N_FFT ? N_FFT : n + (HOP - (n - N_FFT) % HOP) % HOP;

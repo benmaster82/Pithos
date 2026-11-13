@@ -22,6 +22,11 @@ float *audio_decode_wav(const unsigned char *data, size_t len, int *n, char *err
 /* how many embeddings audio_embed gives for n samples (one per 80 ms, rounded up) */
 int audio_n_tokens(int n);
 
+/* whether AUDIO_RATE samples hold speech: at least 0.2 s of 30 ms frames louder than the room (the
+ * 10th percentile of the frames) and than -44 dBFS. A transcription of silence or of noise alone
+ * comes out as made-up words, so callers skip it. */
+int audio_has_speech(const float *pcm, int n);
+
 /* The embeddings [*n_out][lm_dim] of AUDIO_RATE mono samples (caller frees), NULL if too short.
  * PITHOS_AUDIO_DUMP=PREFIX writes, as f32: PREFIX.mel [128][frames], PREFIX.pre and PREFIX.hid
  * (encoder input and output, [tokens][768]) and PREFIX.emb. */

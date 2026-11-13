@@ -1079,6 +1079,7 @@ function saveSettings() {
  * localhost or https only. */
 const MIC_MAX = 300;   /* seconds */
 let mic = null;        /* the recording ({stream, ctx, node, chunks, n, rate, t0, timer}), or "wait" while transcribing */
+let micStarting = false;   /* waiting for the browser to give the microphone: another click does nothing */
 
 function renderMic() {
   const b = $("mic"), t = $("micTime");
@@ -1087,7 +1088,7 @@ function renderMic() {
   b.classList.toggle("rec", rec);
   b.classList.toggle("wait", mic === "wait");
   b.innerHTML = mic === "wait" ? I.spin : I.mic;
-  b.disabled = mic === "wait";
+  b.disabled = mic === "wait" || micStarting;
   b.setAttribute("aria-label", rec ? "Stop and transcribe" : mic === "wait" ? "Transcribing" : "Dictate");
   t.hidden = !rec;
   if (rec) {
@@ -1106,32 +1107,40 @@ function notice(text) {
 }
 
 async function micStart(auto) {
+  if (micStarting || mic) return;
   speakStop();
   let stream;
+  micStarting = true;
+  renderMic();
   try {
     stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
   } catch (e) {
     notice("Microphone not available: " + (e.message || e.name));
     return;
+  } finally {
+    micStarting = false;
+    renderMic();
   }
   const ctx = new AudioContext();
   const node = ctx.createScriptProcessor(4096, 1, 1);
   const m = { stream, ctx, node, chunks: [], n: 0, rate: ctx.sampleRate, t0: performance.now(), auto,
-              noise: 0, heard: 0, quiet: 0 };
+              noise: Infinity, heard: 0, quiet: 0 };
   node.onaudioprocess = (e) => {
     if (mic !== m) return;
     const d = e.inputBuffer.getChannelData(0);
     m.chunks.push(new Float32Array(d));
     m.n += d.length;
     if (m.n >= m.rate * MIC_MAX) { micStop(); return; }
-    if (!voiceOn()) return;
-    /* voice mode: stop after a pause, measured against the noise of the first half second */
+    /* speech: louder than the room, whose level is the quietest moment so far. A recording without
+     * any is not sent: the model would make words up from the silence */
     let e2 = 0;
     for (let i = 0; i < d.length; i++) e2 += d[i] * d[i];
     const level = Math.sqrt(e2 / d.length), sec = m.n / m.rate, dt = d.length / m.rate;
-    if (sec < 0.5) { m.noise = Math.max(m.noise, level); return; }
-    if (level > Math.max(0.012, 2.5 * m.noise)) { m.heard += dt; m.quiet = 0; }
+    m.noise = Math.min(m.noise, Math.max(level, 0.002));
+    if (level > Math.max(0.012, 3 * m.noise)) { m.heard += dt; m.quiet = 0; }
     else m.quiet += dt;
+    if (!voiceOn()) return;
+    /* voice mode: stop after a pause */
     if (m.heard > 0.3 && m.quiet > 1.2) micStop();
     else if (m.auto && m.heard < 0.3 && sec > 10) micStop(true);   /* nobody spoke: stop listening */
   };
@@ -1165,7 +1174,8 @@ async function micStop(discard) {
   m.ctx.close();
   mic = "wait";
   renderMic();
-  if (!discard && m.n >= m.rate / 4) {   /* under a quarter of a second: nothing to transcribe */
+  if (!discard && m.heard < 0.25) notice("Nothing heard: speak, then click the microphone again.");
+  else if (!discard) {
     const fd = new FormData();
     fd.append("file", wavBlob(m.chunks, m.n, m.rate), "dictation.wav");
     try {
