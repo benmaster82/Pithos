@@ -263,14 +263,13 @@ build/pithos -m models/LFM3-1.7B-Q4_K_M.gguf -i
 build/pithos -m models/LFM3-1.7B-Q4_K_M.gguf --server --open
 ```
 
-### LFM3-Audio-2B: speech input (experimental)
+### LFM3-Audio-2B: speech input and output (experimental)
 [LiquidAI/LFM3-Audio-2B](https://huggingface.co/LiquidAI/LFM3-Audio-2B) is LFM3 with a speech
-encoder: it hears audio and answers in text. Transcription works in 18 languages, Italian
-included; it can also answer questions about what it hears or translate it. Pithos reads the audio
-from a WAV file (`--audio`, or the [API](#server-and-web-chat)). Speech output (TTS, voice chat) is
-not supported yet. Two files are needed: the model, whose text part is the same architecture as
-LFM3-1.7B and runs on the same GPU paths, and its audio projector (`mmproj-...`), which Pithos
-looks for next to the model.
+encoder and a speech decoder: it hears audio and speaks, in 18 languages, Italian included. Pithos
+transcribes speech, answers questions about it or translates it, reads text aloud with a female or
+male voice, and lets [Pandora](#server-and-web-chat) hold a spoken conversation. Two files are
+needed: the model, whose text part is the same architecture as LFM3-1.7B and runs on the same GPU
+paths, and its audio projector (`mmproj-...`), which Pithos looks for next to the model.
 
 ```
 build\pithos.exe -m models\LFM3-Audio-2B-Q4_K_M.gguf --audio speech.wav -s "Perform ASR in English."
@@ -286,6 +285,18 @@ does for text-only answers. With `-i` the audio goes into the first message of t
 can be PCM (8, 16, 24 or 32-bit) or 32-bit float, at any sample rate and with any number of
 channels: Pithos mixes it to mono and resamples it to 16 kHz.
 
+**Speech output.** `--tts` speaks a text into a WAV file (24 kHz):
+
+```
+build\pithos.exe -m models\LFM3-Audio-2B-Q4_K_M.gguf --tts "Buongiorno a tutti!" --tts-lang it --tts-voice male -o saluto.wav
+```
+
+Each step of the model gives a frame of 12 codes for 80 ms of speech (a small depth decoder picks
+them in three passes), and the codec turns the frames into sound. On the reference laptop speech
+comes out 2.7 times faster than real time with Vulkan (8.9 s of speech in 3.2 s), 1.2 times on the
+CPU alone; OpenCL runs the text part of each step on the CPU here, as the speech decoder needs the
+model's hidden state. The voices are those of the model card: `female` (default) and `male`.
+
 | | Model | Audio projector |
 |---|---|---|
 | File | `LFM3-Audio-2B-Q4_K_M.gguf` | `mmproj-LFM3-Audio-2B-Q4_K_M.gguf` |
@@ -296,7 +307,8 @@ channels: Pithos mixes it to mono and resamples it to 16 kHz.
 The encoder runs on the CPU, about 30 times faster than real time on the reference laptop (54 s
 of speech in 1.7 s); the transcription itself then runs like any prompt, on the GPU if there is
 one. On test recordings in English and Italian (16, 22 and 44.1 kHz, up to a minute) the
-transcriptions are the same as llama.cpp's on the CPU, OpenCL and Vulkan.
+transcriptions are the same as llama.cpp's on the CPU, OpenCL and Vulkan, and what Pithos says is
+transcribed back word for word.
 
 ## Results
 
@@ -617,9 +629,13 @@ dependency-free HTTP server (Winsock / POSIX sockets) with:
   - multi-turn conversations saved in the browser;
   - streaming answers with Markdown (tables, code with a Copy button) and a collapsible reasoning section;
   - a reasoning level selector next to the message box (High, Medium, Low, Off);
-  - with [LFM3-Audio](#lfm3-audio-2b-speech-input-experimental), a microphone button for dictation:
+  - with [LFM3-Audio](#lfm3-audio-2b-speech-input-and-output-experimental), a microphone button for dictation:
     speak, click again, and the transcription lands in the message box to check before sending
     (browsers allow the microphone on `localhost` or https only);
+  - and a **Voice** mode: the answer is read aloud with the model's voice while it streams, a
+    sentence at a time, what you dictate is sent at once, and hands-free (Settings, on by default)
+    the microphone opens again after each answer and stops by itself after a pause. Clicking the
+    microphone or typing interrupts the voice;
   - prompt-processing progress, stop, regenerate, edit the last message;
   - system prompt and sampling parameters, light/dark theme.
 
@@ -631,15 +647,18 @@ dependency-free HTTP server (Winsock / POSIX sockets) with:
   - `POST /v1/completions` and `GET /v1/models`;
   - like llama-server, also `GET /health`, `GET /props`, `POST /tokenize`, `POST /apply-template`
     and the `timings` / `prompt_progress` fields (`return_progress: true`);
-  - with [LFM3-Audio](#lfm3-audio-2b-speech-input-experimental) and its projector next to it, speech
-    input: `input_audio` parts (base64 WAV) in chat messages, and `POST /v1/audio/transcriptions`
-    (form fields `file`, `language` as an ISO code such as `it`, `response_format` `json`, `text` or
-    `verbose_json`, `temperature`). `GET /props` says so under `modalities`.
+  - with [LFM3-Audio](#lfm3-audio-2b-speech-input-and-output-experimental) and its projector next to it, speech:
+    `input_audio` parts (base64 WAV) in chat messages; `POST /v1/audio/transcriptions` (form
+    fields `file`, `language` as an ISO code such as `it`, `response_format` `json`, `text` or
+    `verbose_json`, `temperature`); `POST /v1/audio/speech` (`input`, `voice` `female` or `male`,
+    `language`, `response_format` `wav` or `pcm`). `GET /props` says so under `modalities`.
 
 ```
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
      -d '{"messages":[{"role":"user","content":"Hello!"}]}'
 curl http://127.0.0.1:8080/v1/audio/transcriptions -F file=@speech.wav -F language=en
+curl http://127.0.0.1:8080/v1/audio/speech -H "Content-Type: application/json" \
+     -d '{"input":"Ciao!","language":"it"}' -o ciao.wav
 ```
 
 **Reasoning levels.** None of the models has official effort levels: LFM3 has an on/off switch in its
@@ -848,6 +867,8 @@ checkpoint and only processes the rest:
 | `-s TEXT` | system prompt |
 | `--audio FILE` | a WAV file the model hears before the prompt (LFM3-Audio); without `-p`, the audio alone is the message |
 | `--mmproj FILE` | the audio projector (default: `mmproj-<model name>*.gguf` next to the model) |
+| `--tts TEXT`, `-o FILE` | speak TEXT into a 24 kHz WAV file (LFM3-Audio; default `speech.wav`) |
+| `--tts-voice V`, `--tts-lang L`, `--tts-temp F` | `female` (default) or `male`; the language as an ISO code (`en`, `it`, `fr`, ...); the temperature of the speech codes (default 1.0) |
 | `--raw` | plain text completion without the template |
 | `-n N` | max tokens per answer (default 4096, reasoning included) |
 | `-c N` | context in tokens (default 8192, max 131072) |
@@ -1099,6 +1120,11 @@ for each of the 30 convolution layers.
   downsampler output within 0.01% once the reference rounds its inputs to int8 as Pithos does,
   encoder output within 0.4%, embeddings within 2% (cosine 0.9997; the projector multiplies in
   float, because int8 inputs would add about 7% there). Transcriptions equal to llama.cpp's.
+  Speech output against the same kind of reference, written from `modeling_lfm3_audio.py` and
+  `modeling_liquid_codec.py`: depth decoder logits within 1.7% (the same most likely code in 94% of
+  the cases; the rest are near ties); codec output within 1.3%, as far as the reference itself
+  moves when it rounds its inputs to int8 like Pithos; inverse STFT exact (141 dB). The spoken
+  test sentences transcribe back word for word.
 - LFM3-1.7B: perplexity against an independent PyTorch implementation written from the model's
   `modeling_lfm3.py`, on the same dequantized weights: 4.45 vs 4.39 with 256-token windows, 3.65
   vs 3.62 with 1024 (sliding window active). The gap is the int8 activations and the f16 KV cache.
@@ -1151,6 +1177,7 @@ for each of the 30 convolution layers.
 | `PITHOS_VK_MAXBUF=MB` | Vulkan: a lower buffer size limit, to test the splitting of large matrices |
 | `PITHOS_VK_FAIL=N` | Vulkan: simulate a GPU failure at the Nth whole-pass submit, to test the fallback to the CPU |
 | `PITHOS_CL_FAIL=N` | OpenCL: simulate a GPU failure at the Nth generated token, to test the fallback to the CPU |
+| `PITHOS_SPEECH_DUMP=PREFIX`, `PITHOS_SPEECH_ORDER=fixed`, `PITHOS_SPEECH_PROFILE=1` | `--tts`: write the hidden states, codes, logits, codec output and audio of every frame (`PREFIX.hid`, `.codes`, `.logits`, `.polar`, `.pcm`); reveal the codebooks in a fixed order (for comparisons); print the time per frame of each part |
 | `PITHOS_AUDIO_DUMP=PREFIX` | `--audio`: write the log-mel features, the encoder input and output and the embeddings as raw f32 files `PREFIX.mel`, `.pre`, `.hid`, `.emb` |
 
 ## Limitations
@@ -1177,8 +1204,9 @@ Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
 - The server handles one request at a time and the others wait in a queue, because the context and
   the expert cache are shared.
 - Web interface conversations live in the browser's `localStorage`.
-- Speech input only, for LFM3-Audio: WAV files (command line and API) and dictation in Pandora,
-  where the conversation itself stays text. No speech output, no vision models.
+- LFM3-Audio: WAV files only (no MP3 / Opus); Pandora's spoken conversation reads the text answer
+  aloud rather than letting the model answer in speech directly (its interleaved mode), so the
+  voice starts once the answer's first sentence is written. No vision models.
 
 ## License
 Pithos is released under the [MIT License](LICENSE). The license covers the engine's code only; the

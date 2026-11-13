@@ -204,34 +204,62 @@ const float *model_f32(Model *m, const char *name, int n, char *err, int errlen)
 /* The speech encoder of an LFM3-Audio projector (mmproj, projector type lfm3a): 17 LFM2 blocks,
  * short-conv or attention, every attention layer causal with a sliding window, full NEOX RoPE. */
 int model_load_audio_encoder(Model *m, const char *path, char *err, int errlen) {
+    GGUF g;
+    if (!gguf_open(&g, path, err, errlen)) return 0;
+    uint64_t pl = 0;
+    const char *pt = gguf_get_str(&g, "clip.audio.projector_type", &pl);
+    const int ok = pt && pl == 5 && !memcmp(pt, "lfm3a", 5);
+    const int window = (int)gguf_get_int(&g, "clip.audio.window_size", 0);
+    gguf_close(&g);
+    if (!ok || window <= 0) { snprintf(err, errlen, "%s: not an LFM3-Audio projector", path); return 0; }
+    return model_load_lfm_part(m, path, "a.blk.", "a.post_ln.weight", window, 0, err, errlen);
+}
+
+int model_load_lfm_part(Model *m, const char *path, const char *prefix, const char *final_norm, int window, int bidir,
+                        char *err, int errlen) {
     memset(m, 0, sizeof(*m));
     if (!gguf_open(&m->gguf, path, err, errlen)) return 0;
     GGUF *g = &m->gguf;
-    uint64_t pl = 0;
-    const char *pt = gguf_get_str(g, "clip.audio.projector_type", &pl);
-    if (!pt || pl != 5 || memcmp(pt, "lfm3a", 5)) { snprintf(err, errlen, "%s: not an LFM3-Audio projector", path); goto fail; }
+    char nm[160];
+#define T(s) (snprintf(nm, sizeof(nm), "%s%d." s, prefix, l), nm)
+    int l = 0;
+    while (gguf_tensor(g, T("ln1.weight"))) l++;
+    m->n_layer = l;
+    l = 0;
+    const GGUFTensor *ln = gguf_tensor(g, T("ln1.weight"));
     snprintf(m->arch, sizeof(m->arch), "lfm3a");
-    m->n_layer = (int)gguf_get_int(g, "clip.audio.block_count", 0);
-    m->dim = (int)gguf_get_int(g, "clip.audio.embedding_length", 0);
-    m->n_head = (int)gguf_get_int(g, "clip.audio.attention.head_count", 0);
-    m->n_kv_head = (int)gguf_get_int(g, "clip.audio.attention.head_count_kv", m->n_head);
-    m->ff_dense = (int)gguf_get_int(g, "clip.audio.feed_forward_length", 0);
-    m->eps = (float)gguf_get_float(g, "clip.audio.attention.layer_norm_epsilon", 1e-5);
-    m->swa_window = (int)gguf_get_int(g, "clip.audio.window_size", 0);
+    m->dim = ln ? (int)ln->ne[0] : 0;
+    m->eps = 1e-5f;
     m->rope_base = m->rope_base_swa = 1e6f;   /* fixed, as in llama.cpp (checked by its converter) */
-    if (m->n_layer <= 0 || m->dim <= 0 || m->n_head <= 0 || m->swa_window <= 0) { snprintf(err, errlen, "bad audio encoder hyperparameters"); goto fail; }
-    m->head_dim = m->dim / m->n_head;
-    const GGUFTensor *cw = gguf_tensor(g, "a.blk.0.conv_dw.weight");
-    m->l_cache = cw ? (int)cw->ne[0] : 3;
-    REQP(m->final_norm = load_f32(m, "a.post_ln.weight", m->dim, 1, err, errlen));
+    m->swa_window = window;
+    m->bidir = bidir;
+    for (l = 0; l < m->n_layer; l++) {        /* the sizes, from the first layer that has each block */
+        const GGUFTensor *qn = gguf_tensor(g, T("attn_q_norm.weight")), *q = gguf_tensor(g, T("attn_q.weight"));
+        const GGUFTensor *k = gguf_tensor(g, T("attn_k.weight")), *cw = gguf_tensor(g, T("conv_dw.weight"));
+        const GGUFTensor *fg = gguf_tensor(g, T("ffn_gate.weight"));
+        if (qn && q && k && !m->n_head) {
+            m->head_dim = (int)qn->ne[0];
+            m->n_head = (int)q->ne[1] / m->head_dim;
+            m->n_kv_head = (int)k->ne[1] / m->head_dim;
+        }
+        if (cw && !m->l_cache) m->l_cache = (int)cw->ne[0];
+        if (fg && !m->ff_dense) m->ff_dense = (int)fg->ne[1];
+    }
+    if (!m->l_cache) m->l_cache = 3;
+    if (m->n_layer <= 0 || m->dim <= 0 || m->n_head <= 0 || m->head_dim <= 0 || m->head_dim > 256) {
+        snprintf(err, errlen, "%s: no usable %s* blocks", path, prefix);
+        goto fail;
+    }
+    REQP(m->final_norm = load_f32(m, final_norm, m->dim, 1, err, errlen));
     m->layers = (Layer *)calloc((size_t)m->n_layer, sizeof(Layer));
-    char nm[128];
-#define T(s) (snprintf(nm, sizeof(nm), "a.blk.%d." s, l), nm)
-    for (int l = 0; l < m->n_layer; l++) {
+    for (l = 0; l < m->n_layer; l++) {
         Layer *L = &m->layers[l];
-        L->is_attn = L->is_swa = gguf_tensor(g, T("attn_q.weight")) != NULL;
+        L->is_attn = gguf_tensor(g, T("attn_q.weight")) != NULL;
+        L->is_swa = L->is_attn && window > 0;
         REQP(L->attn_norm = load_f32(m, T("ln1.weight"), m->dim, 1, err, errlen));
         REQP(L->ffn_norm = load_f32(m, T("ln2.weight"), m->dim, 1, err, errlen));
+        L->post_op_norm = load_f32(m, T("attn_post_norm.weight"), m->dim, 0, err, errlen);
+        L->post_ffn_norm = load_f32(m, T("ffn_post_norm.weight"), m->dim, 0, err, errlen);
         if (L->is_attn) {
             L->attn_idx = m->n_attn++;
             REQ(load_mat(m, &L->wq, T("attn_q.weight"), 1, err, errlen));
@@ -240,6 +268,7 @@ int model_load_audio_encoder(Model *m, const char *path, char *err, int errlen) 
             REQ(load_mat(m, &L->wo, T("attn_out.weight"), 1, err, errlen));
             REQP(L->q_norm = load_f32(m, T("attn_q_norm.weight"), m->head_dim, 1, err, errlen));
             REQP(L->k_norm = load_f32(m, T("attn_k_norm.weight"), m->head_dim, 1, err, errlen));
+            if (load_mat(m, &L->attn_gate, T("attn_gate.weight"), 0, err, errlen) < 0) goto fail;
         } else {
             L->conv_idx = m->n_conv++;
             REQ(load_mat(m, &L->in_proj, T("conv_pw1.weight"), 1, err, errlen));
@@ -305,6 +334,8 @@ struct Context {
     float inv_freq[256], inv_freq_swa[256];
     float *gate;                /* [n_batch][n_head] attention output gates (LFM3) */
     const float *ext;           /* [n_ext][dim] input rows of the token ids -1, -2... (ctx_set_embeds) */
+    int hidden_ok;              /* c->h holds the last token's final-norm state (ctx_hidden) */
+    int need_hidden;            /* ctx_need_hidden */
     int n_ext;
     /* scratch (sized for n_batch tokens) */
     float *x, *h, *big, *tmp, *out, *logits;
@@ -727,7 +758,7 @@ static void attn_task(void *ctx, int task, int tid) {
     const int kvh = h / (nh / m->n_kv_head);
     const int qkvw = m->dim + 2 * kvd;
     const float *q = c->big + (size_t)t * qkvw + h * hd;
-    const int npos = a->pos0 + t + 1;
+    const int npos = m->bidir ? a->pos0 + a->n : a->pos0 + t + 1;
     /* sliding-window layers see the last swa_window positions, the current one included */
     const int j0 = a->L->is_swa && npos > m->swa_window ? npos - m->swa_window : 0;
     const size_t lbase = (size_t)a->L->attn_idx * c->n_ctx * kvd;
@@ -1114,10 +1145,14 @@ static void forward_dx(Context *c, const int *tokens, int n, float *logits) {
         token_row(c, tokens[t], c->x + (size_t)t * D);
         rope_tables(c, pos0 + t, rope + (size_t)t * hd, rope_swa + (size_t)t * hd);
     }
-    if (!dx_dense_forward(c->dx, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL)) {
+    if (!dx_dense_forward(c->dx, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL,
+                          logits ? c->tmp : NULL)) {
         memset(c->logits, 0, sizeof(float) * (size_t)m->n_vocab);   /* the GPU failed: the message says so */
         c->dx_dense = 0;
         c->gpu_lost = 1;
+    } else if (logits) {   /* the last residual row: ctx_hidden */
+        rmsnorm(c->h, c->tmp, m->final_norm, D, m->eps);
+        c->hidden_ok = 1;
     }
     if (logits && logits != c->logits) memcpy(logits, c->logits, sizeof(float) * (size_t)m->n_vocab);
     c->pos += n;
@@ -1144,10 +1179,14 @@ static void forward_vk(Context *c, const int *tokens, int n, float *logits) {
         token_row(c, tokens[t], c->x + (size_t)t * D);
         rope_tables(c, pos0 + t, rope + (size_t)t * hd, rope_swa + (size_t)t * hd);
     }
-    if (!vk_dense_forward(c->vk, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL)) {
+    if (!vk_dense_forward(c->vk, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL,
+                          logits ? c->tmp : NULL)) {
         memset(c->logits, 0, sizeof(float) * (size_t)m->n_vocab);   /* the GPU failed: the message says so */
         c->vk_dense = 0;
         c->gpu_lost = 1;
+    } else if (logits) {   /* the last residual row: ctx_hidden */
+        rmsnorm(c->h, c->tmp, m->final_norm, D, m->eps);
+        c->hidden_ok = 1;
     }
     if (logits && logits != c->logits) memcpy(logits, c->logits, sizeof(float) * (size_t)m->n_vocab);
     c->pos += n;
@@ -1274,7 +1313,8 @@ static void run_layers(Context *c, int n) {
 static void forward_chunk(Context *c, const int *tokens, int n, int want_logits, float *all_logits) {
     const Model *m = c->m;
     const int D = m->dim;
-    if (c->gpu_dense && n == 1) {
+    c->hidden_ok = 0;
+    if (c->gpu_dense && n == 1 && !c->need_hidden) {
         forward_token_gpu(c, tokens[0], all_logits);
         return;
     }
@@ -1317,6 +1357,7 @@ static void forward_chunk(Context *c, const int *tokens, int n, int want_logits,
     } else if (want_logits) {
         const float *xl = c->x + (size_t)(n - 1) * D;
         rmsnorm(c->h, xl, m->final_norm, D, m->eps);
+        c->hidden_ok = 1;
         job_clear(c);
         if (m->output.type == GGML_F32 || m->output.type == GGML_F16) {
             job_add_f(c, &m->output, c->h, D, 1, c->logits, m->n_vocab);
@@ -1373,6 +1414,9 @@ int ctx_forward_embd(Context *c, const float *x, int n, float *hidden) {
     }
     return 1;
 }
+
+const float *ctx_hidden(const Context *c) { return c->hidden_ok ? c->h : NULL; }
+void ctx_need_hidden(Context *c, int on) { c->need_hidden = on; }
 
 void ctx_matmul(Context *c, const Mat *w, const float *x, int n, float *out) {
     job_clear(c);

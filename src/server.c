@@ -45,6 +45,7 @@ typedef int sock_t;
 #include "platform.h"
 #include "server.h"
 #include "audio.h"
+#include "speech.h"
 #include "webui_html.h"
 
 #define MAX_HEADER (64 * 1024)
@@ -1657,7 +1658,8 @@ static void handle_props(Conn *c) {
     buf_printf(&b, ",\"build_info\":\"pithos\",\"total_slots\":1,\"is_busy\":%s,\"n_ctx\":%d,\"cached_sessions\":%d,"
                    "\"agent_tools\":%d,",
                S.busy ? "true" : "false", ctx_n_ctx(S.ctx), pcache_n_files(S.pc), S.cfg.tools ? tools_count(S.cfg.tools) : 0);
-    buf_printf(&b, "\"modalities\":{\"vision\":false,\"audio\":%s},", S.cfg.audio ? "true" : "false");
+    buf_printf(&b, "\"modalities\":{\"vision\":false,\"audio\":%s,\"speech\":%s},", S.cfg.audio ? "true" : "false",
+               S.cfg.speech ? "true" : "false");
     buf_add(&b, "\"system_info\":", -1);
     buf_json_str(&b, S.cfg.info ? S.cfg.info : "", -1);
     buf_printf(&b, ",\"default_generation_settings\":{\"n_ctx\":%d,\"params\":{\"temperature\":%g,\"top_k\":%d,"
@@ -1857,6 +1859,79 @@ static const char *language_name(const char *code) {
     return code;
 }
 
+/* ------------------------------------------------------------------ /v1/audio/speech */
+
+#define SPEECH_MAX_FRAMES 1500   /* 2 minutes per request (speech_load's max_frames) */
+
+/* OpenAI's text-to-speech: {"input", "voice": "female" / "male" (other names: female),
+ * "language": ISO code such as "it" (an extension; default en), "response_format": "wav" or
+ * "pcm" (16-bit 24 kHz mono), "temperature"}. The whole audio comes back at once: callers that want
+ * it sooner send a sentence at a time. */
+static void handle_speech(Conn *c, const Json *body) {
+    if (!S.cfg.speech) { send_error(c, 400, "invalid_request_error", "this model does not speak (it needs LFM3-Audio and its mmproj file)"); return; }
+    const char *input = json_str(json_get(body, "input"), NULL);
+    if (!input || !*input) { send_error(c, 400, "invalid_request_error", "'input' must be a non-empty string"); return; }
+    const char *fmt = json_str(json_get(body, "response_format"), "wav");
+    if (strcmp(fmt, "wav") && strcmp(fmt, "pcm")) { send_error(c, 400, "invalid_request_error", "response_format must be wav or pcm"); return; }
+    const char *voice = json_str(json_get(body, "voice"), "female");
+    SpeechParams sp = speech_defaults();
+    const Json *v = json_get(body, "temperature");
+    if (v && v->t == J_NUM) sp.temp = (float)v->num;
+    v = json_get(body, "seed");
+    uint64_t rng = v && v->t == J_NUM ? (uint64_t)v->num * 0x9E3779B97F4A7C15ull | 1 : 0;
+    char *prompt = speech_prompt(input, json_str(json_get(body, "language"), "en"), strcmp(voice, "male") ? "female" : "male");
+    Gen g;
+    begin_gen(&g, c, 0);
+    lock_acquire(S.lock);
+    S.busy = 1;
+    if (!rng) rng = S.rng = S.rng * 6364136223846793005ull + 1442695040888963407ull;
+    pcache_clear(S.pc);   /* the frames' rows are not tokens: nothing of this state is reused */
+    Toks t = { 0 };
+    toks_text(&t, prompt, -1);
+    free(prompt);
+    const int max_frames = ctx_n_ctx(S.ctx) - t.n - 1 < SPEECH_MAX_FRAMES ? ctx_n_ctx(S.ctx) - t.n - 1 : SPEECH_MAX_FRAMES;
+    float *pcm = (float *)malloc(sizeof(float) * ((size_t)(max_frames > 0 ? max_frames : 0) + 1) * SPEECH_FRAME);
+    float *row = (float *)malloc(sizeof(float) * (size_t)S.m->dim);
+    int n = 0, frames = 0;
+    ctx_need_hidden(S.ctx, 1);
+    const float *h = max_frames > 0 && prefill(&g, &t, NULL, 0) ? ctx_hidden(S.ctx) : NULL;
+    ctx_set_embeds(S.ctx, row, 1);
+    const double t0 = time_sec();
+    const int id = -1;
+    while (h && frames < max_frames) {
+        int codes[SPEECH_CODEBOOKS];
+        if (speech_frame(S.cfg.speech, h, &sp, &rng, codes)) break;
+        n += speech_decode(S.cfg.speech, codes, pcm + n);
+        frames++;
+        if ((frames & 15) == 0 && conn_gone(c)) { g.finish = FIN_ABORT; break; }
+        speech_embed(S.cfg.speech, codes, row);
+        h = pcache_feed(S.pc, &id, 1) ? ctx_hidden(S.ctx) : NULL;
+    }
+    n += speech_flush(S.cfg.speech, pcm + n);
+    g.t_gen = time_sec() - t0;
+    g.n_prompt = t.n;
+    g.n_gen = frames;
+    ctx_set_embeds(S.ctx, NULL, 0);
+    ctx_need_hidden(S.ctx, 0);
+    pcache_clear(S.pc);
+    if (g.finish != FIN_ABORT) {
+        unsigned char *wav = (unsigned char *)malloc(44 + 2 * (size_t)n);
+        const size_t len = speech_wav_bytes(pcm, n, SPEECH_RATE, wav);
+        if (!strcmp(fmt, "pcm")) send_body(c, 200, "audio/pcm", (const char *)wav + 44, (int)(len - 44));
+        else send_body(c, 200, "audio/wav", (const char *)wav, (int)len);
+        free(wav);
+        fprintf(stderr, "[speech] %.2f s of audio (%d frames) in %.2f s, %.2fx real time\n", n / (double)SPEECH_RATE,
+                frames, g.t_gen, n / (double)SPEECH_RATE / (g.t_gen > 0 ? g.t_gen : 1e-9));
+    }
+    conn_close(c);
+    S.busy = 0;
+    lock_release(S.lock);
+    free(pcm);
+    free(row);
+    free(t.v);
+    gen_free(&g);
+}
+
 /* OpenAI's speech-to-text: form fields file (WAV), language, response_format (json, text,
  * verbose_json), temperature; model and prompt are accepted and ignored */
 static void handle_transcription(Conn *c, const Req *r) {
@@ -1959,7 +2034,8 @@ static void route(Conn *c, Req *r) {
     int tmpl = is_path(r->path, "/apply-template", NULL);
     int tcall = is_path(r->path, "/v1/tools/call", "/tools/call");
     int trans = is_path(r->path, "/v1/audio/transcriptions", "/audio/transcriptions");
-    if (!chat && !compl && !tokn && !tmpl && !tcall && !trans) { send_error(c, 404, "not_found_error", "unknown endpoint"); return; }
+    int speech = is_path(r->path, "/v1/audio/speech", "/audio/speech");
+    if (!chat && !compl && !tokn && !tmpl && !tcall && !trans && !speech) { send_error(c, 404, "not_found_error", "unknown endpoint"); return; }
     if (!post) { send_error(c, 405, "invalid_request_error", "use POST"); return; }
     if (trans) { handle_transcription(c, r); return; }
     char err[160];
@@ -1975,6 +2051,7 @@ static void route(Conn *c, Req *r) {
     else if (compl) handle_completion(c, body);
     else if (tmpl) handle_apply_template(c, body);
     else if (tcall) handle_tools_call(c, body);
+    else if (speech) handle_speech(c, body);
     else handle_tokenize(c, body);
     json_free(body);
 }

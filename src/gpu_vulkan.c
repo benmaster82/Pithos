@@ -33,7 +33,7 @@ int vk_dense_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *info,
     return 0;
 }
 int vk_dense_forward(Vulkan *v, const float *x, int n, const float *rope_cs, const float *rope_swa, int pos0,
-                     float *logits) {
+                     float *logits, float *x_last) {
     (void)v; (void)x; (void)n; (void)rope_cs; (void)rope_swa; (void)pos0; (void)logits;
     return 0;
 }
@@ -1214,7 +1214,7 @@ int vk_dense_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *info,
     ok = vbuf_create(v, &t->scratch, top, HOST_NONE) && vbuf_create(v, &t->kv, kv_bytes, HOST_NONE) &&
          vbuf_create(v, &t->cs, cs_bytes ? cs_bytes : 256, HOST_NONE) && vbuf_create(v, &t->sw, len * 4, HOST_NONE) &&
          vbuf_create(v, &t->in, B * (size_t)(D + 2 * hd) * 4, HOST_UPLOAD) &&
-         vbuf_create(v, &t->lrb, (size_t)m->n_vocab * 4, HOST_READBACK) && vbuf_reserve(v, &v->up, len * 4, HOST_UPLOAD);
+         vbuf_create(v, &t->lrb, (size_t)(m->n_vocab + D) * 4, HOST_READBACK) && vbuf_reserve(v, &v->up, len * 4, HOST_UPLOAD);
     if (ok) {
         memcpy(v->up.map, sw, len * 4);
         copy(v, &t->sw, 0, &v->up, 0, len * 4);
@@ -1264,7 +1264,7 @@ static int tok_resid(Vulkan *v, uint32_t mode, uint32_t post, uint32_t norm, int
 }
 
 int vk_dense_forward(Vulkan *v, const float *x, int n, const float *rope_cs, const float *rope_swa, int pos0,
-                     float *logits) {
+                     float *logits, float *x_last) {
     VDense *t = v ? v->dense : NULL;
     if (!t || v->broken || n < 1 || n > t->B || pos0 + n > t->n_ctx) return 0;
     static int passes;   /* PITHOS_VK_FAIL=N: the GPU "fails" at pass N, to test the CPU fallback */
@@ -1345,6 +1345,7 @@ int vk_dense_forward(Vulkan *v, const float *x, int n, const float *rope_cs, con
         ok = tok_mm(v, t->output, xo, t->o_logits, 1, m->n_vocab);
         barrier(v, PS_COMPUTE, AC_SHADER_WRITE, PS_TRANSFER, AC_TRANSFER_READ);
         copy(v, &t->lrb, 0, &t->scratch, t->o_logits, (VkDeviceSize)m->n_vocab * 4);
+        if (x_last) copy(v, &t->lrb, (VkDeviceSize)m->n_vocab * 4, &t->scratch, t->o_x + (size_t)(n - 1) * D * 4, (VkDeviceSize)D * 4);
         barrier(v, PS_TRANSFER, AC_TRANSFER_WRITE, PS_HOST, AC_HOST_READ);
     }
     if (!submit(v) || !ok) {
@@ -1353,6 +1354,7 @@ int vk_dense_forward(Vulkan *v, const float *x, int n, const float *rope_cs, con
         return 0;
     }
     if (logits) memcpy(logits, t->lrb.map, sizeof(float) * (size_t)m->n_vocab);
+    if (logits && x_last) memcpy(x_last, t->lrb.map + 4 * (size_t)m->n_vocab, sizeof(float) * (size_t)D);
     return 1;
 }
 

@@ -23,6 +23,7 @@ typedef struct {
     Tools *tools;               /* agent tools served on /v1/tools (NULL = none) */
     int think_budget;           /* default reasoning: THINK_FULL, THINK_OFF or a token budget */
     struct Audio *audio;        /* speech input (LFM3-Audio): input_audio parts, /v1/audio/transcriptions */
+    struct Speech *speech;      /* speech output (LFM3-Audio): /v1/audio/speech */
 } ServerConfig;
 
 /* Reasoning control. THINK_FULL: the model reasons as long as it wants (the template default);

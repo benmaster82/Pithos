@@ -6,6 +6,7 @@
 #include <string.h>
 #include "agent.h"
 #include "audio.h"
+#include "speech.h"
 #include "gpu.h"
 #include "gpu_dx.h"
 #include "gpu_vk.h"
@@ -35,6 +36,9 @@
 typedef struct {
     const char *model, *prompt, *system, *kernels, *tokenize, *ppl;
     const char *audio, *mmproj;     /* --audio WAV and its LFM3-Audio projector */
+    const char *tts, *tts_voice, *tts_lang, *out;   /* --tts TEXT spoken into -o WAV */
+    float tts_temp;
+    int tts_temp_set;
     const char *host, *alias, *api_key, *cache_dir, *ui_path, *workspace, *mcp, *tool_name, *tool_args;
     int tools_list;
     int port, server, cache_mb, open_browser, tools, web, read_only, ctx_set, shell, workspace_set;
@@ -222,6 +226,11 @@ static void usage(void) {
         "      --audio FILE        a WAV file the model hears before the prompt (LFM3-Audio), e.g. with\n"
         "                          -s \"Perform ASR in English.\" for a transcription\n"
         "      --mmproj FILE       the audio projector (default: the mmproj-*.gguf next to the model)\n"
+        "      --tts TEXT          speak TEXT into a WAV file (LFM3-Audio), see -o, --tts-voice, --tts-lang\n"
+        "      --tts-voice V       female (default) or male\n"
+        "      --tts-lang L        language of the speech: en (default), it, fr, de, es, pt, ... (ISO code)\n"
+        "      --tts-temp F        temperature of the speech codes (default 1.0, model card)\n"
+        "  -o, --output FILE       the WAV file of --tts (default speech.wav)\n"
         "  -i, --interactive       interactive chat (default when no prompt is given)\n"
         "      --raw               no chat template: plain text completion of the prompt\n"
         "  -n, --n-predict N       max new tokens per answer (default 4096; server: until the context is full)\n"
@@ -392,6 +401,11 @@ static int parse_args(int argc, char **argv, Args *a) {
         else if (!strcmp(s, "-p") || !strcmp(s, "--prompt")) a->prompt = NEXT();
         else if (!strcmp(s, "--audio")) a->audio = NEXT();
         else if (!strcmp(s, "--mmproj")) a->mmproj = NEXT();
+        else if (!strcmp(s, "--tts")) a->tts = NEXT();
+        else if (!strcmp(s, "--tts-voice")) a->tts_voice = NEXT();
+        else if (!strcmp(s, "--tts-lang")) a->tts_lang = NEXT();
+        else if (!strcmp(s, "--tts-temp")) { a->tts_temp = (float)atof(NEXT()); a->tts_temp_set = 1; }
+        else if (!strcmp(s, "-o") || !strcmp(s, "--output")) a->out = NEXT();
         else if (!strcmp(s, "-f") || !strcmp(s, "--file")) {
             const char *path = NEXT();
             FILE *f = fopen(path, "rb");
@@ -516,7 +530,7 @@ static int parse_args(int argc, char **argv, Args *a) {
         if (a->max_steps <= 0) a->max_steps = 40;
     }
     if (a->audio && !a->prompt && !a->interactive) a->prompt = ""; /* the audio alone is the message */
-    if (!a->prompt && !a->bench && !a->tokenize && !a->ppl && !a->server && !a->tools_list && !a->tool_name)
+    if (!a->prompt && !a->bench && !a->tokenize && !a->ppl && !a->server && !a->tools_list && !a->tool_name && !a->tts)
         a->interactive = 1;
     return 1;
 }
@@ -763,6 +777,67 @@ static int chat_turn(Engine *e, const char *user, int first) {
     return ok;
 }
 
+/* ------------------------------------------------------------------ speech output */
+
+/* --tts: the model's TTS prompt, then one frame of codes per step from the hidden state (the
+ * frame's embedding is the next input) until the end-of-audio code; the codec turns each frame
+ * into 80 ms of audio. */
+static int tts_run(Engine *e, Speech *sp, const Args *a) {
+    const char *voice = a->tts_voice ? a->tts_voice : "female";
+    if (strcmp(voice, "female") && strcmp(voice, "male")) { fprintf(stderr, "error: --tts-voice is female or male\n"); return 1; }
+    char *prompt = speech_prompt(a->tts, a->tts_lang, voice);
+    const double t0 = time_sec();
+    ctx_need_hidden(e->ctx, 1);
+    const int ok = feed_text(e, prompt);
+    free(prompt);
+    if (!ok) { fprintf(stderr, "error: the text is too long for the context\n"); return 1; }
+    const double tp = time_sec() - t0;
+    SpeechParams sp_par = speech_defaults();
+    if (a->tts_temp_set) sp_par.temp = a->tts_temp;
+    uint64_t rng = a->sp.seed ? a->sp.seed * 0x9E3779B97F4A7C15ull | 1 : 0x2545F4914F6CDD1Dull;
+    const int max_frames = ctx_n_ctx(e->ctx) - ctx_pos(e->ctx) - 1;
+    float *pcm = (float *)malloc(sizeof(float) * ((size_t)(max_frames > 0 ? max_frames : 1) * SPEECH_FRAME + SPEECH_FRAME));
+    float *row = (float *)malloc(sizeof(float) * (size_t)e->m->dim);
+    ctx_set_embeds(e->ctx, row, 1);
+    const float *h = ctx_hidden(e->ctx);
+    int n = 0, frames = 0, ended = 0;
+    const int id = -1;   /* the frame's row */
+    const double tg = time_sec();
+    double t_lm = 0, t_depth = 0, t_codec = 0;   /* PITHOS_SPEECH_PROFILE */
+    while (h && frames < max_frames) {
+        int codes[SPEECH_CODEBOOKS];
+        double t1 = time_sec();
+        if (speech_frame(sp, h, &sp_par, &rng, codes)) { ended = 1; break; }
+        double t2 = time_sec();
+        n += speech_decode(sp, codes, pcm + n);
+        double t3 = time_sec();
+        frames++;
+        if (frames % 25 == 0) fprintf(stderr, "\r[speech: %.1f s]", n / (double)SPEECH_RATE);
+        speech_embed(sp, codes, row);
+        if (!ctx_forward(e->ctx, &id, 1)) break;
+        h = ctx_hidden(e->ctx);
+        t_depth += t2 - t1;
+        t_codec += t3 - t2;
+        t_lm += time_sec() - t3;
+    }
+    if (getenv("PITHOS_SPEECH_PROFILE") && frames)
+        fprintf(stderr, "\nper frame: language model %.1f ms, depth decoder %.1f ms, codec %.1f ms\n", 1e3 * t_lm / frames,
+                1e3 * t_depth / frames, 1e3 * t_codec / frames);
+    n += speech_flush(sp, pcm + n);
+    ctx_set_embeds(e->ctx, NULL, 0);
+    const double dt = time_sec() - tg;
+    const char *out = a->out ? a->out : "speech.wav";
+    const int wrote = speech_write_wav(out, pcm, n, SPEECH_RATE);
+    free(pcm);
+    free(row);
+    if (frames >= 25) fprintf(stderr, "\r");
+    if (!wrote) { fprintf(stderr, "error: cannot write %s\n", out); return 1; }
+    fprintf(stderr, "speech: %.2f s of audio (%d frames%s) in %.2f s = %.2fx real time | prompt %.2f s | %s\n",
+            n / (double)SPEECH_RATE, frames, ended ? "" : ", no end of audio", dt, n / (double)SPEECH_RATE / (dt > 0 ? dt : 1e-9),
+            tp, out);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ tools without the model */
 
 static ToolsConfig tools_config(const Args *a) {
@@ -965,6 +1040,7 @@ static int real_main(int argc, char **argv) {
     e.tok_audio = tok_find(tk, "<|audio|>");
     /* the server hears audio when the model's projector is next to it, or given with --mmproj */
     const int srv_audio = a.server && e.tok_audio >= 0 && find_mmproj(a.model, a.mmproj, mp, sizeof(mp));
+    Speech *srv_speech = NULL;
     if (a.audio || srv_audio) {
         if (e.tok_audio < 0) { fprintf(stderr, "error: --audio needs an audio model (LFM3-Audio): this one has no <|audio|> token\n"); return 1; }
         if (!find_mmproj(a.model, a.mmproj, mp, sizeof(mp))) {
@@ -977,8 +1053,33 @@ static int real_main(int argc, char **argv) {
         if (bn && bl < sizeof(base)) { memcpy(base, bn, bl); base[bl] = 0; }
         au = audio_load(mp, pool, m.dim, base, err, sizeof(err));
         if (!au) { fprintf(stderr, "error: %s\n", err); return 1; }
+        if (srv_audio) {   /* and speaks */
+            srv_speech = speech_load(mp, pool, m.dim, base, 1500, err, sizeof(err));
+            if (!srv_speech) fprintf(stderr, "note: no speech output: %s\n", err);
+        }
     }
-    if (au && !a.audio) fprintf(stderr, "audio input: on (%s)\n", mp);
+    if (au && !a.audio) fprintf(stderr, "audio input: on%s (%s)\n", srv_speech ? ", speech output: on" : "", mp);
+    if (a.tts) {
+        if (e.tok_audio < 0 || !find_mmproj(a.model, a.mmproj, mp, sizeof(mp))) {
+            fprintf(stderr, "error: --tts needs LFM3-Audio and its mmproj-*.gguf next to the model (see --mmproj)\n");
+            return 1;
+        }
+        uint64_t bl = 0;
+        const char *bn = gguf_get_str(&m.gguf, "general.basename", &bl);
+        char base[128] = "";
+        if (bn && bl < sizeof(base)) { memcpy(base, bn, bl); base[bl] = 0; }
+        Speech *sp = speech_load(mp, pool, m.dim, base, a.n_ctx, err, sizeof(err));
+        if (!sp) { fprintf(stderr, "error: %s\n", err); return 1; }
+        status = tts_run(&e, sp, &a);
+        speech_free(sp);
+        audio_free(au);
+        sampler_free(&e.smp);
+        ctx_free(ctx);
+        pool_destroy(pool);
+        tok_free(tk);
+        model_free(&m);
+        return status;
+    }
     if (a.audio) {
         const double ta = time_sec();
         int ns = 0;
@@ -1028,6 +1129,7 @@ static int real_main(int argc, char **argv) {
         sc.open_browser = a.open_browser;
         sc.think_budget = a.think_budget;
         sc.audio = au;
+        sc.speech = srv_speech;
         Tools *tools = NULL;
         if (a.tools || a.agent) {
             ToolsConfig tc = tools_config(&a);

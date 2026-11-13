@@ -6,7 +6,7 @@
 CC      ?= cc
 CFLAGS  ?= -O3 -std=c11 -Wall -Wextra -Wno-unused-parameter
 SRC      = src/main.c src/model.c src/gguf.c src/tokenizer.c src/sampler.c src/quant.c src/platform.c \
-           src/quant_neon.c src/gpu_opencl.c src/gpu_d3d12.c src/gpu_vulkan.c src/json.c src/pcache.c src/server.c src/proc.c src/tools.c src/agent.c src/audio.c
+           src/quant_neon.c src/gpu_opencl.c src/gpu_d3d12.c src/gpu_vulkan.c src/json.c src/pcache.c src/server.c src/proc.c src/tools.c src/agent.c src/audio.c src/speech.c
 BUILD    = build
 UNAME_S := $(shell uname -s 2>/dev/null)
 UNAME_M := $(shell uname -m 2>/dev/null)

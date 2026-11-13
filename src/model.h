@@ -46,6 +46,7 @@ typedef struct {
     const float *rope_freqs;        /* per-frequency divisors of the full-attention layers, or NULL */
     int swa_window;                 /* sliding-window size of is_swa layers (tokens, current one included) */
     int add_bos;                    /* tokenizer.ggml.add_bos_token (default 1) */
+    int bidir;                      /* attention over the whole chunk, not causal (the LFM3-Audio depth decoder) */
     Mat embed, output;
     const float *final_norm;
     Layer *layers;
@@ -71,6 +72,12 @@ typedef struct {
 int  model_load(Model *m, const char *path, char *err, int errlen);
 /* the speech encoder of an LFM3-Audio mmproj file, as a Model without vocabulary */
 int  model_load_audio_encoder(Model *m, const char *path, char *err, int errlen);
+/* A stack of LFM2 / LFM3 blocks of an mmproj file, as a Model without vocabulary: the tensors
+ * <prefix><layer>.{ln1,ln2,attn_*,conv_*,ffn_*,attn_post_norm,ffn_post_norm}, sizes read from them,
+ * NEOX RoPE base 1e6 on every head dimension. window > 0: every attention layer sees the last
+ * window positions; bidir: attention over the whole chunk instead (positions restart per chunk). */
+int  model_load_lfm_part(Model *m, const char *path, const char *prefix, const char *final_norm, int window, int bidir,
+                         char *err, int errlen);
 /* a tensor of m's file as a matrix / as F32[n]; 0 / NULL with err if missing or of another type */
 int  model_mat(Model *m, const char *name, Mat *mat, char *err, int errlen);
 const float *model_f32(Model *m, const char *name, int n, char *err, int errlen);
@@ -117,6 +124,12 @@ void ctx_set_embeds(Context *c, const float *rows, int n);
 /* The layers over input rows x[n][dim] instead of tokens (CPU); hidden[n][dim] receives the output
  * after the final norm. Returns 0 if the context is full. */
 int ctx_forward_embd(Context *c, const float *x, int n, float *hidden);
+/* The last token's hidden state after the final norm ([dim]), as the logits of the last
+ * ctx_forward were computed from it; NULL if that pass ran on OpenCL's decode path, which keeps
+ * it on the device. */
+const float *ctx_hidden(const Context *c);
+/* on: single tokens leave OpenCL's decode path for the CPU one, so that ctx_hidden has them */
+void ctx_need_hidden(Context *c, int on);
 /* out[n][w->rows] = x[n][w->cols] times w, on the context's threads (w->cols a multiple of 256 if quantized) */
 void ctx_matmul(Context *c, const Mat *w, const float *x, int n, float *out);
 /* How many times the context was lost with a failing GPU (it then goes on on the CPU). */
