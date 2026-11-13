@@ -263,6 +263,39 @@ build/pithos -m models/LFM3-1.7B-Q4_K_M.gguf -i
 build/pithos -m models/LFM3-1.7B-Q4_K_M.gguf --server --open
 ```
 
+### LFM3-Audio-2B: speech input (experimental)
+[LiquidAI/LFM3-Audio-2B](https://huggingface.co/LiquidAI/LFM3-Audio-2B) is LFM3 with a speech
+encoder: it hears audio and answers in text. Transcription works in 18 languages, Italian
+included; it can also answer questions about what it hears or translate it. Pithos reads the audio
+from a WAV file (`--audio`). Speech output (TTS, voice chat) is not supported yet. Two files are
+needed: the model, whose text part is the same architecture as LFM3-1.7B and runs on the same GPU
+paths, and its audio projector (`mmproj-...`), which Pithos looks for next to the model.
+
+```
+build\pithos.exe -m models\LFM3-Audio-2B-Q4_K_M.gguf --audio speech.wav -s "Perform ASR in English."
+build\pithos.exe -m models\LFM3-Audio-2B-Q4_K_M.gguf --audio speech.wav -s "Translate the following speech from English to Italian in text form."
+build\pithos.exe -m models\LFM3-Audio-2B-Q4_K_M.gguf --audio speech.wav -p "What is happening in this recording?"
+```
+
+These are the system prompts of the model card: `-s "Perform ASR."` lets the model detect the
+language; for questions the card suggests `-s "Answer questions about the provided audio clip.
+Base every answer only on what can be heard."`. Without a system prompt the model would rather
+answer with speech, which Pithos cannot produce yet, so speech output is turned off as the card
+does for text-only answers. With `-i` the audio goes into the first message of the chat. The WAV can be PCM (8, 16, 24 or 32-bit) or 32-bit float, at any sample rate
+and with any number of channels: Pithos mixes it to mono and resamples it to 16 kHz.
+
+| | Model | Audio projector |
+|---|---|---|
+| File | `LFM3-Audio-2B-Q4_K_M.gguf` | `mmproj-LFM3-Audio-2B-Q4_K_M.gguf` |
+| From | [LiquidAI/LFM3-Audio-2B-GGUF](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF) | the same repository |
+| Size | 1,099,626,016 bytes (1.0 GiB) | 172,418,048 bytes (164 MiB) |
+| SHA-256 | `9a773289bd321ed879cd3a76545f6aca506e403851a45fb315420aee45625be2` | `1a3a895160aad17c1f52117a6ee4cea8e68988651ea5a33c5b990539e8eae81d` |
+
+The encoder runs on the CPU, about 30 times faster than real time on the reference laptop (54 s
+of speech in 1.7 s); the transcription itself then runs like any prompt, on the GPU if there is
+one. On test recordings in English and Italian (16, 22 and 44.1 kHz, up to a minute) the
+transcriptions are the same as llama.cpp's on the CPU, OpenCL and Vulkan.
+
 ## Results
 
 Reference machine: i5-10500H (6 cores, AVX2), 16 GB DDR4-2933, GTX 1650 Max-Q 4 GB, NVMe SSD.
@@ -803,6 +836,8 @@ checkpoint and only processes the rest:
 | `-p TEXT` / `-f FILE` | single prompt with the model's chat template |
 | `-i` | interactive chat (default without a prompt). Commands `/reset`, `/exit` |
 | `-s TEXT` | system prompt |
+| `--audio FILE` | a WAV file the model hears before the prompt (LFM3-Audio); without `-p`, the audio alone is the message |
+| `--mmproj FILE` | the audio projector (default: `mmproj-<model name>*.gguf` next to the model) |
 | `--raw` | plain text completion without the template |
 | `-n N` | max tokens per answer (default 4096, reasoning included) |
 | `-c N` | context in tokens (default 8192, max 131072) |
@@ -1048,6 +1083,12 @@ for each of the 30 convolution layers.
 - Tokenizer identical to Hugging Face `tokenizers` (each model's `tokenizer.json`) and to
   `llama-tokenize`, on texts with accents, numbers, spaces, code, CJK, emoji and special tokens.
 - Perplexity compared with `llama-perplexity` (table above).
+- LFM3-Audio-2B: log-mel features against the model's feature extractor (torch.stft and
+  transformers' Slaney filters): mean difference 1e-6. Encoder and projector against a float64
+  PyTorch implementation written from `modeling_lfm3_audio.py` on the same dequantized weights:
+  downsampler output within 0.01% once the reference rounds its inputs to int8 as Pithos does,
+  encoder output within 0.4%, embeddings within 2% (cosine 0.9997; the projector multiplies in
+  float, because int8 inputs would add about 7% there). Transcriptions equal to llama.cpp's.
 - LFM3-1.7B: perplexity against an independent PyTorch implementation written from the model's
   `modeling_lfm3.py`, on the same dequantized weights: 4.45 vs 4.39 with 256-token windows, 3.65
   vs 3.62 with 1024 (sliding window active). The gap is the int8 activations and the f16 KV cache.
@@ -1100,6 +1141,7 @@ for each of the 30 convolution layers.
 | `PITHOS_VK_MAXBUF=MB` | Vulkan: a lower buffer size limit, to test the splitting of large matrices |
 | `PITHOS_VK_FAIL=N` | Vulkan: simulate a GPU failure at the Nth whole-pass submit, to test the fallback to the CPU |
 | `PITHOS_CL_FAIL=N` | OpenCL: simulate a GPU failure at the Nth generated token, to test the fallback to the CPU |
+| `PITHOS_AUDIO_DUMP=PREFIX` | `--audio`: write the log-mel features, the encoder input and output and the embeddings as raw f32 files `PREFIX.mel`, `.pre`, `.hid`, `.emb` |
 
 ## Limitations
 Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
@@ -1125,7 +1167,8 @@ Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
 - The server handles one request at a time and the others wait in a queue, because the context and
   the expert cache are shared.
 - Web interface conversations live in the browser's `localStorage`.
-- Text only: the vision and audio LFM models are not supported.
+- Speech input only, for LFM3-Audio, from WAV files on the command line (not yet in the server):
+  no speech output, no vision models.
 
 ## License
 Pithos is released under the [MIT License](LICENSE). The license covers the engine's code only; the

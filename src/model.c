@@ -65,7 +65,7 @@ static const float *load_f32(Model *m, const char *name, int n, int required, ch
         if (required) snprintf(err, errlen, "missing tensor %s", name);
         return NULL;
     }
-    if (t->type != GGML_F32 || (n > 0 && (int64_t)n != t->ne[0] * t->ne[1] * t->ne[2])) {
+    if (t->type != GGML_F32 || (n > 0 && (int64_t)n != t->ne[0] * t->ne[1] * t->ne[2] * t->ne[3])) {
         snprintf(err, errlen, "tensor %s: expected F32[%d]", name, n);
         return NULL;
     }
@@ -193,6 +193,70 @@ fail:
     return 0;
 }
 
+int model_mat(Model *m, const char *name, Mat *mat, char *err, int errlen) {
+    return load_mat(m, mat, name, 1, err, errlen) > 0;
+}
+
+const float *model_f32(Model *m, const char *name, int n, char *err, int errlen) {
+    return load_f32(m, name, n, 1, err, errlen);
+}
+
+/* The speech encoder of an LFM3-Audio projector (mmproj, projector type lfm3a): 17 LFM2 blocks,
+ * short-conv or attention, every attention layer causal with a sliding window, full NEOX RoPE. */
+int model_load_audio_encoder(Model *m, const char *path, char *err, int errlen) {
+    memset(m, 0, sizeof(*m));
+    if (!gguf_open(&m->gguf, path, err, errlen)) return 0;
+    GGUF *g = &m->gguf;
+    uint64_t pl = 0;
+    const char *pt = gguf_get_str(g, "clip.audio.projector_type", &pl);
+    if (!pt || pl != 5 || memcmp(pt, "lfm3a", 5)) { snprintf(err, errlen, "%s: not an LFM3-Audio projector", path); goto fail; }
+    snprintf(m->arch, sizeof(m->arch), "lfm3a");
+    m->n_layer = (int)gguf_get_int(g, "clip.audio.block_count", 0);
+    m->dim = (int)gguf_get_int(g, "clip.audio.embedding_length", 0);
+    m->n_head = (int)gguf_get_int(g, "clip.audio.attention.head_count", 0);
+    m->n_kv_head = (int)gguf_get_int(g, "clip.audio.attention.head_count_kv", m->n_head);
+    m->ff_dense = (int)gguf_get_int(g, "clip.audio.feed_forward_length", 0);
+    m->eps = (float)gguf_get_float(g, "clip.audio.attention.layer_norm_epsilon", 1e-5);
+    m->swa_window = (int)gguf_get_int(g, "clip.audio.window_size", 0);
+    m->rope_base = m->rope_base_swa = 1e6f;   /* fixed, as in llama.cpp (checked by its converter) */
+    if (m->n_layer <= 0 || m->dim <= 0 || m->n_head <= 0 || m->swa_window <= 0) { snprintf(err, errlen, "bad audio encoder hyperparameters"); goto fail; }
+    m->head_dim = m->dim / m->n_head;
+    const GGUFTensor *cw = gguf_tensor(g, "a.blk.0.conv_dw.weight");
+    m->l_cache = cw ? (int)cw->ne[0] : 3;
+    REQP(m->final_norm = load_f32(m, "a.post_ln.weight", m->dim, 1, err, errlen));
+    m->layers = (Layer *)calloc((size_t)m->n_layer, sizeof(Layer));
+    char nm[128];
+#define T(s) (snprintf(nm, sizeof(nm), "a.blk.%d." s, l), nm)
+    for (int l = 0; l < m->n_layer; l++) {
+        Layer *L = &m->layers[l];
+        L->is_attn = L->is_swa = gguf_tensor(g, T("attn_q.weight")) != NULL;
+        REQP(L->attn_norm = load_f32(m, T("ln1.weight"), m->dim, 1, err, errlen));
+        REQP(L->ffn_norm = load_f32(m, T("ln2.weight"), m->dim, 1, err, errlen));
+        if (L->is_attn) {
+            L->attn_idx = m->n_attn++;
+            REQ(load_mat(m, &L->wq, T("attn_q.weight"), 1, err, errlen));
+            REQ(load_mat(m, &L->wk, T("attn_k.weight"), 1, err, errlen));
+            REQ(load_mat(m, &L->wv, T("attn_v.weight"), 1, err, errlen));
+            REQ(load_mat(m, &L->wo, T("attn_out.weight"), 1, err, errlen));
+            REQP(L->q_norm = load_f32(m, T("attn_q_norm.weight"), m->head_dim, 1, err, errlen));
+            REQP(L->k_norm = load_f32(m, T("attn_k_norm.weight"), m->head_dim, 1, err, errlen));
+        } else {
+            L->conv_idx = m->n_conv++;
+            REQ(load_mat(m, &L->in_proj, T("conv_pw1.weight"), 1, err, errlen));
+            REQ(load_mat(m, &L->out_proj, T("conv_pw2.weight"), 1, err, errlen));
+            REQP(L->conv_w = load_f32(m, T("conv_dw.weight"), m->dim * m->l_cache, 1, err, errlen));
+        }
+        REQ(load_mat(m, &L->w_gate, T("ffn_gate.weight"), 1, err, errlen));
+        REQ(load_mat(m, &L->w_up, T("ffn_up.weight"), 1, err, errlen));
+        REQ(load_mat(m, &L->w_down, T("ffn_down.weight"), 1, err, errlen));
+    }
+#undef T
+    return 1;
+fail:
+    model_free(m);
+    return 0;
+}
+
 void model_free(Model *m) {
     free(m->layers);
     gguf_close(&m->gguf);
@@ -240,6 +304,8 @@ struct Context {
     float *conv;
     float inv_freq[256], inv_freq_swa[256];
     float *gate;                /* [n_batch][n_head] attention output gates (LFM3) */
+    const float *ext;           /* [n_ext][dim] input rows of the token ids -1, -2... (ctx_set_embeds) */
+    int n_ext;
     /* scratch (sized for n_batch tokens) */
     float *x, *h, *big, *tmp, *out, *logits;
     block_q8_K *hq, *tq;
@@ -1015,6 +1081,22 @@ static void rope_tables(const Context *c, int pos, float *rope, float *rope_swa)
     }
 }
 
+/* the input row of a token: its embedding, or row -id-1 of the ctx_set_embeds rows for id < 0 */
+static void token_row(const Context *c, int id, float *dst) {
+    const Model *m = c->m;
+    if (id < 0 && -id - 1 < c->n_ext) {
+        memcpy(dst, c->ext + (size_t)(-id - 1) * m->dim, sizeof(float) * (size_t)m->dim);
+        return;
+    }
+    if (id < 0 || id >= m->n_vocab) id = 0;
+    dequant_row(m->embed.type, m->embed.data + (size_t)id * m->embed.row_bytes, dst, m->dim);
+}
+
+void ctx_set_embeds(Context *c, const float *rows, int n) {
+    c->ext = rows;
+    c->n_ext = rows ? n : 0;
+}
+
 /* a token or a prompt chunk entirely on the Direct3D 12 GPU (models without experts) */
 static void forward_dx(Context *c, const int *tokens, int n, float *logits) {
     const Model *m = c->m;
@@ -1029,9 +1111,7 @@ static void forward_dx(Context *c, const int *tokens, int n, float *logits) {
     }
     float *rope = c->rope, *rope_swa = c->rope + (size_t)n * hd;
     for (int t = 0; t < n; t++) {
-        int id = tokens[t];
-        if (id < 0 || id >= m->n_vocab) id = 0;
-        dequant_row(m->embed.type, m->embed.data + (size_t)id * m->embed.row_bytes, c->x + (size_t)t * D, D);
+        token_row(c, tokens[t], c->x + (size_t)t * D);
         rope_tables(c, pos0 + t, rope + (size_t)t * hd, rope_swa + (size_t)t * hd);
     }
     if (!dx_dense_forward(c->dx, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL)) {
@@ -1061,9 +1141,7 @@ static void forward_vk(Context *c, const int *tokens, int n, float *logits) {
     }
     float *rope = c->rope, *rope_swa = c->rope + (size_t)n * hd;
     for (int t = 0; t < n; t++) {
-        int id = tokens[t];
-        if (id < 0 || id >= m->n_vocab) id = 0;
-        dequant_row(m->embed.type, m->embed.data + (size_t)id * m->embed.row_bytes, c->x + (size_t)t * D, D);
+        token_row(c, tokens[t], c->x + (size_t)t * D);
         rope_tables(c, pos0 + t, rope + (size_t)t * hd, rope_swa + (size_t)t * hd);
     }
     if (!vk_dense_forward(c->vk, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL)) {
@@ -1104,8 +1182,7 @@ static void forward_token_gpu(Context *c, int token, float *all_logits) {
         gpu_dense_conv(g, c->conv, 1);
         c->conv_gpu_ok = 1;
     }
-    if (token < 0 || token >= m->n_vocab) token = 0;
-    dequant_row(m->embed.type, m->embed.data + (size_t)token * m->embed.row_bytes, c->x, D);
+    token_row(c, token, c->x);
     float rope[512], rope_swa[512];
     rope_tables(c, pos, rope, rope_swa);
     gpu_dense_begin(g, c->x, rope, m->swa_window > 0 ? rope_swa : NULL, pos);
@@ -1161,6 +1238,37 @@ static void forward_token_gpu(Context *c, int token, float *all_logits) {
     c->conv_cpu_ok = 0;
 }
 
+/* ------------------------------------------------------------------ layers */
+
+/* every layer on the CPU over the n rows of c->x, at positions c->pos.. */
+static void run_layers(Context *c, int n) {
+    const Model *m = c->m;
+    const int D = m->dim;
+    for (int l = 0; l < m->n_layer; l++) {
+        const Layer *L = &m->layers[l];
+        if (c->pfq && n >= 8 && l + 1 < m->n_layer && m->layers[l + 1].is_moe) {
+            /* prompt batches touch nearly every expert: stream the next layer, expert by expert
+             * (small requests so a newer layer can cancel what is still pending) */
+            const Layer *Ln = &m->layers[l + 1];
+            prefetcher_clear(c->pfq);
+            for (int e = 0; e < m->n_expert; e++)
+                if (!c->gpu || !gpu_resident(c->gpu, l + 1, e)) prefetch_expert(c, Ln, e);
+        }
+        for (int t = 0; t < n; t++) rmsnorm(c->h + (size_t)t * D, c->x + (size_t)t * D, L->attn_norm, D, m->eps);
+        if (L->is_attn) attention_block(c, L, n);
+        else shortconv_block(c, L, n);
+        if (L->post_op_norm)
+            for (int t = 0; t < n; t++) rmsnorm(c->out + (size_t)t * D, c->out + (size_t)t * D, L->post_op_norm, D, m->eps);
+        for (size_t i = 0; i < (size_t)n * D; i++) c->x[i] += c->out[i];
+        for (int t = 0; t < n; t++) rmsnorm(c->h + (size_t)t * D, c->x + (size_t)t * D, L->ffn_norm, D, m->eps);
+        if (L->is_moe) moe_ffn(c, L, l, n);
+        else dense_ffn(c, L, n);
+        if (L->post_ffn_norm)
+            for (int t = 0; t < n; t++) rmsnorm(c->out + (size_t)t * D, c->out + (size_t)t * D, L->post_ffn_norm, D, m->eps);
+        for (size_t i = 0; i < (size_t)n * D; i++) c->x[i] += c->out[i];
+    }
+}
+
 /* ------------------------------------------------------------------ forward */
 
 static void forward_chunk(Context *c, const int *tokens, int n, int want_logits, float *all_logits) {
@@ -1188,34 +1296,8 @@ static void forward_chunk(Context *c, const int *tokens, int n, int want_logits,
     }
     const int pos0 = c->pos;
     sync_to_cpu(c, pos0);
-    for (int t = 0; t < n; t++) {
-        int id = tokens[t];
-        if (id < 0 || id >= m->n_vocab) id = 0;
-        dequant_row(m->embed.type, m->embed.data + (size_t)id * m->embed.row_bytes, c->x + (size_t)t * D, D);
-    }
-    for (int l = 0; l < m->n_layer; l++) {
-        const Layer *L = &m->layers[l];
-        if (c->pfq && n >= 8 && l + 1 < m->n_layer && m->layers[l + 1].is_moe) {
-            /* prompt batches touch nearly every expert: stream the next layer, expert by expert
-             * (small requests so a newer layer can cancel what is still pending) */
-            const Layer *Ln = &m->layers[l + 1];
-            prefetcher_clear(c->pfq);
-            for (int e = 0; e < m->n_expert; e++)
-                if (!c->gpu || !gpu_resident(c->gpu, l + 1, e)) prefetch_expert(c, Ln, e);
-        }
-        for (int t = 0; t < n; t++) rmsnorm(c->h + (size_t)t * D, c->x + (size_t)t * D, L->attn_norm, D, m->eps);
-        if (L->is_attn) attention_block(c, L, n);
-        else shortconv_block(c, L, n);
-        if (L->post_op_norm)
-            for (int t = 0; t < n; t++) rmsnorm(c->out + (size_t)t * D, c->out + (size_t)t * D, L->post_op_norm, D, m->eps);
-        for (size_t i = 0; i < (size_t)n * D; i++) c->x[i] += c->out[i];
-        for (int t = 0; t < n; t++) rmsnorm(c->h + (size_t)t * D, c->x + (size_t)t * D, L->ffn_norm, D, m->eps);
-        if (L->is_moe) moe_ffn(c, L, l, n);
-        else dense_ffn(c, L, n);
-        if (L->post_ffn_norm)
-            for (int t = 0; t < n; t++) rmsnorm(c->out + (size_t)t * D, c->out + (size_t)t * D, L->post_ffn_norm, D, m->eps);
-        for (size_t i = 0; i < (size_t)n * D; i++) c->x[i] += c->out[i];
-    }
+    for (int t = 0; t < n; t++) token_row(c, tokens[t], c->x + (size_t)t * D);
+    run_layers(c, n);
     c->pos += n;
     c->tok_counter += (uint32_t)n;
     c->kv_cpu_n = c->pos;
@@ -1270,6 +1352,40 @@ float *ctx_forward(Context *c, const int *tokens, int n) {
         if (lost_state(c)) return NULL;
     }
     return c->logits;
+}
+
+int ctx_forward_embd(Context *c, const float *x, int n, float *hidden) {
+    const Model *m = c->m;
+    const int D = m->dim;
+    if (c->pos + n > c->n_ctx) return 0;
+    for (int i = 0; i < n; i += c->n_batch) {
+        const int nb = n - i < c->n_batch ? n - i : c->n_batch, pos0 = c->pos;
+        sync_to_cpu(c, pos0);
+        memcpy(c->x, x + (size_t)i * D, sizeof(float) * (size_t)nb * D);
+        run_layers(c, nb);
+        c->pos += nb;
+        c->tok_counter += (uint32_t)nb;
+        c->kv_cpu_n = c->pos;
+        if (c->kv_gpu_n > pos0) c->kv_gpu_n = pos0;
+        c->conv_gpu_ok = 0;
+        for (int t = 0; t < nb; t++)
+            rmsnorm(hidden + (size_t)(i + t) * D, c->x + (size_t)t * D, m->final_norm, D, m->eps);
+    }
+    return 1;
+}
+
+void ctx_matmul(Context *c, const Mat *w, const float *x, int n, float *out) {
+    job_clear(c);
+    if (w->type == GGML_F32 || w->type == GGML_F16) {
+        job_add_f(c, w, x, w->cols, n, out, w->rows);
+        job_run(c, CAT_DENSE);
+        return;
+    }
+    block_q8_K *q = (block_q8_K *)aligned_malloc(sizeof(block_q8_K) * (size_t)n * (w->cols / QK_K) + 64, 64);
+    quantize_rows(x, n, w->cols, q);
+    job_add_q(c, w, NULL, q, w->cols / QK_K, n, out, w->rows);
+    job_run(c, CAT_DENSE);
+    aligned_free(q);
 }
 
 int ctx_forward_all(Context *c, const int *tokens, int n, float *out) {

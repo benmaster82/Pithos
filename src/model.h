@@ -69,6 +69,11 @@ typedef struct {
 } Stats;
 
 int  model_load(Model *m, const char *path, char *err, int errlen);
+/* the speech encoder of an LFM3-Audio mmproj file, as a Model without vocabulary */
+int  model_load_audio_encoder(Model *m, const char *path, char *err, int errlen);
+/* a tensor of m's file as a matrix / as F32[n]; 0 / NULL with err if missing or of another type */
+int  model_mat(Model *m, const char *name, Mat *mat, char *err, int errlen);
+const float *model_f32(Model *m, const char *name, int n, char *err, int errlen);
 void model_free(Model *m);
 
 /* n_ctx: KV capacity in tokens; n_batch: max tokens per forward call chunk. */
@@ -106,6 +111,14 @@ int    ctx_kv_read(Context *c, int n, int n_file, FILE *f);
 float *ctx_forward(Context *c, const int *tokens, int n);
 /* Like ctx_forward but writes logits for every token into out[n][n_vocab]. */
 int ctx_forward_all(Context *c, const int *tokens, int n, float *out);
+/* Token ids -1, -2... in ctx_forward stand for rows 0, 1... of rows[n][dim] (audio embeddings);
+ * the caller keeps them alive while they are fed. NULL clears them. */
+void ctx_set_embeds(Context *c, const float *rows, int n);
+/* The layers over input rows x[n][dim] instead of tokens (CPU); hidden[n][dim] receives the output
+ * after the final norm. Returns 0 if the context is full. */
+int ctx_forward_embd(Context *c, const float *x, int n, float *hidden);
+/* out[n][w->rows] = x[n][w->cols] times w, on the context's threads (w->cols a multiple of 256 if quantized) */
+void ctx_matmul(Context *c, const Mat *w, const float *x, int n, float *out);
 /* How many times the context was lost with a failing GPU (it then goes on on the CPU). */
 int ctx_lost(const Context *c);
 

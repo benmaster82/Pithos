@@ -1164,6 +1164,8 @@ static float *prefill(Gen *g, const Toks *t, const int *bounds, int nb) {
 static void generate(Gen *g, float *lg, const Toks *prompt) {
     Sampler smp;
     sampler_init(&smp, &g->sp, S.m->n_vocab);
+    int sp[4];
+    sampler_ban(&smp, sp, tok_speech_ids(S.tk, sp));
     int from = prompt->n > g->sp.repeat_last_n ? prompt->n - g->sp.repeat_last_n : 0;
     for (int i = from; i < prompt->n; i++) sampler_accept(&smp, prompt->v[i]);
     double t0 = time_sec();

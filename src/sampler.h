@@ -20,6 +20,7 @@ typedef struct {
     int *hist; int hist_n, hist_cap;
     int n_vocab;
     int *idx; float *val;
+    int ban[8], n_ban;   /* tokens never sampled (sampler_ban) */
 } Sampler;
 
 void sampler_init(Sampler *s, const SamplerParams *p, int n_vocab);
@@ -27,5 +28,7 @@ void sampler_free(Sampler *s);
 void sampler_accept(Sampler *s, int token);
 void sampler_reset_history(Sampler *s);
 int  sampler_sample(Sampler *s, float *logits);
+/* tokens the sampler never picks (up to 8 in all; out-of-range ids are ignored) */
+void sampler_ban(Sampler *s, const int *ids, int n);
 
 #endif

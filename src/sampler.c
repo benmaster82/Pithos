@@ -85,8 +85,14 @@ static void top_k_sort(int *idx, float *val, int n, int k) {
     }
 }
 
+void sampler_ban(Sampler *s, const int *ids, int n) {
+    for (int i = 0; i < n && s->n_ban < 8; i++)
+        if (ids[i] >= 0 && ids[i] < s->n_vocab) s->ban[s->n_ban++] = ids[i];
+}
+
 int sampler_sample(Sampler *s, float *logits) {
     const int n = s->n_vocab;
+    for (int i = 0; i < s->n_ban; i++) logits[s->ban[i]] = -INFINITY;
     if (s->p.repeat_penalty != 1.f && s->hist_n > 0) {
         for (int i = 0; i < s->hist_n; i++) {
             int t = s->hist[i];

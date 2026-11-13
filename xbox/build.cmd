@@ -17,7 +17,7 @@ mkdir %LAYOUT%\Assets
 
 set CFLAGS=/nologo /c /O2 /MD /std:c11 /W3 /D_CRT_SECURE_NO_WARNINGS /DWINAPI_FAMILY=WINAPI_FAMILY_APP /DPITHOS_UWP
 echo [xbox] compiling the engine
-cl %CFLAGS% src\main.c src\model.c src\gguf.c src\tokenizer.c src\sampler.c src\quant.c src\platform.c src\quant_neon.c src\gpu_opencl.c src\gpu_d3d12.c src\gpu_vulkan.c src\json.c src\pcache.c src\server.c src\proc.c src\tools.c src\agent.c /Fo%OBJ%\ || goto fail
+cl %CFLAGS% src\main.c src\model.c src\gguf.c src\tokenizer.c src\sampler.c src\quant.c src\platform.c src\quant_neon.c src\gpu_opencl.c src\gpu_d3d12.c src\gpu_vulkan.c src\json.c src\pcache.c src\server.c src\proc.c src\tools.c src\agent.c src\audio.c /Fo%OBJ%\ || goto fail
 cl %CFLAGS% /arch:AVX src\quant_avx.c /Fo%OBJ%\ || goto fail
 cl %CFLAGS% /arch:AVX2 src\quant_avx2.c /Fo%OBJ%\ || goto fail
 echo [xbox] compiling the GPU probe shaders

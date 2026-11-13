@@ -415,3 +415,13 @@ int tok_bos(const Tokenizer *t) { return t->bos; }
 int tok_eos(const Tokenizer *t) { return t->eos; }
 int tok_is_control(const Tokenizer *t, int id) { return id >= 0 && id < t->n_vocab && t->type[id] == TT_CONTROL; }
 int tok_find(const Tokenizer *t, const char *s) { return vocab_lookup(t, s, (int)strlen(s)); }
+
+int tok_speech_ids(const Tokenizer *t, int *ids) {
+    static const char *names[4] = { "<|audio_start|>", "<|mixed_start|>", "<|audio_out|>", "<|audio|>" };
+    int n = 0;
+    for (int i = 0; i < 4; i++) {
+        const int id = tok_find(t, names[i]);
+        if (id >= 0) ids[n++] = id;
+    }
+    return n;
+}

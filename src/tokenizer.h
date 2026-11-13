@@ -24,5 +24,8 @@ int tok_eos(const Tokenizer *t);
 int tok_is_control(const Tokenizer *t, int id);
 /* id of the token whose text equals s exactly, or -1 */
 int tok_find(const Tokenizer *t, const char *s);
+/* The ids (up to 4) of the LFM3-Audio tokens that open speech output or stand for audio, which
+ * the vocabulary of LFM3 models has: Pithos writes text only, so they are banned in sampling. */
+int tok_speech_ids(const Tokenizer *t, int *ids);
 
 #endif

@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "agent.h"
+#include "audio.h"
 #include "gpu.h"
 #include "gpu_dx.h"
 #include "gpu_vk.h"
@@ -33,6 +34,7 @@
 
 typedef struct {
     const char *model, *prompt, *system, *kernels, *tokenize, *ppl;
+    const char *audio, *mmproj;     /* --audio WAV and its LFM3-Audio projector */
     const char *host, *alias, *api_key, *cache_dir, *ui_path, *workspace, *mcp, *tool_name, *tool_args;
     int tools_list;
     int port, server, cache_mb, open_browser, tools, web, read_only, ctx_set, shell, workspace_set;
@@ -127,8 +129,48 @@ static void collect_gguf(const char *name, void *u) {
     FoundModels *f = (FoundModels *)u;
     const size_t l = strlen(name);
     if (l <= 5 || strcmp(name + l - 5, ".gguf")) return; /* also skips unfinished *.gguf.part */
+    if (!strncmp(name, "mmproj", 6)) return;            /* a projector, not a model */
     if (f->n < 16) snprintf(f->path[f->n], sizeof(f->path[0]), "%s/%s", f->dir, name);
     f->n++;
+}
+
+typedef struct { const char *stem, *quant; char best[512]; int score; const char *dir; } FoundProj;
+
+static void collect_mmproj(const char *name, void *u) {
+    FoundProj *f = (FoundProj *)u;
+    const size_t l = strlen(name);
+    if (l <= 12 || strncmp(name, "mmproj-", 7) || strcmp(name + l - 5, ".gguf")) return;
+    /* only the model's own projector (mmproj-STEM-...), in the model's quantization if there */
+    if (strncmp(name + 7, f->stem, strlen(f->stem))) return;
+    const int sc = 1 + (f->quant[0] && strstr(name, f->quant) != NULL);
+    if (sc > f->score || (sc == f->score && strcmp(name, f->best + strlen(f->dir) + 1) < 0)) {
+        f->score = sc;
+        snprintf(f->best, sizeof(f->best), "%s/%s", f->dir, name);
+    }
+}
+
+/* --mmproj, else the projector next to the model: mmproj-<model name without its quantization>* */
+static int find_mmproj(const char *model, const char *given, char *out, int cap) {
+    if (given) { snprintf(out, (size_t)cap, "%s", given); return 1; }
+    char dir[512], stem[256], quant[64] = "";
+    const char *b = model + strlen(model);
+    while (b > model && b[-1] != '/' && b[-1] != '\\') b--;
+    snprintf(dir, sizeof(dir), "%.*s", b > model ? (int)(b - model - 1) : 1, b > model ? model : ".");
+    snprintf(stem, sizeof(stem), "%s", b);
+    char *dot = strstr(stem, ".gguf");
+    if (dot) *dot = 0;
+    static const char *qs[] = { "-Q", "-IQ", "-F16", "-BF16", "-F32" };
+    char *cut = NULL;
+    for (size_t i = 0; i < sizeof(qs) / sizeof(qs[0]); i++) {
+        char *q = strstr(stem, qs[i]);
+        if (q && (!cut || q < cut)) cut = q;
+    }
+    if (cut) { snprintf(quant, sizeof(quant), "%s", cut + 1); *cut = 0; }
+    FoundProj f = { stem, quant, "", 0, dir };
+    dir_list(dir, collect_mmproj, &f);
+    if (!f.score) return 0;
+    snprintf(out, (size_t)cap, "%s", f.best);
+    return 1;
 }
 
 /* Without -m: the reference model if it is there, otherwise the only GGUF in the model folders.
@@ -177,6 +219,9 @@ static void usage(void) {
         "  -p, --prompt TEXT       single prompt (chat template applied), then exit\n"
         "  -f, --file PATH         read the prompt from a file\n"
         "  -s, --system TEXT       system prompt\n"
+        "      --audio FILE        a WAV file the model hears before the prompt (LFM3-Audio), e.g. with\n"
+        "                          -s \"Perform ASR in English.\" for a transcription\n"
+        "      --mmproj FILE       the audio projector (default: the mmproj-*.gguf next to the model)\n"
         "  -i, --interactive       interactive chat (default when no prompt is given)\n"
         "      --raw               no chat template: plain text completion of the prompt\n"
         "  -n, --n-predict N       max new tokens per answer (default 4096; server: until the context is full)\n"
@@ -345,6 +390,8 @@ static int parse_args(int argc, char **argv, Args *a) {
 #define NEXT() (i + 1 < argc ? argv[++i] : (fprintf(stderr, "missing value for %s\n", s), exit(1), ""))
         if (!strcmp(s, "-m") || !strcmp(s, "--model")) a->model = NEXT();
         else if (!strcmp(s, "-p") || !strcmp(s, "--prompt")) a->prompt = NEXT();
+        else if (!strcmp(s, "--audio")) a->audio = NEXT();
+        else if (!strcmp(s, "--mmproj")) a->mmproj = NEXT();
         else if (!strcmp(s, "-f") || !strcmp(s, "--file")) {
             const char *path = NEXT();
             FILE *f = fopen(path, "rb");
@@ -468,6 +515,7 @@ static int parse_args(int argc, char **argv, Args *a) {
         if (!a->workspace_set) a->workspace = "."; /* the agent works in the folder it is started from */
         if (a->max_steps <= 0) a->max_steps = 40;
     }
+    if (a->audio && !a->prompt && !a->interactive) a->prompt = ""; /* the audio alone is the message */
     if (!a->prompt && !a->bench && !a->tokenize && !a->ppl && !a->server && !a->tools_list && !a->tool_name)
         a->interactive = 1;
     return 1;
@@ -481,7 +529,9 @@ typedef struct {
     Tokenizer *tk;
     Sampler smp;
     Args *a;
-    int tok_im_end, tok_eot, tok_think_end;
+    int tok_im_end, tok_eot, tok_think_end, tok_think_start;
+    float *audio_emb;           /* [n_audio][dim] embeddings of --audio, fed in place of <|audio|> */
+    int n_audio, tok_audio, audio_pending;
     double t_prompt, t_gen;
     int n_prompt, n_gen;
 } Engine;
@@ -491,13 +541,26 @@ static int feed(Engine *e, const int *ids, int n) {
     if (!ctx_forward(e->ctx, ids, n)) return 0;
     e->t_prompt += time_sec() - t0;
     e->n_prompt += n;
-    for (int i = 0; i < n; i++) sampler_accept(&e->smp, ids[i]);
+    for (int i = 0; i < n; i++)
+        if (ids[i] >= 0) sampler_accept(&e->smp, ids[i]);
     return 1;
 }
 
 static int feed_text(Engine *e, const char *text) {
     int n;
     int *ids = encode(e->tk, text, &n);
+    /* the audio placeholder stands for its embeddings: token ids -1, -2... (ctx_set_embeds) */
+    for (int i = 0; i < n && e->n_audio; i++) {
+        if (ids[i] != e->tok_audio) continue;
+        int *x = (int *)malloc(sizeof(int) * (size_t)(n - 1 + e->n_audio));
+        memcpy(x, ids, sizeof(int) * (size_t)i);
+        for (int k = 0; k < e->n_audio; k++) x[i + k] = -1 - k;
+        memcpy(x + i + e->n_audio, ids + i + 1, sizeof(int) * (size_t)(n - i - 1));
+        free(ids);
+        ids = x;
+        n += e->n_audio - 1;
+        break;
+    }
     int ok = feed(e, ids, n);
     free(ids);
     return ok;
@@ -523,7 +586,12 @@ static char *generate(Engine *e, int in_think, int *last) {
         const char *piece = tok_piece(e->tk, tok, &pl);
         str_add(&out, piece, pl);
         if (e->a->ids) printf("[%d]", tok);
-        if (tok == e->tok_think_end && thinking) {
+        if (tok == e->tok_think_start && n == 0 && !thinking) {
+            /* the model opens its reasoning itself (after audio, whose template does not): as if prefilled */
+            thinking = 1;
+            color("[90m");
+            if (!e->a->show_think) { out_str("[thinking..."); color("[0m"); }
+        } else if (tok == e->tok_think_end && thinking) {
             thinking = 0;
             skip_ws = 1;
             if (e->a->show_think) { out_bytes(&uo, piece, pl); color("\x1b[0m"); out_str("\n\n"); }
@@ -634,6 +702,9 @@ static int chat_turn(Engine *e, const char *user, int first) {
         }
     }
     str_add(&p, "<|im_start|>user\n", -1);
+    const int heard = e->audio_pending;   /* --audio goes into the first message */
+    if (heard) str_add(&p, "<|audio|>", -1);
+    e->audio_pending = 0;
     str_add(&p, user, -1);
     str_add(&p, "<|im_end|>\n", -1);
     double tp0 = e->t_prompt, tg0 = e->t_gen;
@@ -642,8 +713,10 @@ static int chat_turn(Engine *e, const char *user, int first) {
     free(p.s);
     CtxSnapshot snap;
     ctx_snapshot(e->ctx, &snap);
-    const int think = e->a->think_budget != THINK_OFF;
-    if (!feed_text(e, think ? "<|im_start|>assistant\n<think>" : think_off_prompt(!strcmp(e->m->arch, "lfm3")))) {
+    /* after audio, the generation prompt of LFM3-Audio's template: no reasoning block */
+    const int think = e->a->think_budget != THINK_OFF && !heard;
+    if (!feed_text(e, heard ? "<|im_start|>assistant\n"
+                            : think ? "<|im_start|>assistant\n<think>" : think_off_prompt(!strcmp(e->m->arch, "lfm3")))) {
         ctx_snapshot_free(&snap);
         return 0;
     }
@@ -881,7 +954,39 @@ static int real_main(int argc, char **argv) {
     e.tok_im_end = tok_find(tk, "<|im_end|>");
     e.tok_eot = tok_find(tk, "<|endoftext|>");
     e.tok_think_end = tok_find(tk, "</think>");
+    e.tok_think_start = tok_find(tk, "<think>");
     sampler_init(&e.smp, &a.sp, m.n_vocab);
+    {
+        int sp[4];
+        sampler_ban(&e.smp, sp, tok_speech_ids(tk, sp));
+    }
+    Audio *au = NULL;
+    if (a.audio) {
+        char mp[1024];
+        e.tok_audio = tok_find(tk, "<|audio|>");
+        if (e.tok_audio < 0) { fprintf(stderr, "error: --audio needs an audio model (LFM3-Audio): this one has no <|audio|> token\n"); return 1; }
+        if (!find_mmproj(a.model, a.mmproj, mp, sizeof(mp))) {
+            fprintf(stderr, "error: --audio needs the model's audio projector: no mmproj-*.gguf next to %s (see --mmproj)\n", a.model);
+            return 1;
+        }
+        const double ta = time_sec();
+        uint64_t bl = 0;
+        const char *bn = gguf_get_str(&m.gguf, "general.basename", &bl);
+        char base[128] = "";
+        if (bn && bl < sizeof(base)) { memcpy(base, bn, bl); base[bl] = 0; }
+        au = audio_load(mp, pool, m.dim, base, err, sizeof(err));
+        if (!au) { fprintf(stderr, "error: %s\n", err); return 1; }
+        int ns = 0;
+        float *pcm = audio_read_wav(a.audio, &ns, err, sizeof(err));
+        if (!pcm) { fprintf(stderr, "error: %s\n", err); return 1; }
+        e.audio_emb = audio_embed(au, pcm, ns, &e.n_audio);
+        free(pcm);
+        if (!e.n_audio) { fprintf(stderr, "error: %s: no audio\n", a.audio); return 1; }
+        ctx_set_embeds(ctx, e.audio_emb, e.n_audio);
+        e.audio_pending = 1;
+        fprintf(stderr, "audio: %s | %.1f s | %d tokens | encoded in %.2f s (%s)\n", a.audio, ns / (double)AUDIO_RATE,
+                e.n_audio, time_sec() - ta, mp);
+    }
 
     if (a.server || a.agent) {
         char alias[256], cache_dir[1100], info[512];
@@ -1125,6 +1230,8 @@ static int real_main(int argc, char **argv) {
 
     sampler_free(&e.smp);
     ctx_free(ctx);
+    free(e.audio_emb);
+    audio_free(au);
     gpu_destroy(gpu);
     dx_destroy(dx);
     vk_destroy(vk);
