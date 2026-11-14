@@ -266,18 +266,19 @@
   -m models/LFM3-Audio-2B-Q4_K_M.gguf</code></pre></div>
             <p class="mcp-small">Check it from another machine: <code>curl -H "Authorization: Bearer change-this-token" http://pithos.lan:8080/v1/models</code>. Keep the port inside the LAN; a VPN is the way in from outside.</p></div>
           <div><h4>2 · Add the command to Home Assistant</h4><div class="code-block"><div class="code-block-header"><span>configuration.yaml</span><button class="copy-button" data-copy-target="lab-command" aria-label="Copy the Home Assistant command">Copy</button></div><pre><code id="lab-command">shell_command:
-  pithos_say: >-
-    curl -sf -m 60 http://pithos.lan:8080/v1/audio/speech
+  pithos_say: &gt;-
+    curl -sf -m 55 http://pithos.lan:8080/v1/audio/speech
     -H "Authorization: Bearer change-this-token"
     -H "Content-Type: application/json"
-    -d '{"input": {{ message | to_json }},
+    -d '{"input": {{ message | replace("'", "’") | to_json }},
     "language": "{{ language | default("en") }}",
     "response_format": "mp3"}'
     -o /config/www/pithos/announce.mp3</code></pre></div>
-            <p class="mcp-small">Create <code>/config/www/pithos</code> once and restart Home Assistant. Messages come from your own automations; avoid single quotes in them.</p></div>
+            <p class="mcp-small">Create <code>/config/www/pithos</code> once and restart Home Assistant. With a template, Home Assistant runs the command without a shell and kills it after 60 seconds, so curl stops at 55; apostrophes in the message become typographic ones, which the JSON quoting needs.</p></div>
         </div>
         <h4 class="lab-step-title">3 · Use it in an automation</h4>
-        <div class="code-block"><div class="code-block-header"><span>automations.yaml</span><button class="copy-button" data-copy-target="lab-automation" aria-label="Copy the automation">Copy</button></div><pre><code id="lab-automation">- alias: "Announce: washing machine finished"
+        <div class="code-block"><div class="code-block-header"><span>automations.yaml</span><button class="copy-button" data-copy-target="lab-automation" aria-label="Copy the automation">Copy</button></div><pre><code id="lab-automation">- id: announce_washing_machine
+  alias: "Announce: washing machine finished"
   triggers:
     - trigger: state
       entity_id: sensor.washing_machine_status
@@ -287,13 +288,16 @@
       data:
         message: "The washing machine has finished."
         language: en
+      response_variable: tts
+    - condition: template
+      value_template: "{{ tts.returncode == 0 }}"
     - action: media_player.play_media
       target:
         entity_id: media_player.kitchen_speaker
       data:
-        media_content_id: "http://homeassistant.local:8123/local/pithos/announce.mp3?v={{ now().timestamp() | int }}"
+        media_content_id: "http://192.168.1.10:8123/local/pithos/announce.mp3?v={{ now().timestamp() | int }}"
         media_content_type: music</code></pre></div>
-        <p>The entity IDs and host names are examples. The query string stops speakers from replaying a cached file. The same server can transcribe voice memos dropped on a NAS share, read a morning briefing in Italian, or provide speech input and output to chat front ends that support an OpenAI-compatible audio service.</p>
+        <p>The entity IDs and addresses are examples: use Home Assistant's LAN address, which the speaker must reach. A failed request does not stop a shell command, so the automation checks <code>returncode</code> before playing; the query string stops speakers from replaying a cached file. The same server can transcribe voice memos dropped on a NAS share, read a morning briefing in Italian, or provide speech input and output to chat front ends that support an OpenAI-compatible audio service.</p>
         <a class="text-link" href="https://github.com/benmaster82/Pithos#lfm3-audio-2b-speech-input-and-output-experimental" target="_blank" rel="noopener noreferrer">Speech server documentation ↗</a>
       </article>
     </section>
