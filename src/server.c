@@ -46,6 +46,7 @@ typedef int sock_t;
 #include "platform.h"
 #include "server.h"
 #include "audio.h"
+#include "mp3.h"
 #include "speech.h"
 #include "webui_html.h"
 #include "talk_html.h"
@@ -2037,16 +2038,66 @@ static const char *language_name(const char *code) {
 
 #define SPEECH_MAX_FRAMES 1500   /* 2 minutes per request (speech_load's max_frames) */
 
+#define SPEECH_MP3_KBPS 48   /* Media Foundation's highest at 24 kHz mono */
+
+/* Where the speech goes as it is generated: SSE events (stream_format "sse"), the body itself
+ * (pcm, mp3) or nothing until the end (wav, whose header holds the length). */
+typedef struct {
+    Conn *c;
+    int sse;
+    Mp3 *mp3;
+} SpeechSink;
+
+static void sink_bytes(void *ctx, const unsigned char *d, int n) {
+    SpeechSink *k = (SpeechSink *)ctx;
+    if (n <= 0) return;
+    if (!k->sse) { conn_send(k->c, (const char *)d, n); return; }
+    Buf b = { 0 };
+    buf_add(&b, "data: {\"type\":\"speech.audio.delta\",\"audio\":\"", -1);
+    b64_encode(&b, d, (size_t)n);
+    buf_add(&b, "\"}\n\n", -1);
+    conn_send(k->c, b.s, b.n);
+    buf_free(&b);
+}
+
+/* n new samples: 16-bit PCM or MP3 frames to the sink */
+static int sink_pcm(SpeechSink *k, const float *pcm, int n) {
+    if (n <= 0) return 1;
+    if (k->mp3) return mp3_encode(k->mp3, pcm, n);
+    unsigned char *w = (unsigned char *)malloc(44 + 2 * (size_t)n);
+    speech_wav_bytes(pcm, n, SPEECH_RATE, w);
+    sink_bytes(k, w + 44, 2 * n);
+    free(w);
+    return 1;
+}
+
 /* OpenAI's text-to-speech: {"input", "voice": "female" / "male" (other names: female),
- * "language": ISO code such as "it" (an extension; default en), "response_format": "wav" or
- * "pcm" (16-bit 24 kHz mono), "temperature"}. The whole audio comes back at once: callers that want
- * it sooner send a sentence at a time. */
+ * "language": ISO code such as "it" (an extension; default en), "response_format": "wav", "pcm"
+ * (16-bit 24 kHz mono) or "mp3", "stream_format": "audio" or "sse", "temperature"}. pcm and mp3
+ * stream: the body grows as the speech is generated (80 ms per frame); with "sse" the audio comes
+ * as speech.audio.delta events (base64 of pcm, or of mp3 frames), then speech.audio.done with the
+ * usage. A wav body comes at once (its header holds the length). */
 static void handle_speech(Conn *c, const Json *body) {
     if (!S.cfg.speech) { send_error(c, 400, "invalid_request_error", "this model does not speak (it needs LFM3-Audio and its mmproj file)"); return; }
     const char *input = json_str(json_get(body, "input"), NULL);
     if (!input || !*input) { send_error(c, 400, "invalid_request_error", "'input' must be a non-empty string"); return; }
-    const char *fmt = json_str(json_get(body, "response_format"), "wav");
-    if (strcmp(fmt, "wav") && strcmp(fmt, "pcm")) { send_error(c, 400, "invalid_request_error", "response_format must be wav or pcm"); return; }
+    const char *sfmt = json_str(json_get(body, "stream_format"), "audio");
+    if (strcmp(sfmt, "audio") && strcmp(sfmt, "sse")) { send_error(c, 400, "invalid_request_error", "stream_format must be audio or sse"); return; }
+    SpeechSink sink = { c, !strcmp(sfmt, "sse"), NULL };
+    const char *fmt = json_str(json_get(body, "response_format"), sink.sse ? "pcm" : "wav");
+    if (strcmp(fmt, "wav") && strcmp(fmt, "pcm") && strcmp(fmt, "mp3")) {
+        send_error(c, 400, "invalid_request_error", "response_format must be wav, pcm or mp3");
+        return;
+    }
+    if (sink.sse && !strcmp(fmt, "wav")) { send_error(c, 400, "invalid_request_error", "with stream_format sse, response_format must be pcm or mp3"); return; }
+    const int whole = !strcmp(fmt, "wav");
+    if (!strcmp(fmt, "mp3")) {
+        char merr[200];
+        if (!(sink.mp3 = mp3_open(SPEECH_RATE, SPEECH_MP3_KBPS, sink_bytes, &sink, merr, sizeof(merr)))) {
+            send_error(c, 400, "invalid_request_error", merr);
+            return;
+        }
+    }
     const char *voice = json_str(json_get(body, "voice"), "female");
     SpeechParams sp = speech_defaults();
     const Json *v = json_get(body, "temperature");
@@ -2072,31 +2123,51 @@ static void handle_speech(Conn *c, const Json *body) {
     ctx_set_embeds(S.ctx, row, 1);
     const double t0 = time_sec();
     const int id = -1;
+    if (!h) send_error(c, 400, "invalid_request_error", "the text is too long for the context");
+    else if (sink.sse) send_head(c, 200, "text/event-stream; charset=utf-8", -1);
+    else if (!whole) send_head(c, 200, sink.mp3 ? "audio/mpeg" : "audio/pcm", -1);
+    const int started = h != NULL;
+    int ok = started;
+    double first = 0;
     while (h && frames < max_frames) {
         int codes[SPEECH_CODEBOOKS];
         if (speech_frame(S.cfg.speech, h, &sp, &rng, codes)) break;
-        n += speech_decode(S.cfg.speech, codes, pcm + n);
+        const int k = speech_decode(S.cfg.speech, codes, pcm + n);
+        if (!whole && ok) ok = sink_pcm(&sink, pcm + n, k);
+        if (k && !first) first = time_sec() - t0;
+        n += k;
         frames++;
         if ((frames & 15) == 0 && conn_gone(c)) { g.finish = FIN_ABORT; break; }
         speech_embed(S.cfg.speech, codes, row);
         h = pcache_feed(S.pc, &id, 1) ? ctx_hidden(S.ctx) : NULL;
     }
-    n += speech_flush(S.cfg.speech, pcm + n);
+    const int k = ok ? speech_flush(S.cfg.speech, pcm + n) : 0;
+    if (!whole && ok && g.finish != FIN_ABORT) ok = sink_pcm(&sink, pcm + n, k) && (!sink.mp3 || mp3_finish(sink.mp3));
+    n += k;
     g.t_gen = time_sec() - t0;
     g.n_prompt = t.n;
     g.n_gen = frames;
     ctx_set_embeds(S.ctx, NULL, 0);
     ctx_need_hidden(S.ctx, 0);
     pcache_clear(S.pc);
-    if (g.finish != FIN_ABORT) {
-        unsigned char *wav = (unsigned char *)malloc(44 + 2 * (size_t)n);
-        const size_t len = speech_wav_bytes(pcm, n, SPEECH_RATE, wav);
-        if (!strcmp(fmt, "pcm")) send_body(c, 200, "audio/pcm", (const char *)wav + 44, (int)(len - 44));
-        else send_body(c, 200, "audio/wav", (const char *)wav, (int)len);
-        free(wav);
-        fprintf(stderr, "[speech] %.2f s of audio (%d frames) in %.2f s, %.2fx real time\n", n / (double)SPEECH_RATE,
-                frames, g.t_gen, n / (double)SPEECH_RATE / (g.t_gen > 0 ? g.t_gen : 1e-9));
-    }
+    if (ok && g.finish != FIN_ABORT) {
+        if (whole) {
+            unsigned char *wav = (unsigned char *)malloc(44 + 2 * (size_t)n);
+            const size_t len = speech_wav_bytes(pcm, n, SPEECH_RATE, wav);
+            send_body(c, 200, "audio/wav", (const char *)wav, (int)len);
+            free(wav);
+        } else if (sink.sse) {
+            Buf b = { 0 };
+            buf_printf(&b, "data: {\"type\":\"speech.audio.done\",\"usage\":{\"input_tokens\":%d,\"output_tokens\":%d,"
+                           "\"total_tokens\":%d}}\n\n", t.n, frames, t.n + frames);
+            conn_send(c, b.s, b.n);
+            buf_free(&b);
+        }
+        fprintf(stderr, "[speech] %.2f s of audio (%d frames, %s) in %.2f s, %.2fx real time, first audio after %.2f s\n",
+                n / (double)SPEECH_RATE, frames, fmt, g.t_gen, n / (double)SPEECH_RATE / (g.t_gen > 0 ? g.t_gen : 1e-9),
+                whole ? g.t_gen : first + g.t_prompt);
+    } else if (started && !ok) fprintf(stderr, "[speech] the MP3 encoder failed\n");
+    mp3_close(sink.mp3);
     conn_close(c);
     S.busy = 0;
     lock_release(S.lock);
@@ -2107,8 +2178,10 @@ static void handle_speech(Conn *c, const Json *body) {
 }
 
 /* OpenAI's speech-to-text: form fields file (WAV), language, response_format (json, text,
- * verbose_json), temperature; model and prompt are accepted and ignored */
-static void handle_transcription(Conn *c, const Req *r) {
+ * verbose_json), temperature; model and prompt are accepted and ignored. translate: the
+ * /v1/audio/translations variant, the speech in English text; there "language" (an extension) names
+ * the language spoken, which the model otherwise recognizes itself. */
+static void handle_transcription(Conn *c, const Req *r, int translate) {
     if (!S.cfg.audio) { send_error(c, 400, "invalid_request_error", "this model takes no audio (it needs LFM3-Audio and its mmproj file)"); return; }
     Part parts[16];
     const int np = multipart(r, parts, 16);
@@ -2144,7 +2217,9 @@ static void handle_transcription(Conn *c, const Req *r) {
     else if (!heard) buf_add(&g.content, "", 0);   /* no speech: an empty transcription, not made-up words */
     else {
         char sys[200];
-        if (lang[0]) snprintf(sys, sizeof(sys), "Perform ASR in %s.", language_name(lang));
+        if (translate && lang[0]) snprintf(sys, sizeof(sys), "Translate the following speech from %s to English in text form.", language_name(lang));
+        else if (translate) snprintf(sys, sizeof(sys), "Translate the following speech to English in text form.");
+        else if (lang[0]) snprintf(sys, sizeof(sys), "Perform ASR in %s.", language_name(lang));
         else snprintf(sys, sizeof(sys), "Perform ASR.");
         Buf p = { 0 };
         buf_add(&p, "<|startoftext|><|im_start|>system\n", -1);
@@ -2166,7 +2241,7 @@ static void handle_transcription(Conn *c, const Req *r) {
     else {
         Buf b = { 0 };
         if (!strcmp(fmt, "verbose_json")) {
-            buf_printf(&b, "{\"task\":\"transcribe\",\"duration\":%.2f,", secs);
+            buf_printf(&b, "{\"task\":\"%s\",\"duration\":%.2f,", translate ? "translate" : "transcribe", secs);
             if (lang[0]) {
                 buf_add(&b, "\"language\":", -1);
                 buf_json_str(&b, language_name(lang), -1);
@@ -2181,7 +2256,7 @@ static void handle_transcription(Conn *c, const Req *r) {
         buf_free(&b);
     }
     conn_close(c);
-    if (!err[0]) log_request("transcription", &g);
+    if (!err[0]) log_request(translate ? "translation" : "transcription", &g);
     pcache_clear(S.pc);
     audio_end();
     S.busy = 0;
@@ -2215,9 +2290,10 @@ static void route(Conn *c, Req *r) {
     int tcall = is_path(r->path, "/v1/tools/call", "/tools/call");
     int trans = is_path(r->path, "/v1/audio/transcriptions", "/audio/transcriptions");
     int speech = is_path(r->path, "/v1/audio/speech", "/audio/speech");
-    if (!chat && !compl && !tokn && !tmpl && !tcall && !trans && !speech) { send_error(c, 404, "not_found_error", "unknown endpoint"); return; }
+    int transl = is_path(r->path, "/v1/audio/translations", "/audio/translations");
+    if (!chat && !compl && !tokn && !tmpl && !tcall && !trans && !speech && !transl) { send_error(c, 404, "not_found_error", "unknown endpoint"); return; }
     if (!post) { send_error(c, 405, "invalid_request_error", "use POST"); return; }
-    if (trans) { handle_transcription(c, r); return; }
+    if (trans || transl) { handle_transcription(c, r, transl); return; }
     char err[160];
     Json *body = json_parse(r->body, r->body_len, err, sizeof(err));
     if (!body || body->t != J_OBJ) {

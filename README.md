@@ -667,15 +667,28 @@ dependency-free HTTP server (Winsock / POSIX sockets) with:
   - with [LFM3-Audio](#lfm3-audio-2b-speech-input-and-output-experimental) and its projector next to it, speech:
     `input_audio` parts (base64 WAV) in chat messages; `POST /v1/audio/transcriptions` (form
     fields `file`, `language` as an ISO code such as `it`, `response_format` `json`, `text` or
-    `verbose_json`, `temperature`); `POST /v1/audio/speech` (`input`, `voice` `female` or `male`,
-    `language`, `response_format` `wav` or `pcm`). `GET /props` says so under `modalities`.
+    `verbose_json`, `temperature`); `POST /v1/audio/translations` (the same fields: the speech as
+    English text; `language`, optional, names the language spoken); `POST /v1/audio/speech`
+    (`input`, `voice` `female` or `male`, `language`, `response_format` `wav`, `pcm` or `mp3`,
+    `stream_format` `audio` or `sse`). `GET /props` says so under `modalities`.
+
+    The speech streams: a `pcm` or `mp3` body grows as it is generated, so a player starts about
+    half a second after the request instead of after the whole text; with `"stream_format": "sse"`
+    the audio comes as `speech.audio.delta` events (base64 of PCM, or of MP3 frames) and ends with
+    `speech.audio.done`, as in OpenAI's API. A `wav` body comes at once (its header holds the
+    length). MP3 (24 kHz mono, 48 kbit/s) uses the system's encoder, so the build needs no library:
+    Media Foundation on Windows (not in N editions without the Media Feature Pack), libmp3lame
+    elsewhere (the `libmp3lame0` or `lame` package).
 
 ```
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
      -d '{"messages":[{"role":"user","content":"Hello!"}]}'
 curl http://127.0.0.1:8080/v1/audio/transcriptions -F file=@speech.wav -F language=en
+curl http://127.0.0.1:8080/v1/audio/translations -F file=@parole.wav
 curl http://127.0.0.1:8080/v1/audio/speech -H "Content-Type: application/json" \
      -d '{"input":"Ciao!","language":"it"}' -o ciao.wav
+curl -N http://127.0.0.1:8080/v1/audio/speech -H "Content-Type: application/json" \
+     -d '{"input":"Hello there!","response_format":"mp3"}' | ffplay -nodisp -autoexit -
 ```
 
 **Reasoning levels.** None of the models has official effort levels: LFM3 has an on/off switch in its
@@ -1012,6 +1025,7 @@ for each of the 30 convolution layers.
 | `src/server.c`, `src/json.c` | HTTP server, OpenAI API, chat template, tool calls, JSON |
 | `src/audio.c` | LFM3-Audio speech input: WAV, resampling, log-mel features, the speech encoder and projector |
 | `src/speech.c` | LFM3-Audio speech output: the depth decoder (MaskGIT), the LiquidCodec decoder, inverse STFT, WAV |
+| `src/mp3.c` | MP3 output through the system's encoder, loaded at run time (Media Foundation, libmp3lame) |
 | `src/pcache.c` | prompt reuse: recurrent-state checkpoints, sessions on disk |
 | `src/tools.c`, `src/proc.c` | agent tools (files, web, shell commands, background processes), MCP client (JSON-RPC over stdio), child processes with pipes |
 | `src/agent.c` | terminal agent: conversation, approvals, safe / autonomous modes (talks to the server in-process) |
@@ -1224,7 +1238,8 @@ Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
 - The server handles one request at a time and the others wait in a queue, because the context and
   the expert cache are shared.
 - Web interface conversations live in the browser's `localStorage`.
-- LFM3-Audio: WAV files only (no MP3 / Opus). The model's own spoken answers are English only;
+- LFM3-Audio: speech comes in as WAV only (no MP3 / Opus / WebM input) and goes out as WAV, PCM or
+  MP3; one audio request at a time (others wait). The model's own spoken answers are English only;
   other languages go through transcription and speech synthesis. In a spoken conversation the
   model hears the last three exchanges again at each turn (their audio is not kept in the prompt
   cache). No vision models.
