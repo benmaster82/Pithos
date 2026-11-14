@@ -38,6 +38,11 @@ int think_parse(const char *s, int *budget);
 const char *think_close(void);
 /* The assistant turn opening with the reasoning off (lfm3: the LFM3 architecture). */
 const char *think_off_prompt(int lfm3);
+/* Whether the model's chat template opens and closes reasoning blocks. LFM3-Audio's has no
+ * enable_thinking switch and writes no blocks: its turns start plainly, past ones have no empty
+ * <think></think>, and an answer written after "<think>\n</think>\n" often ends with a second
+ * </think> and the answer again. */
+int template_reasons(const Model *m);
 
 /* Serves until the process is terminated. Returns non-zero if the socket cannot be opened. */
 int server_run(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *tk, PCache *pc);

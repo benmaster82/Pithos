@@ -727,9 +727,11 @@ static int chat_turn(Engine *e, const char *user, int first) {
     free(p.s);
     CtxSnapshot snap;
     ctx_snapshot(e->ctx, &snap);
-    /* after audio, the generation prompt of LFM3-Audio's template: no reasoning block */
-    const int think = e->a->think_budget != THINK_OFF && !heard;
-    if (!feed_text(e, heard ? "<|im_start|>assistant\n"
+    /* after audio, or for a template without reasoning blocks, the generation prompt of
+     * LFM3-Audio's template: no reasoning block */
+    const int plain = heard || !template_reasons(e->m);
+    const int think = e->a->think_budget != THINK_OFF && !plain;
+    if (!feed_text(e, plain ? "<|im_start|>assistant\n"
                             : think ? "<|im_start|>assistant\n<think>" : think_off_prompt(!strcmp(e->m->arch, "lfm3")))) {
         ctx_snapshot_free(&snap);
         return 0;
@@ -761,7 +763,7 @@ static int chat_turn(Engine *e, const char *user, int first) {
         ctx_restore(e->ctx, &snap);
         Str a = { 0 };
         str_add(&a, "<|im_start|>assistant\n", -1);
-        if (!strcmp(e->m->arch, "lfm3")) str_add(&a, "<think></think>", -1); /* its template marks the dropped thinking */
+        if (!strcmp(e->m->arch, "lfm3") && template_reasons(e->m)) str_add(&a, "<think></think>", -1); /* its template marks the dropped thinking */
         str_add(&a, content, -1);
         str_add(&a, "<|im_end|>\n", -1);
         double t0 = e->t_prompt;
@@ -1034,6 +1036,8 @@ static int real_main(int argc, char **argv) {
     {
         int sp[4];
         sampler_ban(&e.smp, sp, tok_speech_ids(tk, sp));
+        const int th[2] = { e.tok_think_start, e.tok_think_end };
+        if (a.think_budget == THINK_OFF && !template_reasons(&m)) sampler_ban(&e.smp, th, 2);   /* no reasoning of its own */
     }
     Audio *au = NULL;
     char mp[1024];

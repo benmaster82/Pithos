@@ -64,6 +64,7 @@ typedef struct {
     PithosLock *lock;
     int t_im_end, t_eot, t_eos, t_think_end, t_tc_start, t_tc_end;
     int lfm3;                   /* LFM3 template: XML tool calls, <tools> block, <think></think> on past turns */
+    int reasons;                /* template_reasons: 0 for LFM3-Audio (no reasoning blocks) */
     int t_audio, t_think_start, t_audio_out, t_text_end, t_mixed_start, t_audio_start;
     /* Audio of the request being rendered, under the lock (audio_begin / audio_end): render_content
      * turns input_audio parts into clips and toks_text each <|audio|> into the clip's token ids
@@ -675,7 +676,7 @@ static int render_assistant_lfm3(Buf *b, const Json *m, int keep, char *err, int
         if (th->t == J_STR) buf_add(b, th->s, th->len);
         else if (truthy(th)) json_write(b, th);
         buf_add(b, "</think>", -1);
-    } else if (keep && !(content && content->t == J_STR && find_in(content->s, content->len, "</think>"))) {
+    } else if (keep && S.reasons && !(content && content->t == J_STR && find_in(content->s, content->len, "</think>"))) {
         buf_add(b, "<think></think>", -1);
     }
     const char *cs = cb.s;
@@ -689,7 +690,7 @@ static int render_assistant_lfm3(Buf *b, const Json *m, int keep, char *err, int
             cs = last + 8;
             trim_view(&cs, &cn);
         }
-        buf_add(b, "<think></think>", -1);
+        if (S.reasons) buf_add(b, "<think></think>", -1);
     }
     const int has_cfm = cn >= ncfm && !memcmp(cs + cn - ncfm, cfm, (size_t)ncfm);
     if (has_cfm) cn -= ncfm;
@@ -778,9 +779,11 @@ static int render_chat(const Json *messages, const Json *tools, int preserve_thi
     }
     if (nb == cap) { cap++; *bounds = (int *)realloc(*bounds, sizeof(int) * (size_t)cap); }
     (*bounds)[nb++] = out->n;
-    /* after audio, the generation prompt of LFM3-Audio's template (the model may open <think> itself) */
+    /* after audio, or for a template without reasoning blocks, the plain generation prompt of
+     * LFM3-Audio's template (the model may open <think> itself) */
     const char *gp = t_voice ? "<|im_start|>assistant\n<|mixed_start|>"
-                     : t_collect && S.n_clips ? "<|im_start|>assistant\n" : think ? "<|im_start|>assistant\n<think>" : think_off_prompt(S.lfm3);
+                     : !S.reasons || (t_collect && S.n_clips) ? "<|im_start|>assistant\n"
+                     : think ? "<|im_start|>assistant\n<think>" : think_off_prompt(S.lfm3);
     toks_text(out, gp, -1);
     if (text) buf_add(text, gp, -1);
     *nbounds = nb;
@@ -1075,6 +1078,13 @@ const char *think_off_prompt(int lfm3) {
     return lfm3 ? "<|im_start|>assistant\n<think>\n</think>\n" : "<|im_start|>assistant\n<think></think>";
 }
 
+int template_reasons(const Model *m) {
+    if (strcmp(m->arch, "lfm3")) return 1;   /* LFM2.5: no switch in the template, but it reasons */
+    uint64_t tl;
+    const char *tpl = gguf_get_str(&m->gguf, "tokenizer.chat_template", &tl);
+    return !tpl || find_in(tpl, (int)tl, "enable_thinking") != NULL;
+}
+
 /* Closing with a sentence (the budget-forcing one from Qwen3) or with a bare </think> measured the
  * same on MATH; the sentence gives the answer a cleaner start. */
 const char *think_close(void) {
@@ -1312,6 +1322,10 @@ static void generate(Gen *g, float *lg, const Toks *prompt) {
     sampler_init(&smp, &g->sp, S.m->n_vocab);
     int sp[4];
     sampler_ban(&smp, sp, tok_speech_ids(S.tk, sp));
+    if (g->chat && !S.reasons && g->think_budget == THINK_OFF) {   /* no reasoning of its own */
+        const int th[2] = { S.t_think_start, S.t_think_end };
+        sampler_ban(&smp, th, 2);
+    }
     int from = prompt->n > g->sp.repeat_last_n ? prompt->n - g->sp.repeat_last_n : 0;
     for (int i = from; i < prompt->n; i++) sampler_accept(&smp, prompt->v[i]);
     double t0 = time_sec();
@@ -1672,7 +1686,7 @@ static void handle_chat(Conn *c, const Json *body) {
         return;
     }
     g.n_prompt = t.n;
-    if (audio || voice) {
+    if (audio || voice || !S.reasons) {
         g.state = ST_CONTENT;
         g.skip_ws = 1;
     }
@@ -2253,6 +2267,7 @@ void server_attach(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *t
     S.t_mixed_start = tok_find(tk, "<|mixed_start|>");
     S.t_audio_start = tok_find(tk, "<|audio_start|>");
     S.lfm3 = !strcmp(m->arch, "lfm3");
+    S.reasons = template_reasons(m);
     S.t_tc_start = tok_find(tk, S.lfm3 ? "<tool_call>" : "<|tool_call_start|>");
     S.t_tc_end = tok_find(tk, S.lfm3 ? "</tool_call>" : "<|tool_call_end|>");
     S.rng = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ull | 1;
