@@ -116,7 +116,7 @@ prompt 328 tok/s, generation 82 (Direct3D 12: 336 / 70).
 - [ ] **Live ASR** (`Perform live ASR.`, English, ~1 s chunks): captions while the user speaks.
 
 ## Done
-- LFM3-Audio-2B (not released yet): speech input (`--audio`, `input_audio` parts,
+- v0.7.0: LFM3-Audio-2B, speech input (`--audio`, `input_audio` parts,
   `/v1/audio/transcriptions` and `translations`), speech output (`--tts`, `/v1/audio/speech` in
   WAV, PCM or MP3, streamed), spoken answers in English, dictation and voice mode in Pandora, the
   `/talk` page; `build.sh --download-model=lfm3-audio-2b` fetches the model and its projector.
