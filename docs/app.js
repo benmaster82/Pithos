@@ -20,11 +20,21 @@ const MODELS = {
     hash:'3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4',
     download:'1.1 GB',ram:'4',gpu:'~80 tok/s',cpu:'~20 tok/s',
     disk:'At least 2 GB free for the model',diskDetail:'About 1.1 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
-    blurb:'1.7 billion parameters with sliding-window attention. Quick answers on modest hardware; the whole model fits in a 4 GB GPU.'}
+    blurb:'1.7 billion parameters with sliding-window attention. Quick answers on modest hardware; the whole model fits in a 4 GB GPU.'},
+  audio:{id:'lfm3-audio-2b',name:'LFM3-Audio-2B',file:'LFM3-Audio-2B-Q4_K_M.gguf',
+    url:'https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF/resolve/39670cb5c42e9c4bfe046519ba7ffbe47f9552ad/LFM3-Audio-2B-Q4_K_M.gguf',
+    hash:'9a773289bd321ed879cd3a76545f6aca506e403851a45fb315420aee45625be2',
+    projector:{file:'mmproj-LFM3-Audio-2B-Q4_K_M.gguf',download:'172 MB',
+      url:'https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF/resolve/39670cb5c42e9c4bfe046519ba7ffbe47f9552ad/mmproj-LFM3-Audio-2B-Q4_K_M.gguf',
+      hash:'1a3a895160aad17c1f52117a6ee4cea8e68988651ea5a33c5b990539e8eae81d'},
+    download:'1.3 GB',ram:'4',gpu:'2.7× real time',cpu:'~1× real time',cpuBench:'speech output',
+    disk:'At least 2 GB free for the model',diskDetail:'About 1.3 GB to download: the model and its audio projector. Allow extra room for the compiler and, if used, Ubuntu.',
+    blurb:'LFM3 with ears and a voice (experimental): transcription and translation in 18 languages, speech output, and voice conversations on the /talk page.'}
 };
 // " -m models/FILE" for a model that is not the engine's default
 const modelArg = (m, windows) => m === MODELS.big ? '' : windows ? ` -m models\\${m.file}` : ` -m models/${m.file}`;
 const downloadFlag = m => m === MODELS.big ? '--download-model' : `--download-model=${m.id}`;
+const talkNote = m => m.projector ? ' Voice conversations: http://127.0.0.1:8080/talk (the browser asks for the microphone).' : '';
 const icon = name => `<svg class="icon" aria-hidden="true"><use href="#i-${name}"/></svg>`;
 const escapeHTML = value => value.replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
 const external = (url, label) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${label} ${icon('external')}</a>`;
@@ -40,14 +50,15 @@ const buildGuide = m => ({
         command:'pacman -S mingw-w64-ucrt-x86_64-gcc', context:'MSYS2 UCRT64 · not PowerShell',
         note:'Already have MSYS2 GCC or Visual Studio/Build Tools MSVC? Skip to step 2. WSL2 is not needed.'},
       {title:'Set up Pithos and its model.', label:'02 / PROGRAM + MODEL',
-        description:`<p><strong>1.</strong> Download and extract the project ZIP. Open <strong>Pithos-main</strong>, type <code>powershell</code> in the address bar, and press Enter.</p><p><strong>2.</strong> Run the commands below. Then download the model and move <strong>${m.file}</strong> into the <strong>models</strong> folder you just created.</p>`,
+        description:`<p><strong>1.</strong> Download and extract the project ZIP. Open <strong>Pithos-main</strong>, type <code>powershell</code> in the address bar, and press Enter.</p><p><strong>2.</strong> Run the commands below. Then download the model and move <strong>${m.file}</strong>${m.projector?` and its audio projector <strong>${m.projector.file}</strong>`:''} into the <strong>models</strong> folder you just created.</p>`,
         command:'.\\build.cmd\nNew-Item -ItemType Directory -Force models', context:'PowerShell · inside Pithos-main',
-        actions:[{url:`${REPO}/archive/refs/heads/main.zip`,label:'Project · ZIP'},{url:m.url,label:`Model · about ${m.download}`}],
+        actions:[{url:`${REPO}/archive/refs/heads/main.zip`,label:'Project · ZIP'},{url:m.url,label:`Model · about ${m.projector?'1.1 GB':m.download}`},
+          ...(m.projector?[{url:m.projector.url,label:`Audio projector · ${m.projector.download}`}]:[])],
         note:'Wait for “ok: build\\pithos.exe”. Use the exact GGUF model listed here; other files may not be compatible. The download can take a while.', checkHash:true},
       {title:'Open your first chat.', label:'03 / ALMOST THERE',
         description:'<p>Stay in the project folder in PowerShell. Start Pithos with this command and <strong>keep the terminal open</strong>.</p><p>When the server is ready, open the local address below in your browser.</p>',
         command:`.\\build\\pithos.exe${modelArg(m, true)} --server`, context:'PowerShell · inside Pithos-main', localLink:true,
-        note:'A compatible GPU is used automatically; add --cpu to stay on the CPU. Press Ctrl+C to stop the program. To open it tomorrow, repeat just this step.'}
+        note:`A compatible GPU is used automatically; add --cpu to stay on the CPU.${talkNote(m)} Press Ctrl+C to stop the program. To open it tomorrow, repeat just this step.`}
     ]
   },
   linux: {
@@ -64,7 +75,7 @@ const buildGuide = m => ({
       {title:'Your chat is one step away.',label:'03 / OPEN PANDORA',
         description:'<p>Run this command from the Pithos folder. It starts the local server. <strong>Keep the terminal open</strong> and open the address in your browser.</p>',
         command:`./build/pithos${modelArg(m, false)} --server`,context:'Linux terminal · inside Pithos',localLink:true,
-        note:'The chat runs on your computer; a compatible GPU is used automatically (--cpu stays on the CPU). Press Ctrl+C to stop it. Next time, repeat only this step.'}
+        note:`The chat runs on your computer; a compatible GPU is used automatically (--cpu stays on the CPU).${talkNote(m)} Press Ctrl+C to stop it. Next time, repeat only this step.`}
     ]
   },
   wsl:{
@@ -81,7 +92,7 @@ const buildGuide = m => ({
       {title:'Open your Windows browser.',label:'03 / OPEN PANDORA',
         description:'<p>Start the server from the Pithos folder in the Ubuntu terminal. Open the local address in your usual <strong>Windows browser</strong>. Keep Ubuntu open.</p>',
         command:`./build/pithos${modelArg(m, false)} --server --cpu`,context:'Ubuntu terminal · inside Pithos',localLink:true,
-        note:'This guide uses the CPU. OpenCL GPU acceleration in WSL was not verified. Press Ctrl+C in the Ubuntu terminal to stop the program.'}
+        note:`This guide uses the CPU. OpenCL GPU acceleration in WSL was not verified.${talkNote(m)} Press Ctrl+C in the Ubuntu terminal to stop the program.`}
     ]
   }
 });
@@ -100,6 +111,14 @@ try {
 let activeMode='browser';
 const saveState=()=>{try{localStorage.setItem('pithos-guide-v1',JSON.stringify(state));}catch{}};
 
+// The SHA-256 check of the downloaded files (the model, and the audio projector if it has one)
+const hashCheck = m => {
+  const files=[m,...(m.projector?[m.projector]:[])];
+  const command=files.map(f=>`(Get-FileHash .\\models\\${f.file} -Algorithm SHA256).Hash`).join('\n');
+  const expected=files.map(f=>`<code>${f.hash.toUpperCase()}</code>`).join('');
+  return `<details class="model-check"><summary>How to verify the downloaded ${files.length>1?'files':'model'}</summary><p>Run ${files.length>1?'these commands':'this command'} from the project folder. The result must match the expected ${files.length>1?'values, in the same order':'value'} below.</p>${commandBlock(command,'PowerShell','hash-code')}<p>Expected SHA-256:</p>${expected}</details>`;
+};
+
 function renderGuide() {
   const model=MODELS[state.model], guide=buildGuide(model);
   const step=guide[state.os].steps[state.step];
@@ -117,7 +136,7 @@ function renderGuide() {
   });
   const panel=document.querySelector('#guide-panel');
   panel.setAttribute('aria-labelledby',`os-${state.os}`);
-  panel.innerHTML=`<span class="step-label">${step.label}</span><h3 class="step-title" tabindex="-1">${step.title}</h3><div class="step-description">${step.description}</div>${step.actions?`<div class="step-actions">${step.actions.map(action=>external(action.url,action.label)).join('')}</div>`:''}${commandBlock(step.command,step.context)}${step.localLink?`<div class="step-actions"><a href="http://127.0.0.1:8080" target="_blank" rel="noopener noreferrer">Open the chat on your PC ${icon('external')}</a></div>`:''}${note(step.note)}${step.checkHash?`<details class="model-check"><summary>How to verify the downloaded model</summary><p>Run this command from the project folder. The result must match the expected value below.</p>${commandBlock(`(Get-FileHash .\\models\\${model.file} -Algorithm SHA256).Hash`,'PowerShell','hash-code')}<p>Expected SHA-256:</p><code>${model.hash.toUpperCase()}</code></details>`:''}${state.step===2&&state.done[state.os].includes(2)?'<div class="guide-finished"><strong>Chat open? Enjoy your workspace!</strong>Next time, just start Pithos from its folder. No new download is needed.</div>':''}`;
+  panel.innerHTML=`<span class="step-label">${step.label}</span><h3 class="step-title" tabindex="-1">${step.title}</h3><div class="step-description">${step.description}</div>${step.actions?`<div class="step-actions">${step.actions.map(action=>external(action.url,action.label)).join('')}</div>`:''}${commandBlock(step.command,step.context)}${step.localLink?`<div class="step-actions"><a href="http://127.0.0.1:8080" target="_blank" rel="noopener noreferrer">Open the chat on your PC ${icon('external')}</a></div>`:''}${note(step.note)}${step.checkHash?hashCheck(model):''}${state.step===2&&state.done[state.os].includes(2)?'<div class="guide-finished"><strong>Chat open? Enjoy your workspace!</strong>Next time, just start Pithos from its folder. No new download is needed.</div>':''}`;
   document.querySelector('#guide-back').disabled=state.step===0;
   document.querySelector('#guide-next').innerHTML=(state.step===2?'I have opened the chat':'I have completed this step')+icon(state.step===2?'check':'arrow');
   saveState();
@@ -164,7 +183,7 @@ function renderMode() {
     browser:{title:'Your browser becomes your chat.',description:'After setup, start the server and open the local address. Keep the terminal open while you chat.',command:`${binary} --server${cpu}`,followup:'Then open http://127.0.0.1:8080 in your browser.',shot:'pandora'},
     terminal:{title:'Ask and answer, right in your terminal.',description:'Start a text conversation in the terminal. For a single answer, use -p followed by your question.',command:`${binary}${cpu}`,followup:'Press Ctrl+C to end the session.',shot:'terminal'},
     agent:{title:'Practical help for your projects.',description:'The agent can work with files and commands. In safe mode, you approve actions. For another project, set the model path with -m. The README has examples.',command:`${binary} --agent${cpu}`,followup:'The agent works in the folder where you start it.',shot:'terminal'},
-    api:{title:'Connect an application to the engine.',description:'Use /v1/chat/completions or /v1/completions through the local HTTP server. These are OpenAI-compatible inference endpoints; the engine processes one inference request at a time.',command:`${binary} --server${cpu}`,followup:'API base URL: http://127.0.0.1:8080/v1',shot:'pandora'}
+    api:{title:'Connect an application to the engine.',description:`Use /v1/chat/completions or /v1/completions through the local HTTP server.${MODELS[state.model].projector?' With LFM3-Audio, also /v1/audio/transcriptions, /v1/audio/translations and /v1/audio/speech.':''} These are OpenAI-compatible inference endpoints; the engine processes one inference request at a time.`,command:`${binary} --server${cpu}`,followup:'API base URL: http://127.0.0.1:8080/v1',shot:'pandora'}
   }[activeMode];
   document.querySelectorAll('[data-mode]').forEach(button=>{const selected=button.dataset.mode===activeMode;button.classList.toggle('is-selected',selected);button.setAttribute('aria-selected',String(selected));button.tabIndex=selected?0:-1;});
   document.querySelector('#mode-panel').setAttribute('aria-labelledby',`mode-${activeMode}`);

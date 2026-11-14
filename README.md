@@ -4,14 +4,17 @@
 
 <p align="center">
   <b>A dependency-free C inference engine for Liquid AI's LFM2 / LFM2.5 / LFM3 models.</b><br>
-  Terminal chat, an OpenAI-compatible server, a web agent and a terminal agent, all in one executable.
+  Terminal chat, an OpenAI-compatible server, a web agent, a terminal agent and a voice, all in one executable.
 </p>
 
 <p align="center">
+  <a href="https://github.com/benmaster82/Pithos/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/benmaster82/Pithos?label=release&color=3b82f6"></a>
   <img alt="C11, no dependencies" src="https://img.shields.io/badge/C11-no%20dependencies-7c5cf6">
   <img alt="Windows, Linux, macOS" src="https://img.shields.io/badge/Windows%20%7C%20Linux%20%7C%20macOS-x86--64%20%26%20ARM64-ec5c8c">
   <img alt="Xbox One in Developer Mode" src="https://img.shields.io/badge/Xbox%20One-Developer%20Mode-107c10">
   <img alt="GPU: OpenCL, Direct3D 12 or Vulkan, optional" src="https://img.shields.io/badge/GPU-OpenCL%20%7C%20Direct3D%2012%20%7C%20Vulkan%2C%20optional-f5a05a">
+  <a href="#lfm3-audio-2b-speech-input-and-output-experimental"><img alt="Speech in and out with LFM3-Audio" src="https://img.shields.io/badge/speech-LFM3--Audio%20in%20%26%20out-14b8a6"></a>
+  <a href="#server-and-web-chat"><img alt="OpenAI-compatible API: chat and audio" src="https://img.shields.io/badge/API-OpenAI--compatible%20chat%20%26%20audio-6b7280"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-2ea043"></a>
 </p>
 
@@ -21,6 +24,7 @@
   <a href="#screenshots">Screenshots</a> ·
   <a href="#results">Results</a> ·
   <a href="#terminal-agent">Terminal agent</a> ·
+  <a href="#lfm3-audio-2b-speech-input-and-output-experimental">Speech</a> ·
   <a href="#xbox-one">Xbox One</a> ·
   <a href="#adding-mcp-servers">MCP</a> ·
   <a href="ROADMAP.md">Roadmap</a>
@@ -31,6 +35,7 @@
 | **About 1.9× faster than llama.cpp** | 17–22 tok/s against 11 tok/s with CUDA, on the same laptop and model ([head-to-head](#head-to-head-with-llamacpp-v04-2026-10-24)) |
 | **Runs a 13.5 GB model on 16 GB of RAM** | experts stream from disk, the hot ones live in a 4 GB GPU |
 | **Agents included** | Pandora in the browser, and a terminal agent that runs commands, fixes code and checks its own work |
+| **Hears and speaks** | with LFM3-Audio-2B: transcription and translation in 18 languages, streamed speech (WAV, PCM, MP3) and voice conversations on the `/talk` page ([speech](#lfm3-audio-2b-speech-input-and-output-experimental)) |
 | **Runs on an Xbox One** | an OpenAI-compatible server for your home network, with LFM3-1.7B on the console's GPU: 29.5 tok/s generation, ~140 tok/s prompt ([Xbox One](#xbox-one)) |
 
 Pithos is an inference engine written from scratch in C11 with **no dependencies**: no external
@@ -40,6 +45,8 @@ Liquid AI's LFM2 / LFM2-MoE / LFM3 architectures and is tuned for `LFM2.5-24B-A2
 are validated too: [LFM2.5-8B-A1B](#lfm25-8b-a1b-the-middle-ground), a mixture of experts that fits
 in 8 GB of RAM (about 22 tokens per second on the CPU alone), and the small
 [LFM3-1.7B](#lfm3-17b-small-and-fast): about 80 tokens per second with the GPU, 20 on the CPU alone.
+[LFM3-Audio-2B](#lfm3-audio-2b-speech-input-and-output-experimental) (experimental) adds speech: it
+transcribes, translates, speaks and holds voice conversations.
 
 **Pithos** is the engine and the server (in the myth, the *pithos* is Pandora's jar: it holds the
 model). **Pandora** is the agent in the web interface.
@@ -58,6 +65,9 @@ model). **Pandora** is the agent in the web interface.
   on the TV.
 - Works with models larger than the free RAM (asynchronous read-ahead, expert prediction).
 - OpenAI-compatible HTTP server with prompt reuse across turns, also after a restart.
+- **Speech** with LFM3-Audio-2B: `/v1/audio/transcriptions`, `/v1/audio/translations` and
+  `/v1/audio/speech` (WAV, PCM or MP3, streamed), spoken answers, dictation and a voice mode in
+  Pandora, and the `/talk` page for voice conversations.
 - [Reasoning levels](#server-and-web-chat): high, medium, low or off, from the command line,
   the API or a selector in Pandora.
 - **Pandora**, a single-file web chat with an agent mode: web search, files, calculator and any

@@ -26,10 +26,10 @@
   <link rel="stylesheet" href="engine.css">
   <link rel="stylesheet" href="simple.css">
   <link rel="stylesheet" href="effects.css?v=2">
-  <link rel="stylesheet" href="models.css?v=2">
+  <link rel="stylesheet" href="models.css?v=3">
   <link rel="stylesheet" href="speech.css?v=1">
   <link rel="stylesheet" href="top.css?v=2">
-  <script src="app.js?v=5" defer></script>
+  <script src="app.js?v=6" defer></script>
   <script src="mascot.js?v=1" defer></script>
 </head>
 <body>
@@ -61,9 +61,9 @@
   <main id="main">
     <section class="hero wrap" aria-labelledby="hero-title">
       <div class="hero-copy">
-        <div class="eyebrow">C11 inference engine · LFM2 · LFM2.5 · LFM3</div>
+        <div class="eyebrow">C11 inference engine · LFM2 · LFM2.5 · LFM3 · LFM3-Audio</div>
         <h1 id="hero-title">Local inference for Liquid AI models. <em>On the hardware you have.</em></h1>
-        <p class="hero-description">Pithos runs LFM2, LFM2.5 and LFM3 GGUF models on an ordinary laptop: SIMD kernels on the CPU, optional acceleration through OpenCL, Vulkan or Direct3D 12. Written in C11 with no dependencies; the chat, the OpenAI-compatible server and the agent share one engine.</p>
+        <p class="hero-description">Pithos runs LFM2, LFM2.5 and LFM3 GGUF models on an ordinary laptop: SIMD kernels on the CPU, optional acceleration through OpenCL, Vulkan or Direct3D 12. Written in C11 with no dependencies; the chat, the OpenAI-compatible server and the agent share one engine. With LFM3-Audio it also hears and speaks: transcription, speech and voice conversations.</p>
         <dl class="hero-figures">
           <div><dt><span data-to="22">22</span> tok/s</dt><dd>LFM2.5-8B, laptop CPU only</dd></div>
           <div><dt><span data-to="270">270</span> tok/s</dt><dd>LFM2.5-8B prompt, 4 GB GPU</dd></div>
@@ -74,11 +74,12 @@
       </div>
       <div class="hero-visual model-hero">
         <div class="terminal-stage">
-          <div class="terminal-stage-header"><span class="terminal-path" id="model-picker-title">Choose your model</span><span>VALIDATED · GGUF Q4_K_M</span></div>
+          <div class="terminal-stage-header"><span class="terminal-path" id="model-picker-title">Choose your model</span><span>GGUF Q4_K_M</span></div>
           <div class="model-tabs" role="tablist" aria-labelledby="model-picker-title">
             <button id="model-big" role="tab" data-model="big" aria-selected="true" aria-controls="model-card"><strong>LFM2.5-24B-A2B</strong><span>The reference · MoE</span></button>
             <button id="model-mid" role="tab" data-model="mid" aria-selected="false" aria-controls="model-card" tabindex="-1"><strong>LFM2.5-8B-A1B</strong><span>Fits in 8 GB · MoE</span></button>
             <button id="model-small" role="tab" data-model="small" aria-selected="false" aria-controls="model-card" tabindex="-1"><strong>LFM3-1.7B</strong><span>Small and fast · dense</span></button>
+            <button id="model-audio" role="tab" data-model="audio" aria-selected="false" aria-controls="model-card" tabindex="-1"><strong>LFM3-Audio-2B</strong><span>Hears and speaks · new</span></button>
           </div>
           <div id="model-card" class="model-card" role="tabpanel" aria-labelledby="model-big">
             <dl class="model-stats">
@@ -90,7 +91,7 @@
             <p class="model-blurb" id="model-blurb">24 billion parameters, about 2 billion active per token. The deepest answers; runs from disk when RAM is short.</p>
           </div>
           <div class="terminal-launch"><div class="terminal-launch-label"><span>START COMMAND</span><span id="hero-context">WINDOWS / NATIVE</span></div><div class="terminal-command"><span id="hero-prompt" aria-hidden="true">PS&gt;</span><code id="hero-code">.\build\pithos.exe --server</code><button class="copy-button icon-only" data-copy-target="hero-code" aria-label="Copy the startup command"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg></button></div></div>
-          <p class="model-foot">Speeds of real generation on a laptop: Core i5-10500H, 16 GB, GTX 1650 4 GB. The benchmark repeats one short context, so the experts it needs stay in RAM. The setup guide below follows your choice.</p>
+          <p class="model-foot">Speeds of real generation on a laptop: Core i5-10500H, 16 GB, GTX 1650 4 GB; for LFM3-Audio, speech generated against its duration. The benchmark repeats one short context, so the experts it needs stay in RAM. The setup guide below follows your choice.</p>
         </div>
       </div>
     </section>
