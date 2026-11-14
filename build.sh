@@ -15,7 +15,9 @@ If prerequisites are missing, show the package commands and ask before installin
   --download-model[=ID[,ID...]]
                  Download/verify models in models/: by default the reference 24B
                  (13.5 GiB); --download-model=lfm2.5-8b the 8B MoE (4.8 GiB),
-                 --download-model=lfm3-1.7b the small one (1.0 GiB)
+                 --download-model=lfm3-1.7b the small one (1.0 GiB),
+                 --download-model=lfm3-audio-2b the speech model (1.2 GiB, with
+                 its audio projector)
   --list-models  List the downloadable models (models.tsv) and exit without building
   --native       Optimize for this CPU; do not use for distributable binaries
   --jobs N       Parallel build jobs, 1-256 (default: detected CPU count, max 256)
@@ -97,7 +99,9 @@ load_catalog() {
         for ((i = 0; i < ${#cat_id[@]}; i++)); do
             [[ ${cat_id[i]} != "$id" && ${cat_file[i]} != "$file" ]] || die "models.tsv line $n: duplicate id or file name."
         done
-        if ((default_model < 0)) && [[ $status == validated ]]; then default_model=${#cat_id[@]}; fi
+        if [[ $id == *.mmproj ]]; then
+            [[ $(model_index "${id%.mmproj}") -ge 0 ]] || die "models.tsv line $n: the projector $id comes after its model ${id%.mmproj}."
+        elif ((default_model < 0)) && [[ $status == validated ]]; then default_model=${#cat_id[@]}; fi
         cat_id+=("$id") cat_file+=("$file") cat_bytes+=("$bytes") cat_sha+=("$sha")
         cat_status+=("$status") cat_ram+=("$ram") cat_url+=("$url") cat_desc+=("$desc")
     done < "$catalog"
@@ -125,12 +129,12 @@ format_size() {
 
 list_catalog() {
     local i mark
-    printf '%-12s %-9s %-7s %-12s %s\n' ID SIZE RAM STATUS DESCRIPTION
+    printf '%-20s %-9s %-7s %-12s %s\n' ID SIZE RAM STATUS DESCRIPTION
     for ((i = 0; i < ${#cat_id[@]}; i++)); do
         mark=
         ((i != default_model)) || mark=' (default)'
         [[ ! -f $repo/models/${cat_file[i]} ]] || mark+=' [in models/]'
-        printf '%-12s %-9s %-7s %-12s %s%s\n' "${cat_id[i]}" "$(format_size "${cat_bytes[i]}")" "${cat_ram[i]} GB" \
+        printf '%-20s %-9s %-7s %-12s %s%s\n' "${cat_id[i]}" "$(format_size "${cat_bytes[i]}")" "${cat_ram[i]} GB" \
             "${cat_status[i]}" "${cat_desc[i]}" "$mark"
     done
     printf '\nDownload: bash build.sh --download-model=ID[,ID...]   (plain --download-model: %s)\n' "${cat_id[default_model]}"
@@ -149,6 +153,9 @@ if ((list_models || download_model)); then
                 index=$(model_index "$want")
                 ((index >= 0)) || option_error "Unknown model: $want. Run bash build.sh --list-models."
                 [[ " ${selected[*]} " == *" $index "* ]] || selected+=("$index")
+                # the model's projector (ID.mmproj: the audio part of LFM3-Audio) comes along
+                index=$(model_index "$want.mmproj")
+                ((index < 0)) || [[ " ${selected[*]} " == *" $index "* ]] || selected+=("$index")
             done
             ((${#selected[@]})) || option_error '--download-model= needs model ids (see --list-models).'
         fi
@@ -378,7 +385,7 @@ print_run_hints() {
     if [[ -f $catalog ]]; then
         load_catalog
         for ((i = 0; i < ${#cat_id[@]}; i++)); do
-            [[ -f $repo/models/${cat_file[i]} ]] || continue
+            [[ -f $repo/models/${cat_file[i]} && ${cat_id[i]} != *.mmproj ]] || continue
             if ((found == 0)); then printf '\nTo start, from the Pithos folder:\n'; fi
             found=1
             if ((i == default_model)); then

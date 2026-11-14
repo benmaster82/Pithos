@@ -107,7 +107,7 @@ ones (Raspberry Pi 3 / 4). Otherwise build from source:
 1. **Get the model** (see [Downloading the model](#downloading-the-model) below).
    On Linux, `bash build.sh --download-model` can handle both the build and this download
    (`--download-model=lfm2.5-8b` or `--download-model=lfm3-1.7b` for the smaller models,
-   `--list-models` for the choices).
+   `--download-model=lfm3-audio-2b` for the speech model, `--list-models` for the choices).
 2. **Build.** On Windows run `build.cmd`; on Linux run `bash build.sh`; on macOS run `make`
    (see [Building](#building)). You can compile before downloading the model.
 3. **Run.**
@@ -132,6 +132,10 @@ Three models are validated. Choose by the memory of your computer:
 | [LFM2.5-24B-A2B](#downloading-the-model) (the reference, MoE) | 13.5 GiB | 16 GB | the deepest answers; it also runs when the model does not fit in RAM, from disk |
 | [LFM2.5-8B-A1B](#lfm25-8b-a1b-the-middle-ground) (MoE) | 4.8 GiB | 8 GB | a larger model on the CPU: it fits in RAM and generates as fast as LFM3-1.7B there |
 | [LFM3-1.7B](#lfm3-17b-small-and-fast) (dense) | 1.0 GiB | 4 GB | modest hardware, the fastest with a GPU (the whole model in VRAM), the Xbox One |
+
+For speech, [LFM3-Audio-2B](#lfm3-audio-2b-speech-input-and-output-experimental) (experimental,
+1.2 GiB with its audio projector, 4 GB of RAM) transcribes, translates, speaks and holds voice
+conversations.
 
 Pithos uses by default the file **`LFM2.5-24B-A2B-Q4_K_M.gguf`** from Liquid AI's public repository
 [LiquidAI/LFM2.5-24B-A2B-GGUF](https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF). No account
@@ -270,7 +274,18 @@ transcribes speech, answers questions about it or translates it, reads text alou
 male voice, and holds spoken conversations: [Pandora's voice page](#voice-conversation-talk) at
 `/talk`. Two files are
 needed: the model, whose text part is the same architecture as LFM3-1.7B and runs on the same GPU
-paths, and its audio projector (`mmproj-...`), which Pithos looks for next to the model.
+paths, and its audio projector (`mmproj-...`), which Pithos looks for next to the model (the
+table below has their sizes and SHA-256). On Linux `bash build.sh --download-model=lfm3-audio-2b`
+downloads and verifies both; elsewhere:
+
+```powershell
+curl.exe -L -C - -o models\LFM3-Audio-2B-Q4_K_M.gguf https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF/resolve/main/LFM3-Audio-2B-Q4_K_M.gguf
+curl.exe -L -C - -o models\mmproj-LFM3-Audio-2B-Q4_K_M.gguf https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF/resolve/main/mmproj-LFM3-Audio-2B-Q4_K_M.gguf
+server.cmd -m models\LFM3-Audio-2B-Q4_K_M.gguf     # Pandora with a microphone, /talk for voice conversations
+```
+
+(`curl` instead of `curl.exe` and `/` in the paths on Linux and macOS.) Once the server runs, the
+chat, the microphone and the voice page work in the browser; the command line:
 
 ```
 build\pithos.exe -m models\LFM3-Audio-2B-Q4_K_M.gguf --audio speech.wav -s "Perform ASR in English."
@@ -281,8 +296,8 @@ build\pithos.exe -m models\LFM3-Audio-2B-Q4_K_M.gguf --audio speech.wav -p "What
 These are the system prompts of the model card: `-s "Perform ASR."` lets the model detect the
 language; for questions the card suggests `-s "Answer questions about the provided audio clip.
 Base every answer only on what can be heard."`. Without a system prompt the model would rather
-answer with speech, which Pithos cannot produce yet, so speech output is turned off as the card
-does for text-only answers. With `-i` the audio goes into the first message of the chat. The WAV
+answer with speech, so in text answers its speech tokens are turned off, as the card does for
+text-only answers (spoken answers are below). With `-i` the audio goes into the first message of the chat. The WAV
 can be PCM (8, 16, 24 or 32-bit) or 32-bit float, at any sample rate and with any number of
 channels: Pithos mixes it to mono and resamples it to 16 kHz.
 
@@ -411,6 +426,7 @@ bash build.sh --download-model   # also download/verify the reference 24B model
 bash build.sh --download-model=lfm2.5-8b              # the 8B MoE instead (4.8 GiB)
 bash build.sh --download-model=lfm3-1.7b              # the small model instead (1.0 GiB)
 bash build.sh --download-model=lfm3-1.7b,lfm2.5-24b   # two of them
+bash build.sh --download-model=lfm3-audio-2b          # the speech model and its audio projector (1.2 GiB)
 bash build.sh --no-install       # build without installing anything (offline/CI)
 bash build.sh --yes --test       # allow missing-package installation without prompting
 bash build.sh --native --jobs 4  # optimize for this CPU; not for distributing binaries
@@ -431,7 +447,8 @@ Use `bash build.sh --download-model` (or combine it with `--test`) to fetch the
 listed by `--list-models`. The list lives in **`models.tsv`**: one line per model with its
 file name, exact size, SHA-256, a revision-pinned https URL and a status (`validated` models
 were checked against a reference; `experimental` ones are only downloaded when named).
-Adding a model is one line there. For every model the script pins the Hugging Face revision,
+Adding a model is one line there; a model's projector is the line `ID.mmproj` after it, and it
+is downloaded with the model. For every model the script pins the Hugging Face revision,
 checks free disk space, resumes interrupted transfers in a `.gguf.part` file, and
 verifies the exact size and SHA-256 before renaming it to `.gguf`. An existing valid
 model is verified and reused; an invalid existing model is preserved and reported

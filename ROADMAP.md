@@ -96,7 +96,30 @@ prompt 328 tok/s, generation 82 (Direct3D 12: 336 / 70).
 - [x] **Vulkan by default where it is fastest**: `--gpu auto` on discrete NVIDIA GPUs, for dense
   models.
 
+## 8. Speech (LFM3-Audio)
+- [ ] **Compressed audio in input**: today `input_audio` parts and `/v1/audio/transcriptions` /
+  `translations` take WAV only, while browsers record WebM/Opus, phones M4A (AAC) and many files
+  are MP3. Clients have to convert first. To decode:
+  - **MP3**: a small built-in decoder (public-domain designs such as minimp3 exist), so it works
+    everywhere without libraries.
+  - **WebM/Opus**: a minimal Matroska/WebM demuxer (the audio track only) plus libopus loaded at
+    run time, as libmp3lame is for MP3 output.
+  - **M4A/AAC**: Media Foundation's source reader on Windows (it also covers MP3); elsewhere
+    libavcodec loaded at run time, if present.
+  - Detection by content (the first bytes), not by the file name. Resampling to 16 kHz and the
+    mono mix stay as today.
+- [ ] **Tool calls in spoken answers**: the model card's mode ("Respond with function calls, and
+  interleaved text and audio." and the tools, no prefill): the model starts with `<tool_call>`
+  or `<|mixed_start|>`. Read-only tools first in `/talk`; actions ask for confirmation.
+- [ ] **A separate answer server in `/talk`**: transcription and speech from LFM3-Audio, the
+  answers from a larger model on another Pithos server (a setting of the page).
+- [ ] **Live ASR** (`Perform live ASR.`, English, ~1 s chunks): captions while the user speaks.
+
 ## Done
+- LFM3-Audio-2B (not released yet): speech input (`--audio`, `input_audio` parts,
+  `/v1/audio/transcriptions` and `translations`), speech output (`--tts`, `/v1/audio/speech` in
+  WAV, PCM or MP3, streamed), spoken answers in English, dictation and voice mode in Pandora, the
+  `/talk` page; `build.sh --download-model=lfm3-audio-2b` fetches the model and its projector.
 - Branch `gpu-cli`: one option for the GPU, `--gpu auto|off|vulkan|d3d12|opencl|opencl+vulkan|opencl+d3d12`
   (and `--cpu`), with `--gpu-device N` for every backend and `--list-gpus` listing all three; by
   default LFM3 runs on Vulkan on a discrete NVIDIA GPU (82 tok/s instead of 56). The old options

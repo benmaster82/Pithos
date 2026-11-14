@@ -313,7 +313,8 @@ class BuildScriptTests(unittest.TestCase):
     def test_list_models_reads_the_real_catalog_without_building(self):
         result = self.run_build('--list-models')
         self.assertEqual(result.returncode, 0, result.stderr)
-        for text in ('lfm2.5-24b', 'lfm2.5-8b', 'lfm3-1.7b', '(default)', '13.5 GiB', '4.8 GiB', '1.0 GiB', 'validated'):
+        for text in ('lfm2.5-24b', 'lfm2.5-8b', 'lfm3-1.7b', 'lfm3-audio-2b.mmproj', '(default)', '13.5 GiB', '4.8 GiB',
+                     '1.0 GiB', '164 MiB', 'validated'):
             self.assertIn(text, result.stdout)
         self.assertFalse(self.builds())
         self.assertFalse(self.events('curl'))
@@ -339,6 +340,31 @@ class BuildScriptTests(unittest.TestCase):
         self.assertEqual(len(self.events('curl')), 2)
         self.assertIn('./build/pithos -p "Hello"', result.stdout)
         self.assertFalse(list(self.model.parent.glob('*.lock')))
+
+    def test_projector_comes_along_with_its_model(self):
+        self.configure_download()
+        size, digest = self.rows[0][2], self.rows[0][3]
+        url = 'https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF/resolve/39670cb5c42e9c4bfe046519ba7ffbe47f9552ad/'
+        self.write_catalog(self.rows + [
+            ['lfm3-audio-2b', 'LFM3-Audio-2B-Q4_K_M.gguf', size, digest, 'experimental', '4', url + 'LFM3-Audio-2B-Q4_K_M.gguf', 'audio'],
+            ['lfm3-audio-2b.mmproj', 'mmproj-LFM3-Audio-2B-Q4_K_M.gguf', size, digest, 'experimental', '1', url + 'mmproj-LFM3-Audio-2B-Q4_K_M.gguf', 'its projector']])
+        result = self.run_build('--no-install', '--download-model=lfm3-audio-2b')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        models = self.small.parent
+        self.assertEqual((models / 'LFM3-Audio-2B-Q4_K_M.gguf').read_bytes(), self.payload)
+        self.assertEqual((models / 'mmproj-LFM3-Audio-2B-Q4_K_M.gguf').read_bytes(), self.payload)
+        self.assertEqual(len(self.events('curl')), 2)
+        self.assertIn('-m models/LFM3-Audio-2B-Q4_K_M.gguf', result.stdout)
+        self.assertNotIn('-m models/mmproj-', result.stdout)
+
+    def test_projector_before_its_model_is_a_catalog_error(self):
+        self.configure_download()
+        row = self.rows[1]
+        self.write_catalog([self.rows[0], [row[0] + '.mmproj', 'mmproj-x.gguf'] + row[2:], row])
+        result = self.run_build('--no-install', '--download-model')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('comes after its model', result.stderr)
+        self.assertFalse(self.events('curl'))
 
     def test_unknown_model_is_an_option_error(self):
         self.configure_download()

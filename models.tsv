@@ -10,6 +10,9 @@
 # - ram_gb: RAM for comfortable use (larger models also run from disk, more slowly).
 # - url: https, pinned to a repository revision, so the bytes cannot change under the same name.
 # The first validated line is the default of a plain --download-model.
+# A line with the id ID.mmproj is the projector of model ID (after it) and comes along with it.
 lfm2.5-24b	LFM2.5-24B-A2B-Q4_K_M.gguf	14526258464	d3334405b96228eb9908cdebb5c6194908f2da64282bda852afc3a3910c64e7d	validated	16	https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF/resolve/0912d33141f77e10705345a6732bfd83f0252fdc/LFM2.5-24B-A2B-Q4_K_M.gguf	LFM2.5 24B MoE (2B active): the reference model
 lfm2.5-8b	LFM2.5-8B-A1B-Q4_K_M.gguf	5155564768	4923ec14f06b968b74d663e5949867d2d9c3bf13a20b8be1a9f9af39989b2bb0	validated	8	https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/49c14831707011e64d70b2ebd8462ba08d608434/LFM2.5-8B-A1B-Q4_K_M.gguf	LFM2.5 8B MoE (1.5B active): fast on the CPU, fits in 8 GB
 lfm3-1.7b	LFM3-1.7B-Q4_K_M.gguf	1099627808	3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4	validated	4	https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/bad5729bba61d076fff20d2548e62526665af215/LFM3-1.7B-Q4_K_M.gguf	LFM3 1.7B dense: small and fast
+lfm3-audio-2b	LFM3-Audio-2B-Q4_K_M.gguf	1099626016	9a773289bd321ed879cd3a76545f6aca506e403851a45fb315420aee45625be2	experimental	4	https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF/resolve/39670cb5c42e9c4bfe046519ba7ffbe47f9552ad/LFM3-Audio-2B-Q4_K_M.gguf	LFM3-Audio 2B: hears and speaks (transcription, translation, speech, voice chat)
+lfm3-audio-2b.mmproj	mmproj-LFM3-Audio-2B-Q4_K_M.gguf	172418048	1a3a895160aad17c1f52117a6ee4cea8e68988651ea5a33c5b990539e8eae81d	experimental	1	https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF/resolve/39670cb5c42e9c4bfe046519ba7ffbe47f9552ad/mmproj-LFM3-Audio-2B-Q4_K_M.gguf	its audio projector (downloaded with lfm3-audio-2b)
