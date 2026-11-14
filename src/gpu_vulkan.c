@@ -367,17 +367,19 @@ static VkInstance vk_instance(VkApi *vk) {
 
 /* GPU layouts, 16-byte aligned so that the shaders can read uint4 words (tools/vk_shaders.cmd
  * passes the same numbers to kernels_dx.hlsl): Q8_K activations as int8 qs[256] then float d,
- * padded to 272 bytes; q6_K as ql[128] qh[64] scales[16] then half d, padded to 224 bytes */
+ * padded to 272 bytes; q6_K as ql[128] qh[64] scales[16] then half d, padded to 224 bytes; q8_0
+ * in groups of 8 blocks, their int8 qs[256] then the 8 half scales (272 bytes) */
 #define Q8_BYTES 272
 #define Q8_GPU_D 256
 #define Q6K_GPU_BYTES 224
+#define Q80_GPU_BYTES 272
 #define STAGE_BYTES (64u << 20)
 #define VK_MV_TOKENS 12     /* fewer tokens: one matrix-vector product per token */
 #define CONST_SLOT 256      /* constants of one dispatch (16 uints, padded to the largest offset alignment) */
 #define MAX_SETS 2048       /* dispatches per submit */
 #define MAX_DEVICES 16
 
-enum { K_Q4_K, K_Q6_K, N_KERNELS };
+enum { K_Q4_K, K_Q6_K, K_Q8_0, N_KERNELS };
 enum { T_RESID, T_QUANT, T_SILU, T_CONV, T_PREP, T_ATTN, T_CONV_CHUNK, T_CONV_STATE, T_ATTN_CHUNK,
        N_TOKEN_KERNELS };   /* kernels_dx_token.hlsl */
 enum { B_U0 = 0, B_U1 = 1, B_U2 = 2, B_T0 = 8, B_T1 = 9, B_CONST = 16 };   /* descriptor bindings */
@@ -667,7 +669,9 @@ static int create_pipelines(Vulkan *v) {
 
     static const struct { const unsigned char *code; size_t size; const char *entry; } k[2 * N_KERNELS + N_TOKEN_KERNELS] = {
         {g_vk_mm_q4_K, sizeof(g_vk_mm_q4_K), "mm_q4_K"}, {g_vk_mm_q6_K, sizeof(g_vk_mm_q6_K), "mm_q6_K"},
+        {g_vk_mm_q8_0, sizeof(g_vk_mm_q8_0), "mm_q8_0"},
         {g_vk_mv_q4_K, sizeof(g_vk_mv_q4_K), "mv_q4_K"}, {g_vk_mv_q6_K, sizeof(g_vk_mv_q6_K), "mv_q6_K"},
+        {g_vk_mv_q8_0, sizeof(g_vk_mv_q8_0), "mv_q8_0"},
         {g_vk_resid_norm, sizeof(g_vk_resid_norm), "resid_norm"}, {g_vk_quant, sizeof(g_vk_quant), "quant"},
         {g_vk_silu_quant, sizeof(g_vk_silu_quant), "silu_quant"}, {g_vk_shortconv, sizeof(g_vk_shortconv), "shortconv"},
         {g_vk_attn_prep, sizeof(g_vk_attn_prep), "attn_prep"}, {g_vk_attention, sizeof(g_vk_attention), "attention"},
@@ -677,7 +681,9 @@ static int create_pipelines(Vulkan *v) {
     /* Intel: the matmul kernels built for its GPUs (kernels_dx.hlsl); PITHOS_VK_INTEL=0: the common ones */
     static const struct { const unsigned char *code; size_t size; } intel_k[2 * N_KERNELS] = {
         {g_vk_mm_q4_K_intel, sizeof(g_vk_mm_q4_K_intel)}, {g_vk_mm_q6_K_intel, sizeof(g_vk_mm_q6_K_intel)},
+        {g_vk_mm_q8_0_intel, sizeof(g_vk_mm_q8_0_intel)},
         {g_vk_mv_q4_K_intel, sizeof(g_vk_mv_q4_K_intel)}, {g_vk_mv_q6_K_intel, sizeof(g_vk_mv_q6_K_intel)},
+        {g_vk_mv_q8_0_intel, sizeof(g_vk_mv_q8_0_intel)},
     };
     const char *env = getenv("PITHOS_VK_INTEL");
     const int intel = v->props.vendorID == 0x8086 && !(env && env[0] == '0');
@@ -709,7 +715,7 @@ static int create_pipelines(Vulkan *v) {
 
 static void add_mat(Vulkan *v, const Mat *w, int *cap) {
     if (!w->data || w->cols % QK_K) return;
-    int kernel = w->type == GGML_Q4_K ? K_Q4_K : w->type == GGML_Q6_K ? K_Q6_K : -1;
+    int kernel = w->type == GGML_Q4_K ? K_Q4_K : w->type == GGML_Q6_K ? K_Q6_K : w->type == GGML_Q8_0 ? K_Q8_0 : -1;
     if (kernel < 0) return;
     if (v->nmats == *cap) {
         *cap = *cap ? *cap * 2 : 64;
@@ -722,7 +728,8 @@ static void add_mat(Vulkan *v, const Mat *w, int *cap) {
     x->rows = w->rows;
     x->K = w->cols;
     x->row_bytes = w->row_bytes;
-    x->gpu_row = kernel == K_Q6_K ? (size_t)(w->cols / QK_K) * Q6K_GPU_BYTES : w->row_bytes;
+    x->gpu_row = kernel == K_Q6_K ? (size_t)(w->cols / QK_K) * Q6K_GPU_BYTES
+               : kernel == K_Q8_0 ? (size_t)(w->cols / QK_K) * Q80_GPU_BYTES : w->row_bytes;
 }
 
 static int mat_cmp(const void *a, const void *b) {
@@ -744,11 +751,20 @@ static const VMat *find_mat(const Vulkan *v, const uint8_t *w) {
 /* file layout -> GPU layout of rows [r0, r1) of a matrix */
 static void pack_rows(const VMat *x, int r0, int r1, uint8_t *dst) {
     const uint8_t *src = x->host + (size_t)r0 * x->row_bytes;
+    const size_t nblk = (size_t)(r1 - r0) * (size_t)(x->K / QK_K);
+    if (x->kernel == K_Q8_0) {
+        const block_q8_0 *b = (const block_q8_0 *)src;
+        for (size_t i = 0; i < nblk; i++, dst += Q80_GPU_BYTES)
+            for (int j = 0; j < QK_K / QK8_0; j++) {
+                memcpy(dst + j * QK8_0, b[i * (QK_K / QK8_0) + j].qs, QK8_0);
+                memcpy(dst + QK_K + j * 2, &b[i * (QK_K / QK8_0) + j].d, 2);
+            }
+        return;
+    }
     if (x->kernel != K_Q6_K) {
         memcpy(dst, src, x->row_bytes * (size_t)(r1 - r0));
         return;
     }
-    const size_t nblk = (size_t)(r1 - r0) * (size_t)(x->K / QK_K);
     const block_q6_K *b = (const block_q6_K *)src;
     for (size_t i = 0; i < nblk; i++, dst += Q6K_GPU_BYTES) {
         memcpy(dst, b[i].ql, 128);
@@ -902,12 +918,13 @@ Vulkan *vk_create(const Model *m, int device, char *info, int infolen) {
     for (int l = 0; l < m->n_layer; l++) {
         const Layer *L = &m->layers[l];
         const Mat *ws[] = {&L->in_proj, &L->out_proj, &L->wq, &L->wk, &L->wv, &L->wo, &L->attn_gate,
-                           &L->w_gate, &L->w_up, &L->w_down};
+                           &L->w_gate, &L->w_up, &L->w_down, &L->ssm_qkv, &L->ssm_z, &L->ssm_alpha,
+                           &L->ssm_beta, &L->ssm_out, &L->sh_gate, &L->sh_up, &L->sh_down};
         for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) add_mat(v, ws[i], &cap);
     }
     add_mat(v, &m->output, &cap);
     if (!v->nmats) {
-        snprintf(info, (size_t)infolen, "no Q4_K / Q6_K dense weights in this model");
+        snprintf(info, (size_t)infolen, "no Q4_K / Q6_K / Q8_0 dense weights in this model");
         vk_destroy(v);
         return NULL;
     }

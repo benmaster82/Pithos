@@ -1,4 +1,4 @@
-/* test_vk.c - checks the Vulkan matmuls (Q4_K and Q6_K) and the whole forward pass against the
+/* test_vk.c - checks the Vulkan matmuls (Q4_K, Q6_K and Q8_0) and the whole forward pass against the
  * CPU and times the matmuls:
  *   test_vk model.gguf [device]     (device: an index from the list it prints first) */
 #include <math.h>
@@ -167,8 +167,9 @@ int main(int argc, char **argv) {
     if (!v) { printf("no Vulkan: %s\n", err); return 0; }
     printf("Vulkan: %s\n", err);
     /* the first layer with each shape and type */
-    const Mat *pick[9] = {0};
-    const char *names[9] = {"ffn_up", "ffn_down/4", "ffn_down/6", "attn_q", "attn_k", "attn_gate", "in_proj", "attn_v/6", "output"};
+    const Mat *pick[13] = {0};
+    const char *names[13] = {"ffn_up", "ffn_down/4", "ffn_down/6", "attn_q", "attn_k", "attn_gate", "in_proj", "attn_v/6", "output",
+                             "ssm_qkv", "ssm_alpha", "ssm_out", "shexp_down"};
     const Mat *qkv[3] = {0};
     for (int l = 0; l < m.n_layer; l++) {
         const Layer *L = &m.layers[l];
@@ -180,12 +181,16 @@ int main(int argc, char **argv) {
         if (!pick[5] && L->attn_gate.data) pick[5] = &L->attn_gate;
         if (!pick[6] && L->in_proj.data) pick[6] = &L->in_proj;
         if (!pick[7] && L->wv.data && L->wv.type == GGML_Q6_K) pick[7] = &L->wv;
+        if (!pick[9] && L->ssm_qkv.data) pick[9] = &L->ssm_qkv;
+        if (!pick[10] && L->ssm_alpha.data) pick[10] = &L->ssm_alpha;
+        if (!pick[11] && L->ssm_out.data) pick[11] = &L->ssm_out;
+        if (!pick[12] && L->sh_down.data) pick[12] = &L->sh_down;
         if (!qkv[0] && L->wq.data && L->wk.data && L->w_down.data) { qkv[0] = &L->wq; qkv[1] = &L->wk; qkv[2] = &L->w_down; }
     }
     pick[8] = &m.output;
     int ok = 1;
     const int nts[] = {1, 3, 8, 37, 64, 256};
-    for (int i = 0; i < 9; i++) {
+    for (int i = 0; i < 13; i++) {
         if (!pick[i]) continue;
         if (!vk_has(v, pick[i]->data)) {   /* only allowed for matrices over the device's buffer limit */
             printf("  %-10s not on the GPU (%llu MB)\n", names[i],

@@ -253,9 +253,11 @@ static void usage(void) {
         "      --mlock             try to lock the whole model in RAM\n"
         "      --gpu B             which GPU backend does the work (default auto):\n"
         "                            auto    dense models (LFM3): Vulkan on a discrete NVIDIA GPU;\n"
-        "                                    models with experts, or no such GPU: a dedicated OpenCL GPU\n"
+        "                                    models with experts, or no such GPU: a dedicated OpenCL GPU,\n"
+        "                                    else (over 64 experts: Qwen3.6) Vulkan matmuls on that NVIDIA GPU\n"
         "                            off     CPU only (same as --cpu)\n"
-        "                            vulkan  the whole forward pass on a Vulkan GPU (Windows, Linux)\n"
+        "                            vulkan  the whole forward pass on a Vulkan GPU (Windows, Linux);\n"
+        "                                    with experts: the dense matmuls\n"
         "                            d3d12   the same on a Direct3D 12 GPU (Windows; Xbox in Game mode)\n"
         "                            opencl  hot experts and dense layers on an OpenCL GPU\n"
         "                            opencl+vulkan, opencl+d3d12: OpenCL, with the prompt matmuls on the other\n"
@@ -678,6 +680,7 @@ static void print_profile(const Stats *st, int ntok, const char *title) {
 static void print_expert_coverage(const Model *m, const Stats *st) {
     /* expert usage skew: share of activations covered by the hottest experts of each layer */
     int fr[] = { 8, 16, 24, 32 };
+    if (m->n_expert > 64) return;   /* the hits are counted for the first 64 experts only */
     for (int fi = 0; fi < 4; fi++) {
         double cov = 0, tot = 0;
         for (int l = 0; l < m->n_layer && l < 64; l++) {
@@ -996,8 +999,8 @@ static int real_main(int argc, char **argv) {
          * measured (README); models with experts, or without such a GPU: OpenCL as before */
         if (!m.n_expert && (vk = start_vk(&m, ctx, VK_AUTO_DEVICE, info_vk, sizeof(info_vk))) != NULL) print_gpu("Vulkan", info_vk);
         else if ((gpu = start_cl(&m, ctx, &a, -1, info_cl, sizeof(info_cl))) != NULL) print_gpu("OpenCL", info_cl);
-        else if (!m.n_expert) fprintf(stderr, "GPU: none, CPU only (Vulkan: %s; OpenCL: %s)\n", info_vk, info_cl);
-        else fprintf(stderr, "GPU: none, CPU only (OpenCL: %s)\n", info_cl);
+        else if (m.n_expert && (vk = start_vk(&m, ctx, VK_AUTO_DEVICE, info_vk, sizeof(info_vk))) != NULL) print_gpu("Vulkan", info_vk);
+        else fprintf(stderr, "GPU: none, CPU only (Vulkan: %s; OpenCL: %s)\n", info_vk, info_cl);
     } else {
         /* --gpu-device: the device of the one backend named, or of OpenCL in a combination */
         const int use = a.gpu_use, one = use == USE_CL || use == USE_DX || use == USE_VK;

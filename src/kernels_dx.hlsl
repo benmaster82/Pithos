@@ -36,6 +36,7 @@ cbuffer P : register(b0) {
 #define Q8_QS 4
 #endif
 #define Q4K_BYTES 144
+#define Q80_BYTES 272               // Vulkan's q8_0 layout: 8 blocks, int8 qs[256] then half d[8]
 #ifndef Q6K_BYTES
 #define Q6K_BYTES 212               // Q6_K block: half d at Q6_D, ql[128], qh[64], int8 scales[16]
 #define Q6_D 0
@@ -172,6 +173,31 @@ void mm_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     store(r0, t0, tr, tt, a0, a1, a2, a3);
 }
 
+#ifdef PITHOS_VK
+// repacked q8_0 (Vulkan only): 8 blocks of 32 values as int8 qs[256], then their 8 half scales
+[numthreads(256, 1, 1)]
+void mm_q8_0(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint r0 = gid.x * 64, t0 = gid.y * 64;
+    const uint slot = li >> 2, part = li & 3;
+    const uint tr = li & 15, tt = li >> 4;
+    const uint wbase = min(r0 + slot, rows - 1) * wrow, xbase = min(t0 + slot, nt - 1) * xrow;
+    float4 a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    for (uint b = 0; b < nb; b++) {
+        const uint wb = wbase + b * Q80_BYTES;
+        for (uint j = 0; j < 8; j++) {
+            const float ds = f16tof32(W.Load(wb + 256 + (j >> 1) * 4) >> ((j & 1) * 16));
+            const uint2 q = W.Load2(wb + j * 32 + part * 8);
+            [unroll] for (uint i = 0; i < 8; i++) Ws[(part * 8 + i) * 16 + (slot >> 2)][slot & 3] = ds * sbyte(q, i);
+            load_x(xbase, b, j, part, slot);
+            GroupMemoryBarrierWithGroupSync();
+            accumulate(tr, tt, a0, a1, a2, a3);
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+    store(r0, t0, tr, tt, a0, a1, a2, a3);
+}
+#endif
+
 #else
 // Intel (Vulkan): the same 64 x 64 tiles with 128 threads of 8 rows x 4 tokens each, so that every
 // float4 of weights read from group-shared memory serves twice as many products (group-shared
@@ -256,6 +282,30 @@ void mm_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
                 const uint bl = (ql[i >> 2] >> ((i & 3) * 8)) & 255, bh = (qh[i >> 2] >> ((i & 3) * 8)) & 255;
                 Ws[(part * 16 + i) * 16 + (slot >> 2)][slot & 3] = ds * (int(((bl >> lshift) & 15) | (((bh >> hshift) & 3) << 4)) - 32);
             }
+            load_x16(xb, xd, j, part, slot);
+            GroupMemoryBarrierWithGroupSync();
+            accumulate8(tr, tt, a0, a1, a2, a3, c0, c1, c2, c3);
+            GroupMemoryBarrierWithGroupSync();
+        }
+    }
+    store8(r0, t0, tr, tt, a0, a1, a2, a3, c0, c1, c2, c3);
+}
+[numthreads(128, 1, 1)]
+void mm_q8_0(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint r0 = gid.x * 64, t0 = gid.y * 64;
+    const uint slot = li >> 1, part = li & 1;
+    const uint tr = li & 7, tt = li >> 3;
+    const uint wbase = min(r0 + slot, rows - 1) * wrow, xbase = min(t0 + slot, nt - 1) * xrow;
+    float4 a0 = 0, a1 = 0, a2 = 0, a3 = 0, c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    for (uint b = 0; b < nb; b++) {
+        const uint wb = wbase + b * Q80_BYTES, xb = xbase + b * Q8_BYTES, w4 = wb / 16;
+        const float xd = asfloat(X.Load(xb + Q8_D));
+        const uint4 dw = W4[w4 + 16];
+        for (uint j = 0; j < 8; j++) {
+            const float ds = f16tof32(dw[j >> 1] >> ((j & 1) * 16));
+            const uint4 q = W4[w4 + j * 2 + part];
+            [unroll] for (uint i = 0; i < 16; i++)
+                Ws[(part * 16 + i) * 16 + (slot >> 2)][slot & 3] = ds * float(int(q[i >> 2] << (24 - 8 * (i & 3))) >> 24);
             load_x16(xb, xd, j, part, slot);
             GroupMemoryBarrierWithGroupSync();
             accumulate8(tr, tt, a0, a1, a2, a3, c0, c1, c2, c3);
@@ -410,3 +460,28 @@ void mv_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     }
     reduce_store(li, r, t, sum);
 }
+
+#ifdef PITHOS_VK
+// piece p of a repacked q8_0 group: its q8_0 blocks 2p and 2p+1
+[numthreads(MV_GROUP, 1, 1)]
+void mv_q8_0(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint r = gid.x * (MV_GROUP / MV_LANES) + (li >> MV_LOG2), t = gid.y;
+    float sum = 0;
+    if (r < rows) {
+        const uint wbase = r * wrow, xbase = t * xrow;
+        for (uint p = li & (MV_LANES - 1); p < nb * 4; p += MV_LANES) {
+            const uint b = p >> 2, pp = p & 3;
+            const uint wq = (wbase + b * Q80_BYTES) / 16, xb = xbase + b * Q8_BYTES, xq = (xb + Q8_QS) / 16 + pp * 4;
+            const uint dw = W4[wq + 16][pp];
+            int d[2] = { 0, 0 };
+            [unroll] for (uint i = 0; i < 4; i++) {
+                const uint4 w = W4[wq + pp * 4 + i], x = X4[xq + i];
+                [unroll] for (uint e = 0; e < 4; e++)
+                    [unroll] for (uint k = 0; k < 4; k++) d[i >> 1] += sx(w[e], k) * sx(x[e], k);
+            }
+            sum += asfloat(X.Load(xb + Q8_D)) * (f16tof32(dw) * float(d[0]) + f16tof32(dw >> 16) * float(d[1]));
+        }
+    }
+    reduce_store(li, r, t, sum);
+}
+#endif

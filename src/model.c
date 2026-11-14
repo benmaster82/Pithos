@@ -1157,8 +1157,12 @@ static void predict_next_experts(Context *c, int layer) {
     float hn[8192], sc[MAX_EXPERT];
     if (D > 8192 || Ln->router.type != GGML_F32) return;
     rmsnorm(hn, c->x, Ln->ffn_norm, D, m->eps);
+    /* the router of the next layer, on the threads (its logits into rlog, already consumed) */
+    job_clear(c);
+    job_add_f(c, &Ln->router, hn, D, 1, c->rlog, E);
+    job_run(c, CAT_ROUTER);
     for (int e = 0; e < E; e++) {
-        const float lg = KS.dot_f32((const float *)(Ln->router.data + (size_t)e * Ln->router.row_bytes), hn, D);
+        const float lg = c->rlog[e];
         const float p = m->gating == 1 ? lg : 1.f / (1.f + expf(-lg));
         sc[e] = p + (Ln->exp_bias && m->gating != 1 ? Ln->exp_bias[e] : 0.f);
     }
