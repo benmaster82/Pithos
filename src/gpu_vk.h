@@ -47,7 +47,13 @@ int  vk_dense_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *info
  * residual stream before the final norm [dim]. Returns 0 if the GPU failed. */
 int  vk_dense_forward(Vulkan *v, const float *x, int n, const float *rope_cs, const float *rope_swa, int pos0,
                       float *logits, float *x_last);
-/* copy KV rows [r0, r1) / the convolution state between the host arrays and the GPU copy */
+/* qwen35moe runs the same way, except for the routed experts: at every layer the GPU stops and
+ * fn gets the residual stream x and its normalized rows h [n][dim] of the pass's tokens; it
+ * writes the weighted sum of their experts to y [n][dim] and the shared expert's gate to s [n].
+ * Set it before vk_dense_forward. */
+typedef void (*VkMoeFn)(void *arg, int layer, const float *x, const float *h, int n, float *y, float *s);
+void vk_dense_set_moe(Vulkan *v, VkMoeFn fn, void *arg);
+/* copy KV rows [r0, r1) / the convolution state (DeltaNet's included) between the host arrays and the GPU copy */
 void vk_dense_kv(Vulkan *v, uint16_t *kc, uint16_t *vc, int r0, int r1, int to_gpu);
 void vk_dense_conv(Vulkan *v, float *conv, int to_gpu);
 

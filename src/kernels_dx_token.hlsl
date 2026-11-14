@@ -322,3 +322,208 @@ void attn_chunk(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
         stu(oo + 4, acc.y * inv);
     }
 }
+
+#ifdef PITHOS_VK
+// ---------------------------------------------------------------- Qwen3.5 / 3.6 (Vulkan only)
+//
+// The layers of qwen35moe run here, the routed experts on the CPU: after each layer's mixer the
+// GPU stops with x and the normalized h read back; the CPU's expert sum y and the shared expert's
+// gate s come back through IN for the next residual add. The CS buffer holds the CPU's DeltaNet
+// state, layer by layer: the convolution's last K - 1 inputs [K-1][qkv], then S [vh][d][d].
+
+// as reduce_sum, over 128 threads
+float reduce_sum128(uint li, float v) {
+    gs[li] = v;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = 64; s > 0; s >>= 1) {
+        if (li < s) gs[li] += gs[li + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    const float r = gs[0];
+    GroupMemoryBarrierWithGroupSync();
+    return r;
+}
+
+// x = embedding (mode 0), x += out (mode 1) or x += s * out + y (mode 2: out the shared expert,
+// y and s from the CPU in IN); then Q8_K of rmsnorm(x) * norm weight, and the same values as
+// floats at h unless NONE. One group per token.
+// C0: dim, x, out, q   C1: mode, norm weight, eps, h   C2: y (offset in IN), s (offset in IN)
+[numthreads(256, 1, 1)]
+void moe_resid(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint D = C0.x, t = gid.y, xo = C0.y + 4 * t * D, oo = C0.z + 4 * t * D, eo = 4 * t * D;
+    const uint qo = C0.w + t * (D / 256) * Q8_BYTES, mode = C1.x, nw = C1.y, ho = C1.w + 4 * t * D;
+    const float eps = asfloat(C1.z);
+    const float g = mode == 2 ? asfloat(IN.Load(C2.y + 4 * t)) : 1;
+    float ss = 0;
+    for (uint i = li; i < D; i += 256) {
+        float v;
+        if (mode == 0) v = asfloat(IN.Load(eo + 4 * i));
+        else if (mode == 1) v = ldu(xo + 4 * i) + ldu(oo + 4 * i);
+        else v = ldu(xo + 4 * i) + g * ldu(oo + 4 * i) + asfloat(IN.Load(C2.x + 4 * (t * D + i)));
+        stu(xo + 4 * i, v);
+        ss += v * v;
+    }
+    const float s = rsqrt(reduce_sum(li, ss) / D + eps);
+    for (uint b = 0; b < D / 256; b++) {
+        const uint i = b * 256 + li;
+        const float v = ldu(xo + 4 * i) * s * ldw(nw + 4 * i);
+        if (C1.w != NONE) stu(ho + 4 * i, v);
+        quant_block(li, v, qo + b * Q8_BYTES);
+    }
+}
+
+// DeltaNet's causal depthwise convolution over the last K inputs, then silu, in place, for the
+// n tokens of the chunk in order; the state keeps the last K - 1 inputs (oldest first).
+// Groups: 256 channels.  C0: channels, rows (qkv part of the in-projection), row bytes, n
+// C1: conv weights [channels][K], state, K
+[numthreads(256, 1, 1)]
+void delta_conv(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint nc = C0.x, ch = gid.x * 256 + li, n = C0.w, K = C1.z, so = C1.y;
+    if (ch >= nc) return;
+    const uint w = C1.x + 4 * ch * K;
+    float st[7];
+    [unroll] for (uint k = 0; k < 7; k++) st[k] = k + 1 < K ? asfloat(CS.Load(so + 4 * (k * nc + ch))) : 0;
+    for (uint t = 0; t < n; t++) {
+        const uint xo = C0.y + t * C0.z + 4 * ch;
+        const float xin = ldu(xo);
+        float acc = ldw(w + 4 * (K - 1)) * xin;
+        [unroll] for (uint k = 0; k < 7; k++) if (k + 1 < K) acc += ldw(w + 4 * k) * st[k];
+        [unroll] for (uint m = 0; m < 6; m++) if (m + 2 < K) st[m] = st[m + 1];
+        [unroll] for (uint e = 0; e < 7; e++) if (e + 2 == K) st[e] = xin;
+        stu(xo, acc / (1 + exp(-acc)));
+    }
+    [unroll] for (uint k2 = 0; k2 < 7; k2++) if (k2 + 1 < K) CS.Store(so + 4 * (k2 * nc + ch), asuint(st[k2]));
+}
+
+groupshared float dq[128], dk[128];
+
+// the gated delta rule of one V head (128 threads, one value column of S each) over the n tokens
+// in order: q and k L2-normalized (q also by 1/sqrt(d)); S = decay S + k u^T with
+// u = beta (v - decay S^T k); o = S^T q; then RMSNorm of o times the norm weight and silu(z).
+// Groups: V heads (V head j reads K head j % kh).
+// C0: rows (q | k | v), row bytes, z rows, z and out row bytes   C1: alpha rows, beta rows (vh floats), out, n
+// C2: S of this layer (in CS), kh, vh, eps   C3: ssm_a, dt bias, norm weight (offsets in SW), 1/sqrt(d)
+[numthreads(128, 1, 1)]
+void delta_rec(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint d = 128, j = gid.x, kh = C2.y, vh = C2.z, kj = j % kh, n = C1.w;
+    const float eps = asfloat(C2.w), qs = asfloat(C3.w);
+    const float A = ldw(C3.x + 4 * j), dt = ldw(C3.y + 4 * j), nw = ldw(C3.z + 4 * li);
+    const uint so = C2.x + 4 * j * d * d + 4 * li;    // S[i][li] at so + 4 * i * d
+    for (uint t = 0; t < n; t++) {
+        const uint row = C0.x + t * C0.y;
+        const float q = ldu(row + 4 * (kj * d + li)), k = ldu(row + 4 * (kh * d + kj * d + li));
+        const float v = ldu(row + 4 * (2 * kh * d + j * d + li));
+        const float nq = sqrt(reduce_sum128(li, q * q)), nk = sqrt(reduce_sum128(li, k * k));
+        dq[li] = q / max(nq, eps) * qs;
+        dk[li] = k / max(nk, eps);
+        GroupMemoryBarrierWithGroupSync();
+        const float x = ldu(C1.x + 4 * (t * vh + j)) + dt, beta = ldu(C1.y + 4 * (t * vh + j));
+        const float sp = x > 20 ? x : log(1 + exp(x));
+        const float decay = exp(sp * A), b = 1 / (1 + exp(-beta));
+        float u = 0;
+        for (uint i = 0; i < d; i++) u += asfloat(CS.Load(so + 4 * i * d)) * dk[i];
+        u = b * (v - decay * u);
+        float o = 0;
+        for (uint i2 = 0; i2 < d; i2++) {
+            const float sv = decay * asfloat(CS.Load(so + 4 * i2 * d)) + dk[i2] * u;
+            CS.Store(so + 4 * i2 * d, asuint(sv));
+            o += sv * dq[i2];
+        }
+        const float r = rsqrt(reduce_sum128(li, o * o) / d + eps);
+        const float z = ldu(C0.z + t * C0.w + 4 * (j * d + li));
+        stu(C1.z + t * C0.w + 4 * (j * d + li), o * r * nw * (z / (1 + exp(-z))));
+    }
+}
+
+// Qwen attention, per head: q heads [q | gate] -> RMSNorm and NEOX RoPE of the first n_rot
+// values of q, sigmoid of the gate; k heads the same into the cache, v heads into the cache.
+// Groups: n_head q heads, then n_kv_head k/v heads; tokens.
+// C0: hd, q|gate rows (2 qd floats), k|v rows (2 kvd floats), n_head   C1: q norm, k norm, rope (in IN), eps
+// C2: k cache offset of this layer and the first token's position, v cache offset, n_rot, q out (qd rows)
+// C3: gate out (qd rows), qd, kvd
+[numthreads(256, 1, 1)]
+void qattn_prep(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint hd = C0.x, nh = C0.w, t = gid.y, g = gid.x, qd = C3.y, kvd = C3.z, nr = C2.z / 2;
+    const bool isq = g < nh;
+    const uint kh = isq ? 0 : g - nh;
+    const uint src = isq ? C0.y + 4 * (t * 2 * qd + g * 2 * hd) : C0.z + 4 * (t * 2 * kvd + kh * hd);
+    const uint nw = isq ? C1.x : C1.y, ro = C1.z + 4 * t * hd;
+    float ss = 0;
+    for (uint i = li; i < hd; i += 256) {
+        const float v = ldu(src + 4 * i);
+        hs[i] = v;
+        ss += v * v;
+    }
+    const float sc = rsqrt(reduce_sum(li, ss) / hd + asfloat(C1.w));
+    for (uint i2 = li; i2 < hd; i2 += 256) hs[i2] *= sc * ldw(nw + 4 * i2);
+    GroupMemoryBarrierWithGroupSync();
+    for (uint r = li; r < nr; r += 256) {
+        const float x0 = hs[r], x1 = hs[r + nr];
+        const float cs = asfloat(IN.Load(ro + 4 * r)), sn = asfloat(IN.Load(ro + 4 * (hd / 2 + r)));
+        hs[r] = x0 * cs - x1 * sn;
+        hs[r + nr] = x0 * sn + x1 * cs;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    if (isq) {
+        for (uint o = li; o < hd; o += 256) {
+            stu(C2.w + 4 * (t * qd + g * hd + o), hs[o]);
+            const float gv = ldu(src + 4 * (hd + o));
+            stu(C3.x + 4 * (t * qd + g * hd + o), 1 / (1 + exp(-gv)));
+        }
+    } else {
+        const uint ko = C2.x + 2 * t * kvd + 2 * kh * hd, vo = C2.y + 2 * t * kvd + 2 * kh * hd;
+        const uint vs = C0.z + 4 * (t * 2 * kvd + kvd + kh * hd);
+        for (uint p = li; p < hd / 2; p += 256) {
+            KV.Store(ko + 4 * p, f16(hs[2 * p]) | (f16(hs[2 * p + 1]) << 16));
+            KV.Store(vo + 4 * p, f16(ldu(vs + 8 * p)) | (f16(ldu(vs + 8 * p + 4)) << 16));
+        }
+    }
+}
+
+// attn_chunk for Qwen: q rows of qd floats, the output times the elementwise gate (qd rows).
+// Groups: q heads, tokens.  C0: hd, q, gate, out   C1: k cache of this layer, v cache, kvd, qd
+// C2: position of the chunk's first token, q heads per kv head   C3: 1/sqrt(hd)
+[numthreads(256, 1, 1)]
+void qattn(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint hd = C0.x, half = hd / 2, h = gid.x, t = gid.y, kh = h / C2.y, kvd = C1.z, qd = C1.w;
+    const uint npos = C2.x + t + 1, j0 = 0;
+    const uint kb = C1.x + 2 * kh * hd, vb = C1.y + 2 * kh * hd;
+    const float scale = asfloat(C3.x);
+    for (uint i = li; i < hd; i += 256) hs[i] = ldu(C0.y + 4 * (t * qd + h * hd + i));
+    GroupMemoryBarrierWithGroupSync();
+    const uint slices = 256 / half, p = li % half, sl = li / half;
+    float mx = -1e30, sum = 0;
+    float2 acc = 0;
+    for (uint base = j0; base < npos; base += 256) {
+        const uint j = min(base + li, npos - 1);
+        const uint ko = kb + 2 * j * kvd;
+        float dd = 0;
+        for (uint q = 0; q < half; q++) {
+            const uint w = KV.Load(ko + 4 * q);
+            dd += f16tof32(w) * hs[2 * q] + f16tof32(w >> 16) * hs[2 * q + 1];
+        }
+        const float s = base + li < npos ? dd * scale : -1e30;
+        const float m2 = max(mx, reduce_max(li, s)), corr = exp(mx - m2);
+        const float e = base + li < npos ? exp(s - m2) : 0;
+        gp[li] = e;
+        sum = sum * corr + reduce_sum(li, e);
+        acc *= corr;
+        const uint cnt = min(256u, npos - base);
+        for (uint jv = sl; jv < cnt; jv += slices) {
+            const uint w2 = KV.Load(vb + 2 * (base + jv) * kvd + 4 * p);
+            acc += gp[jv] * float2(f16tof32(w2), f16tof32(w2 >> 16));
+        }
+        mx = m2;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    g2[li] = acc;
+    GroupMemoryBarrierWithGroupSync();
+    if (sl == 0) {
+        for (uint s2 = 1; s2 < slices; s2++) acc += g2[s2 * half + p];
+        const float inv = 1 / sum;
+        const uint oo = 4 * (t * qd + h * hd + 2 * p);
+        stu(C0.w + oo, acc.x * inv * ldu(C0.z + oo));
+        stu(C0.w + oo + 4, acc.y * inv * ldu(C0.z + oo + 4));
+    }
+}
+#endif

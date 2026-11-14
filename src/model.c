@@ -1432,6 +1432,23 @@ static void forward_dx(Context *c, const int *tokens, int n, float *logits) {
     c->conv_cpu_ok = 0;
 }
 
+/* qwen35moe on the Vulkan GPU: the routed experts of one layer on the CPU (vk_dense_set_moe) */
+static void vk_moe(void *arg, int layer, const float *x, const float *h, int n, float *y, float *s) {
+    Context *c = (Context *)arg;
+    const Model *m = c->m;
+    const Layer *L = &m->layers[layer];
+    const int D = m->dim;
+    if (c->pfq && n >= 8 && layer + 1 < m->n_layer && m->layers[layer + 1].is_moe) {   /* as run_layers */
+        prefetcher_clear(c->pfq);
+        for (int e = 0; e < m->n_expert; e++) prefetch_expert(c, &m->layers[layer + 1], e);
+    }
+    memcpy(c->x, x, sizeof(float) * (size_t)n * D);   /* predict_next_experts reads it */
+    memcpy(c->h, h, sizeof(float) * (size_t)n * D);
+    moe_ffn(c, L, layer, n);
+    memcpy(y, c->out, sizeof(float) * (size_t)n * D);
+    for (int t = 0; t < n; t++) s[t] = 1.f / (1.f + expf(-KS.dot_f32(L->sh_inp, c->h + (size_t)t * D, D)));
+}
+
 /* the same on the Vulkan GPU */
 static void forward_vk(Context *c, const int *tokens, int n, float *logits) {
     const Model *m = c->m;
@@ -1449,6 +1466,7 @@ static void forward_vk(Context *c, const int *tokens, int n, float *logits) {
         token_row(c, tokens[t], c->x + (size_t)t * D);
         rope_tables(c, pos0 + t, rope + (size_t)t * hd, rope_swa + (size_t)t * hd);
     }
+    vk_dense_set_moe(c->vk, vk_moe, c);
     if (!vk_dense_forward(c->vk, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL,
                           logits ? c->tmp : NULL)) {
         memset(c->logits, 0, sizeof(float) * (size_t)m->n_vocab);   /* the GPU failed: the message says so */
