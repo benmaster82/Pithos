@@ -1,0 +1,20 @@
+/* The speech server section: endpoint lists as in the MCP section, a home-lab flow and its steps. */
+.speech-section .eyebrow{color:#9fb4c9}
+.speech-section dt code{font-size:13px;white-space:nowrap}
+.lab-example>h3{margin-top:14px}
+.lab-flow{display:grid;grid-template-columns:minmax(0,1fr) 28px minmax(0,1fr) 28px minmax(0,1fr) 28px minmax(0,1fr);align-items:stretch;margin:30px 0 8px}
+.lab-flow>.lab-arrow{display:grid;place-items:center;color:#8fa8c1}
+.lab-flow .flow-node h4{font:700 19px/1.25 var(--display, var(--sans));margin:10px 0}
+.lab-flow .flow-node p{font-size:13px;line-height:1.7;margin:0}
+.lab-flow .flow-node code{font-size:12px;white-space:normal;overflow-wrap:anywhere}
+.lab-flow .lab-core{border-color:#b6cfe6;box-shadow:0 0 0 1px #b6cfe633 inset}
+.lab-steps{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:40px;margin-top:32px}
+.lab-steps>*{min-width:0}
+.lab-step-title{margin-top:32px!important}
+.speech-section .code-block pre code{white-space:pre;overflow-wrap:normal;font-size:12px}
+.speech-section .code-block-header .copy-button{text-decoration:none}
+@media(max-width:1000px){
+  .lab-flow{grid-template-columns:1fr;gap:6px}
+  .lab-flow>.lab-arrow{transform:rotate(90deg);height:28px}
+  .lab-steps{grid-template-columns:1fr;gap:28px}
+}

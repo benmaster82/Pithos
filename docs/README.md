@@ -12,6 +12,7 @@ The English landing page is published automatically by GitHub Pages from
 - `models.css`: the model picker at the top (its data, as in `../models.tsv`, is in `app.js`).
 - `effects.css`: a few pulses in the architecture diagram, then it rests (none with reduced motion).
 - `top.css`: the compact hero at the top of the page, loaded last.
+- `speech.css`: the speech server section (LFM3-Audio endpoints and the Home Assistant example).
 - `mascot.js`: Pandora presents the hero figures once (a click replays it); with reduced motion or without JavaScript the figures are simply shown.
 - `app.js`: model picker (it drives the guide and every command on the page), installation guide, CPU/GPU diagram, tabs, clipboard, and local progress storage.
 - `assets/`: original project graphics and self-hosted fonts with license files.
