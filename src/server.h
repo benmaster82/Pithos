@@ -36,8 +36,12 @@ enum { THINK_FULL = -1, THINK_OFF = 0 };
 int think_parse(const char *s, int *budget);
 /* The text that closes the reasoning when the budget runs out. */
 const char *think_close(void);
-/* The assistant turn opening with the reasoning off (lfm3: the LFM3 architecture). */
-const char *think_off_prompt(int lfm3);
+/* The chat template family of a model: LFM2 / LFM2.5, LFM3 (XML tool calls), Qwen3.5 / 3.6. */
+enum { CHAT_LFM2, CHAT_LFM3, CHAT_QWEN };
+int chat_family(const Model *m);
+/* The assistant turn opening with the reasoning off / on, for a chat_family. */
+const char *think_off_prompt(int family);
+const char *think_on_prompt(int family);
 /* Whether the model's chat template opens and closes reasoning blocks. LFM3-Audio's has no
  * enable_thinking switch and writes no blocks: past turns have no empty <think></think>, and with
  * the reasoning off its turn starts plainly (an answer written after "<think>\n</think>\n" often

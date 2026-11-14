@@ -1,4 +1,5 @@
-/* model.h - LFM2 / LFM2-MoE / LFM3 hybrid (short-conv + GQA attention + sparse MoE) forward pass. */
+/* model.h - LFM2 / LFM2-MoE / LFM3 hybrid (short-conv + GQA attention + sparse MoE) and
+ * Qwen3.5 / 3.6 MoE (Gated DeltaNet + gated GQA attention + MoE with a shared expert) forward pass. */
 #ifndef PITHOS_MODEL_H
 #define PITHOS_MODEL_H
 
@@ -15,9 +16,12 @@ typedef struct {
     size_t expert_stride;   /* bytes between experts for 3D expert tensors */
 } Mat;
 
+#define MAX_EXPERT 256
+
 typedef struct {
     int is_attn, is_moe, is_swa;    /* is_swa: sliding-window attention (LFM3) */
-    int attn_idx, conv_idx;
+    int is_delta;                   /* Gated DeltaNet (Qwen3.5); neither attention nor delta: short conv */
+    int attn_idx, conv_idx, delta_idx;
     const float *attn_norm, *ffn_norm;
     const float *post_op_norm, *post_ffn_norm;  /* LFM3 sandwich norms, or NULL */
     /* short conv */
@@ -29,10 +33,19 @@ typedef struct {
     Mat attn_gate;                  /* LFM3: per-head sigmoid output gate [n_head][dim], or no data */
     /* dense ffn */
     Mat w_gate, w_up, w_down;
+    /* Gated DeltaNet: qkv and z projections, per-V-head alpha / beta, depthwise causal conv over
+     * qkv, decay -exp(A_log) (ssm_a) and its bias (ssm_dt), the per-head output norm */
+    Mat ssm_qkv, ssm_z, ssm_alpha, ssm_beta, ssm_out;
+    const float *ssm_conv;          /* [2 * k_dim + v_dim][ssm_conv_k] */
+    const float *ssm_a, *ssm_dt;    /* [ssm_vh] */
+    const float *ssm_norm;          /* [ssm_d] */
     /* moe */
     Mat router;                     /* [n_expert][dim], F32 */
     const float *exp_bias;          /* [n_expert] or NULL */
     Mat gate_exps, up_exps, down_exps;
+    /* shared expert (Qwen3.5), added with the weight sigmoid(sh_inp . h); no data: none */
+    Mat sh_gate, sh_up, sh_down;
+    const float *sh_inp;            /* [dim] */
 } Layer;
 
 typedef struct {
@@ -47,10 +60,14 @@ typedef struct {
     int swa_window;                 /* sliding-window size of is_swa layers (tokens, current one included) */
     int add_bos;                    /* tokenizer.ggml.add_bos_token (default 1) */
     int bidir;                      /* attention over the whole chunk, not causal (the LFM3-Audio depth decoder) */
+    int n_rot;                      /* RoPE on the first n_rot dims of each head (head_dim: all) */
+    int q_gate;                     /* attn_q gives per head [q | gate]: output * sigmoid(gate) (Qwen3.5) */
+    int ssm_conv_k, ssm_kh, ssm_vh, ssm_d;  /* DeltaNet: conv taps, K and V heads, head size */
+    int ff_shexp;                   /* shared expert size, 0: none */
     Mat embed, output;
     const float *final_norm;
     Layer *layers;
-    int n_attn, n_conv;
+    int n_attn, n_conv, n_delta;
     uint64_t bytes_per_token;       /* estimate of weight bytes touched per decoded token */
 } Model;
 

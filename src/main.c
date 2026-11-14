@@ -707,8 +707,9 @@ static char *trim_dup(const char *s) {
 static int chat_turn(Engine *e, const char *user, int first) {
     const int lost0 = ctx_lost(e->ctx);
     Str p = { 0 };
+    const int fam = chat_family(e->m);
     if (first) {
-        str_add(&p, "<|startoftext|>", -1);
+        if (fam != CHAT_QWEN) str_add(&p, "<|startoftext|>", -1);   /* Qwen's template has no BOS */
         if (e->a->system && *e->a->system) {
             str_add(&p, "<|im_start|>system\n", -1);
             str_add(&p, e->a->system, -1);
@@ -732,7 +733,7 @@ static int chat_turn(Engine *e, const char *user, int first) {
     const int think = e->a->think_budget != THINK_OFF && !heard;
     const int plain = heard || (!think && !template_reasons(e->m));
     if (!feed_text(e, plain ? "<|im_start|>assistant\n"
-                            : think ? "<|im_start|>assistant\n<think>" : think_off_prompt(!strcmp(e->m->arch, "lfm3")))) {
+                            : think ? think_on_prompt(fam) : think_off_prompt(fam))) {
         ctx_snapshot_free(&snap);
         return 0;
     }
@@ -944,13 +945,15 @@ static int real_main(int argc, char **argv) {
     if (!model_load(&m, a.model, err, sizeof(err))) { fprintf(stderr, "error: %s\n", err); return 1; }
     Tokenizer *tk = tok_load(&m.gguf, err, sizeof(err));
     if (!tk) { fprintf(stderr, "error: %s\n", err); return 1; }
-    char moe[48] = "", swa[48] = "";
+    char moe[64] = "", swa[48] = "", rec[32];
     int n_swa = 0;
     for (int l = 0; l < m.n_layer; l++) n_swa += m.layers[l].is_swa;
-    if (m.n_expert) snprintf(moe, sizeof(moe), " | %d experts top-%d", m.n_expert, m.n_expert_used);
+    if (m.n_expert) snprintf(moe, sizeof(moe), " | %d experts top-%d%s", m.n_expert, m.n_expert_used, m.ff_shexp ? " + shared" : "");
     if (n_swa) snprintf(swa, sizeof(swa), ", %d of them sliding-window %d", n_swa, m.swa_window);
-    fprintf(stderr, "model: %s | %d layers (%d attn%s, %d conv) | dim %d%s | vocab %d | %.2f GB | ~%.0f MB/token | %.2f s\n",
-            m.arch, m.n_layer, m.n_attn, swa, m.n_conv, m.dim, moe, m.n_vocab,
+    if (m.n_delta) snprintf(rec, sizeof(rec), "%d DeltaNet", m.n_delta);
+    else snprintf(rec, sizeof(rec), "%d conv", m.n_conv);
+    fprintf(stderr, "model: %s | %d layers (%d attn%s, %s) | dim %d%s | vocab %d | %.2f GB | ~%.0f MB/token | %.2f s\n",
+            m.arch, m.n_layer, m.n_attn, swa, rec, m.dim, moe, m.n_vocab,
             m.gguf.mf.size / 1073741824.0, m.bytes_per_token / 1048576.0, time_sec() - t0);
 
     if (a.tokenize) {

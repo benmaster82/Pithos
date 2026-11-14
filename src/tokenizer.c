@@ -23,6 +23,7 @@ struct Tokenizer {
     int byte_tok[256];
     int *special; int n_special;            /* control/user tokens, longest first */
     int bos, eos;
+    int qwen;                               /* tokenizer.ggml.pre "qwen35": its regex, merges always applied */
 };
 
 /* ------------------------------------------------------------------ unicode helpers */
@@ -236,6 +237,9 @@ Tokenizer *tok_load(const GGUF *g, char *err, int errlen) {
 
     t->bos = (int)gguf_get_int(g, "tokenizer.ggml.bos_token_id", -1);
     t->eos = (int)gguf_get_int(g, "tokenizer.ggml.eos_token_id", -1);
+    uint64_t pl = 0;
+    const char *pre = gguf_get_str(g, "tokenizer.ggml.pre", &pl);
+    t->qwen = pre && pl == 6 && !memcmp(pre, "qwen35", 6);
     return t;
 }
 
@@ -251,8 +255,9 @@ void tok_free(Tokenizer *t) {
 
 static int bpe_word(const Tokenizer *t, const unsigned char *s, int n, int *out, int max_out, int count) {
     /* ignore_merges (tokenizer.json of LFM2 / LFM2.5 / LFM3, llama.cpp for the lfm2 pre-tokenizer):
-     * a word that is itself in the vocabulary is one token, even where the merges would split it */
-    if (n <= 64) { /* the vocabulary holds the byte-level form: each byte as its own symbol's text */
+     * a word that is itself in the vocabulary is one token, even where the merges would split it.
+     * Qwen's tokenizer does not set it. */
+    if (n <= 64 && !t->qwen) { /* the vocabulary holds the byte-level form: each byte as its own symbol's text */
         char enc[64 * 2];
         int el = 0, ok = 1;
         for (int i = 0; i < n && ok; i++) {
@@ -291,9 +296,13 @@ static int bpe_word(const Tokenizer *t, const unsigned char *s, int n, int *out,
 
 /* LFM2 / llama3 regex:
  * (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|
- *  ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+ */
+ *  ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+ * qwen35: the same with [\p{L}\p{M}]+ for the letters, single digits \p{N} and the marks out of
+ * the punctuation runs,  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]* */
 static int encode_plain(const Tokenizer *t, const unsigned char *s, int n, int *out, int max_out, int count) {
     if (n <= 0) return count;
+    const int letter = t->qwen ? UNI_LETTER | UNI_MARK : UNI_LETTER, max_digits = t->qwen ? 1 : 3;
+    const int not_punct = UNI_SPACE | UNI_NUMBER | letter;
     /* decode to codepoints with byte offsets */
     int cap = n + 1;
     uint32_t *cp = (uint32_t *)malloc(sizeof(uint32_t) * cap);
@@ -328,26 +337,26 @@ static int encode_plain(const Tokenizer *t, const unsigned char *s, int n, int *
                 if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) { pos += 3; goto emit; }
             }
         }
-        /* [^\r\n\p{L}\p{N}]?\p{L}+ */
+        /* [^\r\n\p{L}\p{N}]?\p{L}+ (qwen35: [\p{L}\p{M}]+, a leading mark is part of the run anyway) */
         if (!(c == '\r' || c == '\n' || (f & UNI_NUMBER))) {
-            if ((f & UNI_LETTER) || (FL(pos + 1) & UNI_LETTER)) {
+            if ((f & letter) || (FL(pos + 1) & letter)) {
                 pos++;
-                while (FL(pos) & UNI_LETTER) pos++;
+                while (FL(pos) & letter) pos++;
                 goto emit;
             }
         }
-        /* \p{N}{1,3} */
+        /* \p{N}{1,3} (qwen35: \p{N}) */
         if (f & UNI_NUMBER) {
             int k = 0;
-            while (k < 3 && (FL(pos) & UNI_NUMBER)) { pos++; k++; }
+            while (k < max_digits && (FL(pos) & UNI_NUMBER)) { pos++; k++; }
             goto emit;
         }
         /*  ?[^\s\p{L}\p{N}]+[\r\n]* */
         {
             int p2 = (c == ' ') ? pos + 1 : pos;
-            if (p2 < nc && !(FL(p2) & (UNI_SPACE | UNI_LETTER | UNI_NUMBER))) {
+            if (p2 < nc && !(FL(p2) & not_punct)) {
                 pos = p2;
-                while (pos < nc && !(FL(pos) & (UNI_SPACE | UNI_LETTER | UNI_NUMBER))) pos++;
+                while (pos < nc && !(FL(pos) & not_punct)) pos++;
                 while (CP(pos) == '\r' || CP(pos) == '\n') pos++;
                 goto emit;
             }

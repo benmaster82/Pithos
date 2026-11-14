@@ -11,7 +11,15 @@
  * LFM3 adds, each one only where the model has it: an RMSNorm on both block outputs before
  * they enter the residual stream (sandwich norm), a sigmoid gate per head on the attention
  * output (computed from h), sliding-window attention on some layers with their own RoPE base,
- * and partial rotation on the full-attention layers (rope_freqs divisors). */
+ * and partial rotation on the full-attention layers (rope_freqs divisors).
+ *
+ * Qwen3.5 / 3.6 MoE (qwen35moe): three Gated DeltaNet layers to one full-attention layer, every
+ * FFN an MoE (softmax router, top-k renormalized) plus a shared expert gated by sigmoid(w . h).
+ * DeltaNet: qkv = silu(causal_conv(attn_qkv h)), q and k L2-normalized, per V head j (K head
+ * j % n_k) S = S exp(g) + beta k (v - S^T k)^T, o = S^T q / sqrt(d), then rmsnorm(o) silu(z).
+ * Attention: attn_q gives q and a gate per head, RoPE on the first n_rot dims only, the output
+ * multiplied by sigmoid(gate) elementwise. The converter folded the +1 of Qwen's norms into the
+ * weights and stored ssm_a as -exp(A_log). */
 #include "model.h"
 #include "gpu.h"
 #include "gpu_dx.h"
@@ -28,7 +36,7 @@
 #define PREFETCH(p) __builtin_prefetch((p), 0, 3)
 #endif
 
-#define MAX_JOBS 160
+#define MAX_JOBS (2 * MAX_EXPERT + 32)   /* gate and up of every expert of a prompt chunk, at most */
 #define DX_MIN_TOKENS 1      /* default PITHOS_DX_MIN: matmuls over fewer tokens stay on the CPU */
 #define MAX_TASKS 32768
 #define TOK_TILE 16
@@ -75,6 +83,127 @@ static const float *load_f32(Model *m, const char *name, int n, int required, ch
 #define REQ(expr) do { if ((expr) <= 0) goto fail; } while (0)
 #define REQP(expr) do { if (!(expr)) goto fail; } while (0)
 
+/* weight bytes one decoded token touches */
+static uint64_t token_bytes(const Model *m) {
+    uint64_t b = (uint64_t)m->output.row_bytes * m->n_vocab;
+    for (int l = 0; l < m->n_layer; l++) {
+        const Layer *L = &m->layers[l];
+        if (L->is_attn) b += (uint64_t)L->wq.expert_stride + L->wk.expert_stride + L->wv.expert_stride + L->wo.expert_stride +
+                             L->attn_gate.expert_stride;
+        else if (L->is_delta) b += (uint64_t)L->ssm_qkv.expert_stride + L->ssm_z.expert_stride + L->ssm_alpha.expert_stride +
+                                   L->ssm_beta.expert_stride + L->ssm_out.expert_stride;
+        else b += (uint64_t)L->in_proj.expert_stride + L->out_proj.expert_stride;
+        if (L->is_moe) b += (uint64_t)m->n_expert_used * (L->gate_exps.expert_stride + L->up_exps.expert_stride + L->down_exps.expert_stride) +
+                            L->sh_gate.expert_stride + L->sh_up.expert_stride + L->sh_down.expert_stride;
+        else b += (uint64_t)L->w_gate.expert_stride + L->w_up.expert_stride + L->w_down.expert_stride;
+    }
+    return b;
+}
+
+/* Qwen3.5 / 3.6 MoE, the GGUF of llama.cpp's converter (arch qwen35moe); m->gguf is open */
+static int load_qwen35(Model *m, char *err, int errlen) {
+    GGUF *g = &m->gguf;
+#define KEY(s) "qwen35moe." s
+    m->n_layer = (int)gguf_get_int(g, KEY("block_count"), 0);
+    m->dim = (int)gguf_get_int(g, KEY("embedding_length"), 0);
+    m->n_head = (int)gguf_get_int(g, KEY("attention.head_count"), 0);
+    m->n_kv_head = (int)gguf_get_int(g, KEY("attention.head_count_kv"), 0);
+    m->head_dim = (int)gguf_get_int(g, KEY("attention.key_length"), 0);
+    m->n_rot = (int)gguf_get_int(g, KEY("rope.dimension_count"), m->head_dim);
+    m->ff_exp = (int)gguf_get_int(g, KEY("expert_feed_forward_length"), 0);
+    m->ff_shexp = (int)gguf_get_int(g, KEY("expert_shared_feed_forward_length"), 0);
+    m->n_expert = (int)gguf_get_int(g, KEY("expert_count"), 0);
+    m->n_expert_used = (int)gguf_get_int(g, KEY("expert_used_count"), 0);
+    m->n_ctx_train = (int)gguf_get_int(g, KEY("context_length"), 4096);
+    m->eps = (float)gguf_get_float(g, KEY("attention.layer_norm_rms_epsilon"), 1e-6);
+    m->rope_base = m->rope_base_swa = (float)gguf_get_float(g, KEY("rope.freq_base"), 1e7);
+    m->ssm_conv_k = (int)gguf_get_int(g, KEY("ssm.conv_kernel"), 0);
+    m->ssm_d = (int)gguf_get_int(g, KEY("ssm.state_size"), 0);
+    m->ssm_kh = (int)gguf_get_int(g, KEY("ssm.group_count"), 0);
+    m->ssm_vh = (int)gguf_get_int(g, KEY("ssm.time_step_rank"), 0);
+    const int inner = (int)gguf_get_int(g, KEY("ssm.inner_size"), 0);
+    const int interval = (int)gguf_get_int(g, KEY("full_attention_interval"), 4);
+    const GGUFKV *rec = gguf_find(g, KEY("attention.recurrent_layers"));
+#undef KEY
+    m->gating = 1;      /* softmax over all experts, then the top k renormalized */
+    m->norm_topk = 1;
+    m->q_gate = 1;
+    m->l_cache = 1;     /* no short conv: no state of its own */
+    m->add_bos = (int)gguf_get_int(g, "tokenizer.ggml.add_bos_token", 0);
+    if (m->n_layer <= 0 || m->dim <= 0 || m->n_head <= 0 || m->n_kv_head <= 0 || m->n_head % m->n_kv_head ||
+        m->head_dim <= 0 || m->head_dim > 256 || m->n_rot <= 0 || m->n_rot > m->head_dim || m->n_rot % 2 ||
+        m->ssm_conv_k < 2 || m->ssm_d <= 0 || m->ssm_d > 256 || m->ssm_kh <= 0 || m->ssm_vh % m->ssm_kh ||
+        inner != m->ssm_vh * m->ssm_d || m->n_expert <= 0 || m->n_expert > MAX_EXPERT || m->n_expert_used <= 0 ||
+        m->n_expert_used > 8 || m->ff_exp % QK_K || m->ff_shexp % QK_K) {
+        snprintf(err, errlen, "qwen35moe: unsupported hyperparameters");
+        return 0;
+    }
+    REQ(load_mat(m, &m->embed, "token_embd.weight", 1, err, errlen));
+    m->n_vocab = m->embed.rows;
+    if (load_mat(m, &m->output, "output.weight", 0, err, errlen) < 0) return 0;
+    if (!m->output.data) m->output = m->embed;
+    REQP(m->final_norm = load_f32(m, "output_norm.weight", m->dim, 1, err, errlen));
+
+    const int qkv = 2 * m->ssm_kh * m->ssm_d + inner;
+    m->layers = (Layer *)calloc((size_t)m->n_layer, sizeof(Layer));
+    char nm[128];
+#define T(s) (snprintf(nm, sizeof(nm), "blk.%d." s, l), nm)
+    for (int l = 0; l < m->n_layer; l++) {
+        Layer *L = &m->layers[l];
+        L->is_delta = rec && rec->type == GGUF_T_ARRAY ? gguf_arr_int(rec, (uint64_t)l) != 0 : (l + 1) % interval != 0;
+        L->is_attn = !L->is_delta;
+        REQP(L->attn_norm = load_f32(m, T("attn_norm.weight"), m->dim, 1, err, errlen));
+        REQP(L->ffn_norm = load_f32(m, T("post_attention_norm.weight"), m->dim, 1, err, errlen));  /* the pre-FFN norm */
+        if (L->is_delta) {
+            L->delta_idx = m->n_delta++;
+            REQ(load_mat(m, &L->ssm_qkv, T("attn_qkv.weight"), 1, err, errlen));
+            REQ(load_mat(m, &L->ssm_z, T("attn_gate.weight"), 1, err, errlen));
+            REQ(load_mat(m, &L->ssm_alpha, T("ssm_alpha.weight"), 1, err, errlen));
+            REQ(load_mat(m, &L->ssm_beta, T("ssm_beta.weight"), 1, err, errlen));
+            REQ(load_mat(m, &L->ssm_out, T("ssm_out.weight"), 1, err, errlen));
+            REQP(L->ssm_conv = load_f32(m, T("ssm_conv1d.weight"), qkv * m->ssm_conv_k, 1, err, errlen));
+            REQP(L->ssm_a = load_f32(m, T("ssm_a"), m->ssm_vh, 1, err, errlen));
+            REQP(L->ssm_dt = load_f32(m, T("ssm_dt.bias"), m->ssm_vh, 1, err, errlen));
+            REQP(L->ssm_norm = load_f32(m, T("ssm_norm.weight"), m->ssm_d, 1, err, errlen));
+            if (L->ssm_qkv.rows != qkv || L->ssm_z.rows != inner || L->ssm_alpha.rows != m->ssm_vh ||
+                L->ssm_beta.rows != m->ssm_vh || L->ssm_out.cols != inner || L->ssm_out.rows != m->dim) {
+                snprintf(err, errlen, "layer %d: DeltaNet tensors of unexpected shape", l);
+                return 0;
+            }
+        } else {
+            L->attn_idx = m->n_attn++;
+            REQ(load_mat(m, &L->wq, T("attn_q.weight"), 1, err, errlen));
+            REQ(load_mat(m, &L->wk, T("attn_k.weight"), 1, err, errlen));
+            REQ(load_mat(m, &L->wv, T("attn_v.weight"), 1, err, errlen));
+            REQ(load_mat(m, &L->wo, T("attn_output.weight"), 1, err, errlen));
+            REQP(L->q_norm = load_f32(m, T("attn_q_norm.weight"), m->head_dim, 1, err, errlen));
+            REQP(L->k_norm = load_f32(m, T("attn_k_norm.weight"), m->head_dim, 1, err, errlen));
+            if (L->wq.rows != 2 * m->n_head * m->head_dim || L->wk.rows != m->n_kv_head * m->head_dim ||
+                L->wo.cols != m->n_head * m->head_dim) {
+                snprintf(err, errlen, "layer %d: attention tensors of unexpected shape", l);
+                return 0;
+            }
+        }
+        L->is_moe = 1;
+        REQ(load_mat(m, &L->router, T("ffn_gate_inp.weight"), 1, err, errlen));
+        if (L->router.type != GGML_F32 || L->router.rows != m->n_expert) { snprintf(err, errlen, "router must be F32"); return 0; }
+        REQ(load_mat(m, &L->gate_exps, T("ffn_gate_exps.weight"), 1, err, errlen));
+        REQ(load_mat(m, &L->up_exps, T("ffn_up_exps.weight"), 1, err, errlen));
+        REQ(load_mat(m, &L->down_exps, T("ffn_down_exps.weight"), 1, err, errlen));
+        if (m->ff_shexp) {
+            REQ(load_mat(m, &L->sh_gate, T("ffn_gate_shexp.weight"), 1, err, errlen));
+            REQ(load_mat(m, &L->sh_up, T("ffn_up_shexp.weight"), 1, err, errlen));
+            REQ(load_mat(m, &L->sh_down, T("ffn_down_shexp.weight"), 1, err, errlen));
+            REQP(L->sh_inp = load_f32(m, T("ffn_gate_inp_shexp.weight"), m->dim, 1, err, errlen));
+        }
+    }
+#undef T
+    m->bytes_per_token = token_bytes(m);
+    return 1;
+fail:
+    return 0;
+}
+
 int model_load(Model *m, const char *path, char *err, int errlen) {
     memset(m, 0, sizeof(*m));
     if (!gguf_open(&m->gguf, path, err, errlen)) return 0;
@@ -84,8 +213,12 @@ int model_load(Model *m, const char *path, char *err, int errlen) {
     if (!arch || al >= sizeof(m->arch)) { snprintf(err, errlen, "no architecture"); goto fail; }
     memcpy(m->arch, arch, al);
     m->arch[al] = 0;
+    if (!strcmp(m->arch, "qwen35moe")) {
+        if (load_qwen35(m, err, errlen)) return 1;
+        goto fail;
+    }
     if (strcmp(m->arch, "lfm2") && strcmp(m->arch, "lfm2moe") && strcmp(m->arch, "lfm3")) {
-        snprintf(err, errlen, "unsupported architecture '%s' (need lfm2 / lfm2moe / lfm3)", m->arch);
+        snprintf(err, errlen, "unsupported architecture '%s' (need lfm2 / lfm2moe / lfm3 / qwen35moe)", m->arch);
         goto fail;
     }
     char key[128];
@@ -112,6 +245,7 @@ int model_load(Model *m, const char *path, char *err, int errlen) {
     m->add_bos = (int)gguf_get_int(g, "tokenizer.ggml.add_bos_token", 1);
     if (m->n_layer <= 0 || m->dim <= 0 || m->n_head <= 0 || !kvh) { snprintf(err, errlen, "bad hyperparameters"); goto fail; }
     m->head_dim = key_len > 0 ? key_len : m->dim / m->n_head;
+    m->n_rot = m->head_dim;
     if (m->head_dim > 256 || m->head_dim % 2) { snprintf(err, errlen, "head size %d not supported", m->head_dim); goto fail; }
     if (m->n_expert > 64) { snprintf(err, errlen, "too many experts (%d)", m->n_expert); goto fail; }
 
@@ -175,17 +309,7 @@ int model_load(Model *m, const char *path, char *err, int errlen) {
         }
     }
 #undef T
-    /* bytes touched per decoded token (weights) */
-    uint64_t b = (uint64_t)m->output.row_bytes * m->n_vocab;
-    for (int l = 0; l < m->n_layer; l++) {
-        Layer *L = &m->layers[l];
-        if (L->is_attn) b += (uint64_t)L->wq.expert_stride + L->wk.expert_stride + L->wv.expert_stride + L->wo.expert_stride +
-                             L->attn_gate.expert_stride;
-        else b += (uint64_t)L->in_proj.expert_stride + L->out_proj.expert_stride;
-        if (L->is_moe) b += (uint64_t)m->n_expert_used * (L->gate_exps.expert_stride + L->up_exps.expert_stride + L->down_exps.expert_stride);
-        else b += (uint64_t)L->w_gate.expert_stride + L->w_up.expert_stride + L->w_down.expert_stride;
-    }
-    m->bytes_per_token = b;
+    m->bytes_per_token = token_bytes(m);
     if (!m->n_kv_head) m->n_kv_head = m->n_head;
     return 1;
 fail:
@@ -246,6 +370,7 @@ int model_load_lfm_part(Model *m, const char *path, const char *prefix, const ch
         if (fg && !m->ff_dense) m->ff_dense = (int)fg->ne[1];
     }
     if (!m->l_cache) m->l_cache = 3;
+    m->n_rot = m->head_dim;
     if (m->n_layer <= 0 || m->dim <= 0 || m->n_head <= 0 || m->head_dim <= 0 || m->head_dim > 256) {
         snprintf(err, errlen, "%s: no usable %s* blocks", path, prefix);
         goto fail;
@@ -328,9 +453,13 @@ struct Context {
     float *gy;                  /* [n_batch * K][dim] GPU expert outputs */
     int pred[64], pred_n, pred_layer;
     uint32_t tok_counter;       /* tokens processed since creation (never reset) */
-    uint32_t last_used[64 * 64];/* [layer][expert] -> tok_counter at last use */
+    uint32_t *last_used;        /* [layer][expert] -> tok_counter at last use */
     f16_t *kc, *vc;
+    /* the recurrent state: [n_conv][l_cache-1][dim] short-conv inputs, then per DeltaNet layer
+     * its last ssm_conv_k-1 qkv rows and the S matrices [ssm_vh][ssm_d][ssm_d] */
     float *conv;
+    size_t delta_off, delta_size;   /* in floats: where the DeltaNet part starts, one layer's share */
+    float *qg;                  /* [n_batch][2 * n_head * head_dim] attn_q output with the gates (q_gate) */
     float inv_freq[256], inv_freq_swa[256];
     float *gate;                /* [n_batch][n_head] attention output gates (LFM3) */
     const float *ext;           /* [n_ext][dim] input rows of the token ids -1, -2... (ctx_set_embeds) */
@@ -367,30 +496,41 @@ Context *ctx_create(Model *m, ThreadPool *pool, int n_ctx, int n_batch) {
     c->prefetch_rows = getenv("PITHOS_PF") ? atoi(getenv("PITHOS_PF")) : 4;
     c->tok_counter = 1;
     c->pred_layer = -1;
-    int B = c->n_batch, D = m->dim, kvd = m->n_kv_head * m->head_dim;
+    int B = c->n_batch, D = m->dim, kvd = m->n_kv_head * m->head_dim, qd = m->n_head * m->head_dim;
     int nbd = D / QK_K;
     size_t kvn = (size_t)m->n_attn * n_ctx * kvd;
     c->kc = (f16_t *)aligned_malloc(kvn * sizeof(f16_t) + 64, 64);
     c->vc = (f16_t *)aligned_malloc(kvn * sizeof(f16_t) + 64, 64);
-    c->conv = (float *)amalloc(sizeof(float) * (size_t)(m->n_conv ? m->n_conv : 1) * (m->l_cache - 1) * D);
-    for (int i = 0; i < m->head_dim / 2; i++) {
-        c->inv_freq[i] = (float)pow((double)m->rope_base, -2.0 * i / m->head_dim);
+    const int vd = m->ssm_vh * m->ssm_d, qkv = 2 * m->ssm_kh * m->ssm_d + vd;
+    c->delta_off = (size_t)(m->n_conv ? m->n_conv : 1) * (m->l_cache - 1) * D;
+    c->delta_size = m->n_delta ? (size_t)(m->ssm_conv_k - 1) * qkv + (size_t)vd * m->ssm_d : 0;
+    c->conv = (float *)amalloc(sizeof(float) * (c->delta_off + (size_t)m->n_delta * c->delta_size));
+    for (int i = 0; i < m->n_rot / 2; i++) {
+        c->inv_freq[i] = (float)pow((double)m->rope_base, -2.0 * i / m->n_rot);
         if (m->rope_freqs) c->inv_freq[i] /= m->rope_freqs[i]; /* a huge divisor leaves the pair unrotated */
-        c->inv_freq_swa[i] = (float)pow((double)m->rope_base_swa, -2.0 * i / m->head_dim);
+        c->inv_freq_swa[i] = (float)pow((double)m->rope_base_swa, -2.0 * i / m->n_rot);
     }
+    /* widest rows: short conv [B|C|x], attention [q|k|v], DeltaNet [qkv|z|alpha|beta] */
     int bigw = 3 * D;
-    if (D + 2 * kvd > bigw) bigw = D + 2 * kvd;
+    if (qd + 2 * kvd > bigw) bigw = qd + 2 * kvd;
+    if (m->n_delta && qkv + vd + 2 * m->ssm_vh > bigw) bigw = qkv + vd + 2 * m->ssm_vh;
+    int tw = D;                 /* the input of the output projections */
+    if (qd > tw) tw = qd;
+    if (vd > tw) tw = vd;
     c->x = (float *)amalloc(sizeof(float) * B * D);
     c->h = (float *)amalloc(sizeof(float) * B * D);
     c->big = (float *)amalloc(sizeof(float) * B * bigw);
-    c->tmp = (float *)amalloc(sizeof(float) * B * D);
+    c->tmp = (float *)amalloc(sizeof(float) * B * tw);
     c->out = (float *)amalloc(sizeof(float) * B * D);
-    c->gate = (float *)amalloc(sizeof(float) * B * m->n_head);
+    c->gate = (float *)amalloc(sizeof(float) * B * (m->q_gate ? qd : m->n_head));
+    if (m->q_gate) c->qg = (float *)amalloc(sizeof(float) * B * 2 * qd);
     c->rope = (float *)amalloc(sizeof(float) * 2 * B * m->head_dim);
     c->logits = (float *)amalloc(sizeof(float) * m->n_vocab);
     c->hq = (block_q8_K *)amalloc(sizeof(block_q8_K) * B * nbd);
-    c->tq = (block_q8_K *)amalloc(sizeof(block_q8_K) * B * nbd);
+    c->tq = (block_q8_K *)amalloc(sizeof(block_q8_K) * B * (tw / QK_K));
+    c->last_used = (uint32_t *)calloc((size_t)m->n_layer * (m->n_expert ? m->n_expert : 1), sizeof(uint32_t));
     int ffd = m->ff_dense > 0 ? m->ff_dense : QK_K;
+    if (m->ff_shexp > ffd) ffd = m->ff_shexp;
     c->fg = (float *)amalloc(sizeof(float) * B * ffd);
     c->fu = (float *)amalloc(sizeof(float) * B * ffd);
     c->fq = (block_q8_K *)amalloc(sizeof(block_q8_K) * B * (ffd / QK_K));
@@ -424,9 +564,9 @@ void ctx_free(Context *c) {
     if (c->pfq) prefetcher_destroy(c->pfq);
     void *a[] = { c->kc, c->vc, c->conv, c->x, c->h, c->big, c->tmp, c->out, c->gate, c->rope, c->logits, c->hq, c->tq,
                   c->fg, c->fu, c->fq, c->rlog, c->selw, c->sel, c->a_tok, c->a_slot, c->tok_a, c->xg,
-                  c->eg, c->eu, c->eq, c->eo, c->scores, c->gy, c->on_gpu, c->ga_e, c->ga_t };
+                  c->eg, c->eu, c->eq, c->eo, c->scores, c->gy, c->on_gpu, c->ga_e, c->ga_t, c->qg };
     for (size_t i = 0; i < sizeof(a) / sizeof(a[0]); i++) aligned_free(a[i]);
-    free(c->task_job); free(c->task_r0); free(c->task_r1);
+    free(c->task_job); free(c->task_r0); free(c->task_r1); free(c->last_used);
     free(c);
 }
 
@@ -495,11 +635,11 @@ void ctx_reset(Context *c) {
     c->kv_cpu_n = c->kv_gpu_n = 0;
     c->conv_cpu_ok = 1;
     c->conv_gpu_ok = 0;
-    memset(c->conv, 0, sizeof(float) * (size_t)(c->m->n_conv ? c->m->n_conv : 1) * (c->m->l_cache - 1) * c->m->dim);
+    memset(c->conv, 0, sizeof(float) * (c->delta_off + (size_t)c->m->n_delta * c->delta_size));
 }
 
 static size_t conv_state_size(const Context *c) {
-    return sizeof(float) * (size_t)(c->m->n_conv ? c->m->n_conv : 1) * (c->m->l_cache - 1) * c->m->dim;
+    return sizeof(float) * (c->delta_off + (size_t)c->m->n_delta * c->delta_size);
 }
 
 void ctx_snapshot(const Context *cc, CtxSnapshot *s) {
@@ -730,8 +870,9 @@ static void quantize_rows(const float *x, int n, int K, block_q8_K *q) {
 }
 
 
-static void rope_neox(float *v, int hd, int pos, const float *inv_freq) {
-    const int half = hd / 2;
+/* NEOX rotation of the first n_rot values of a head: pairs (i, i + n_rot / 2) */
+static void rope_neox(float *v, int n_rot, int pos, const float *inv_freq) {
+    const int half = n_rot / 2;
     for (int i = 0; i < half; i++) {
         const double a = (double)pos * inv_freq[i];
         const float cs = (float)cos(a), sn = (float)sin(a);
@@ -753,10 +894,10 @@ static void attn_task(void *ctx, int task, int tid) {
     AttnArgs *a = (AttnArgs *)ctx;
     Context *c = a->c;
     const Model *m = c->m;
-    const int hd = m->head_dim, nh = m->n_head, kvd = m->n_kv_head * hd;
+    const int hd = m->head_dim, nh = m->n_head, kvd = m->n_kv_head * hd, qd = nh * hd;
     const int t = task / nh, h = task % nh;
     const int kvh = h / (nh / m->n_kv_head);
-    const int qkvw = m->dim + 2 * kvd;
+    const int qkvw = qd + 2 * kvd;
     const float *q = c->big + (size_t)t * qkvw + h * hd;
     const int npos = m->bidir ? a->pos0 + a->n : a->pos0 + t + 1;
     /* sliding-window layers see the last swa_window positions, the current one included */
@@ -775,41 +916,54 @@ static void attn_task(void *ctx, int task, int tid) {
     const float sum = KS.exp_sum(s, npos - j0, mx);
     float inv = 1.f / sum;
     if (a->L->attn_gate.data) inv *= c->gate[(size_t)t * nh + h]; /* LFM3 output gate */
-    float *o = c->tmp + (size_t)t * m->dim + h * hd;
+    float *o = c->tmp + (size_t)t * qd + h * hd;
     float acc[512];
     memset(acc, 0, sizeof(float) * hd);
     for (int j = j0; j < npos; j++) KS.axpy_f16(s[j - j0] * inv, vc + (size_t)j * kvd, acc, hd);
+    if (m->q_gate) {   /* Qwen3.5: elementwise sigmoid gate */
+        const float *g = c->gate + (size_t)t * qd + h * hd;
+        for (int i = 0; i < hd; i++) acc[i] *= g[i];
+    }
     memcpy(o, acc, sizeof(float) * hd);
 }
 
 static void attention_block(Context *c, const Layer *L, int n) {
     const Model *m = c->m;
-    const int D = m->dim, hd = m->head_dim, kvd = m->n_kv_head * hd, nbd = D / QK_K;
-    const int qkvw = D + 2 * kvd;
+    const int D = m->dim, hd = m->head_dim, kvd = m->n_kv_head * hd, nbd = D / QK_K, qd = m->n_head * hd;
+    const int qkvw = qd + 2 * kvd;
     quantize_rows(c->h, n, D, c->hq);
     job_clear(c);
-    job_add_q(c, &L->wq, NULL, c->hq, nbd, n, c->big, qkvw);
-    job_add_q(c, &L->wk, NULL, c->hq, nbd, n, c->big + D, qkvw);
-    job_add_q(c, &L->wv, NULL, c->hq, nbd, n, c->big + D + kvd, qkvw);
+    if (m->q_gate) job_add_q(c, &L->wq, NULL, c->hq, nbd, n, c->qg, 2 * qd);
+    else job_add_q(c, &L->wq, NULL, c->hq, nbd, n, c->big, qkvw);
+    job_add_q(c, &L->wk, NULL, c->hq, nbd, n, c->big + qd, qkvw);
+    job_add_q(c, &L->wv, NULL, c->hq, nbd, n, c->big + qd + kvd, qkvw);
     if (L->attn_gate.data) job_add_q(c, &L->attn_gate, NULL, c->hq, nbd, n, c->gate, m->n_head);
     job_run(c, CAT_ATTN);
 
     double t0 = time_sec();
     if (L->attn_gate.data)
         for (int i = 0; i < n * m->n_head; i++) c->gate[i] = 1.f / (1.f + expf(-c->gate[i]));
+    if (m->q_gate)   /* per head [q | gate]: q into its row, sigmoid(gate) aside */
+        for (int t = 0; t < n; t++)
+            for (int h = 0; h < m->n_head; h++) {
+                const float *src = c->qg + (size_t)t * 2 * qd + (size_t)h * 2 * hd;
+                float *g = c->gate + (size_t)t * qd + h * hd;
+                memcpy(c->big + (size_t)t * qkvw + h * hd, src, sizeof(float) * hd);
+                for (int i = 0; i < hd; i++) g[i] = 1.f / (1.f + expf(-src[hd + i]));
+            }
     const float *inv_freq = L->is_swa ? c->inv_freq_swa : c->inv_freq;
     const size_t lbase = (size_t)L->attn_idx * c->n_ctx * kvd;
     for (int t = 0; t < n; t++) {
         float *q = c->big + (size_t)t * qkvw;
-        float *k = q + D, *v = q + D + kvd;
+        float *k = q + qd, *v = q + qd + kvd;
         const int pos = c->pos + t;
         for (int h = 0; h < m->n_head; h++) {
             rmsnorm(q + h * hd, q + h * hd, L->q_norm, hd, m->eps);
-            rope_neox(q + h * hd, hd, pos, inv_freq);
+            rope_neox(q + h * hd, m->n_rot, pos, inv_freq);
         }
         for (int h = 0; h < m->n_kv_head; h++) {
             rmsnorm(k + h * hd, k + h * hd, L->k_norm, hd, m->eps);
-            rope_neox(k + h * hd, hd, pos, inv_freq);
+            rope_neox(k + h * hd, m->n_rot, pos, inv_freq);
         }
         KS.f32_to_f16_row(k, c->kc + lbase + (size_t)pos * kvd, kvd);
         KS.f32_to_f16_row(v, c->vc + lbase + (size_t)pos * kvd, kvd);
@@ -818,10 +972,108 @@ static void attention_block(Context *c, const Layer *L, int n) {
     pool_run(c->pool, attn_task, &a, n * m->n_head);
     c->stats.t_attn += time_sec() - t0;
 
-    quantize_rows(c->tmp, n, D, c->tq);
+    quantize_rows(c->tmp, n, qd, c->tq);
     job_clear(c);
-    job_add_q(c, &L->wo, NULL, c->tq, nbd, n, c->out, D);
+    job_add_q(c, &L->wo, NULL, c->tq, qd / QK_K, n, c->out, D);
     job_run(c, CAT_ATTN);
+}
+
+/* ------------------------------------------------------------------ Gated DeltaNet */
+
+typedef struct {
+    Context *c;
+    const Layer *L;
+    int n;
+    float *st;          /* the layer's S matrices [vh][d][d], S[i][j]: key i, value j */
+} DeltaArgs;
+
+/* one V head over the n tokens of the chunk, in order (the recurrence is sequential in time) */
+static void delta_task(void *ctx, int j, int tid) {
+    (void)tid;
+    DeltaArgs *a = (DeltaArgs *)ctx;
+    Context *c = a->c;
+    const Model *m = c->m;
+    const int d = m->ssm_d, kd = m->ssm_kh * d, vd = m->ssm_vh * d, qkv = 2 * kd + vd;
+    const int bw = qkv + vd + 2 * m->ssm_vh, kh = j % m->ssm_kh;   /* V heads tiled over the K heads */
+    float *S = a->st + (size_t)j * d * d;
+    float u[256], o[256];
+    for (int t = 0; t < a->n; t++) {
+        const float *row = c->big + (size_t)t * bw;
+        const float *q = row + kh * d, *k = row + kd + kh * d, *v = row + 2 * kd + j * d;
+        const float alpha = row[qkv + vd + j], beta = row[qkv + vd + m->ssm_vh + j];
+        const float x = alpha + a->L->ssm_dt[j];
+        const float sp = x > 20.f ? x : log1pf(expf(x));                 /* softplus */
+        const float decay = expf(sp * a->L->ssm_a[j]);                   /* ssm_a = -exp(A_log) */
+        const float b = 1.f / (1.f + expf(-beta));
+        /* S *= decay; u = beta (v - S^T k) */
+        for (int i = 0; i < d; i++) u[i] = 0.f;
+        for (int i = 0; i < d; i++) {
+            float *Si = S + (size_t)i * d;
+            const float ki = k[i];
+            for (int jj = 0; jj < d; jj++) { Si[jj] *= decay; u[jj] += Si[jj] * ki; }
+        }
+        for (int jj = 0; jj < d; jj++) u[jj] = b * (v[jj] - u[jj]);
+        /* S += k u^T; o = S^T q */
+        for (int jj = 0; jj < d; jj++) o[jj] = 0.f;
+        for (int i = 0; i < d; i++) {
+            float *Si = S + (size_t)i * d;
+            const float ki = k[i], qi = q[i];
+            for (int jj = 0; jj < d; jj++) { Si[jj] += ki * u[jj]; o[jj] += Si[jj] * qi; }
+        }
+        /* rmsnorm per head times silu(z) */
+        const float *z = row + qkv + j * d;
+        double ss = 0;
+        for (int jj = 0; jj < d; jj++) ss += (double)o[jj] * o[jj];
+        const float sc = (float)(1.0 / sqrt(ss / d + m->eps));
+        float *dst = c->tmp + (size_t)t * vd + j * d;
+        for (int jj = 0; jj < d; jj++) dst[jj] = o[jj] * sc * a->L->ssm_norm[jj] * (z[jj] / (1.f + expf(-z[jj])));
+    }
+}
+
+static void deltanet_block(Context *c, const Layer *L, int n) {
+    const Model *m = c->m;
+    const int D = m->dim, nbd = D / QK_K, d = m->ssm_d, kd = m->ssm_kh * d, vd = m->ssm_vh * d, vh = m->ssm_vh;
+    const int qkv = 2 * kd + vd, bw = qkv + vd + 2 * vh, K = m->ssm_conv_k;
+    quantize_rows(c->h, n, D, c->hq);
+    job_clear(c);
+    job_add_q(c, &L->ssm_qkv, NULL, c->hq, nbd, n, c->big, bw);
+    job_add_q(c, &L->ssm_z, NULL, c->hq, nbd, n, c->big + qkv, bw);
+    job_add_q(c, &L->ssm_alpha, NULL, c->hq, nbd, n, c->big + qkv + vd, bw);
+    job_add_q(c, &L->ssm_beta, NULL, c->hq, nbd, n, c->big + qkv + vd + vh, bw);
+    job_run(c, CAT_CONV);
+
+    double t0 = time_sec();
+    float *cs = c->conv + c->delta_off + (size_t)L->delta_idx * c->delta_size;   /* [K-1][qkv], oldest first */
+    for (int t = 0; t < n; t++) {
+        float *x = c->big + (size_t)t * bw;
+        /* causal depthwise conv over the last K inputs, then silu (in place) */
+        for (int ch = 0; ch < qkv; ch++) {
+            const float *w = L->ssm_conv + (size_t)ch * K, xin = x[ch];
+            float acc = w[K - 1] * xin;
+            for (int k = 0; k < K - 1; k++) acc += w[k] * cs[(size_t)k * qkv + ch];
+            for (int k = 0; k < K - 2; k++) cs[(size_t)k * qkv + ch] = cs[(size_t)(k + 1) * qkv + ch];
+            cs[(size_t)(K - 2) * qkv + ch] = xin;
+            x[ch] = acc / (1.f + expf(-acc));
+        }
+        /* q and k: L2 norm per head (x / max(|x|, eps)), q also times 1/sqrt(d) */
+        for (int h = 0; h < 2 * m->ssm_kh; h++) {
+            float *v = x + (size_t)h * d;
+            double ss = 0;
+            for (int i = 0; i < d; i++) ss += (double)v[i] * v[i];
+            const double nrm = sqrt(ss);
+            float s = (float)(1.0 / (nrm > m->eps ? nrm : m->eps));
+            if (h < m->ssm_kh) s /= sqrtf((float)d);
+            for (int i = 0; i < d; i++) v[i] *= s;
+        }
+    }
+    DeltaArgs a = { c, L, n, cs + (size_t)(K - 1) * qkv };
+    pool_run(c->pool, delta_task, &a, vh);
+    c->stats.t_attn += time_sec() - t0;
+
+    quantize_rows(c->tmp, n, vd, c->tq);
+    job_clear(c);
+    job_add_q(c, &L->ssm_out, NULL, c->tq, vd / QK_K, n, c->out, D);
+    job_run(c, CAT_CONV);
 }
 
 /* ------------------------------------------------------------------ short conv */
@@ -856,19 +1108,34 @@ static void shortconv_block(Context *c, const Layer *L, int n) {
 
 /* ------------------------------------------------------------------ feed-forward */
 
-static void dense_ffn(Context *c, const Layer *L, int n) {
+/* out[n][dim] = down(silu(gate h) * up h) */
+static void swiglu(Context *c, const Mat *gate, const Mat *up, const Mat *down, int n, float *out) {
     const Model *m = c->m;
-    const int D = m->dim, nbd = D / QK_K, F = L->w_gate.rows;
+    const int D = m->dim, nbd = D / QK_K, F = gate->rows;
     quantize_rows(c->h, n, D, c->hq);
     job_clear(c);
-    job_add_q(c, &L->w_gate, NULL, c->hq, nbd, n, c->fg, F);
-    job_add_q(c, &L->w_up, NULL, c->hq, nbd, n, c->fu, F);
+    job_add_q(c, gate, NULL, c->hq, nbd, n, c->fg, F);
+    job_add_q(c, up, NULL, c->hq, nbd, n, c->fu, F);
     job_run(c, CAT_DENSE);
     KS.silu_mul(c->fg, c->fu, n * F);
     quantize_rows(c->fg, n, F, c->fq);
     job_clear(c);
-    job_add_q(c, &L->w_down, NULL, c->fq, F / QK_K, n, c->out, D);
+    job_add_q(c, down, NULL, c->fq, F / QK_K, n, out, D);
     job_run(c, CAT_DENSE);
+}
+
+static void dense_ffn(Context *c, const Layer *L, int n) { swiglu(c, &L->w_gate, &L->w_up, &L->w_down, n, c->out); }
+
+/* the shared expert of Qwen3.5, weighted by sigmoid(sh_inp . h), added to c->out */
+static void shared_expert(Context *c, const Layer *L, int n) {
+    const int D = c->m->dim;
+    swiglu(c, &L->sh_gate, &L->sh_up, &L->sh_down, n, c->tmp);
+    for (int t = 0; t < n; t++) {
+        const float g = 1.f / (1.f + expf(-KS.dot_f32(L->sh_inp, c->h + (size_t)t * D, D)));
+        const float *s = c->tmp + (size_t)t * D;
+        float *o = c->out + (size_t)t * D;
+        for (int i = 0; i < D; i++) o[i] += g * s[i];
+    }
 }
 
 static void prefetch_expert(Context *c, const Layer *L, int e) {
@@ -887,7 +1154,7 @@ static void predict_next_experts(Context *c, int layer) {
     if (ln >= m->n_layer || ln >= 64 || !m->layers[ln].is_moe) return;
     const Layer *Ln = &m->layers[ln];
     const int D = m->dim, E = m->n_expert;
-    float hn[8192], sc[64];
+    float hn[8192], sc[MAX_EXPERT];
     if (D > 8192 || Ln->router.type != GGML_F32) return;
     rmsnorm(hn, c->x, Ln->ffn_norm, D, m->eps);
     for (int e = 0; e < E; e++) {
@@ -908,7 +1175,8 @@ static void predict_next_experts(Context *c, int layer) {
         c->pred[k] = best;
         /* experts used in the last few dozen tokens are almost surely resident: skip them */
         if (c->gpu && gpu_resident(c->gpu, ln, best)) continue; /* served from VRAM */
-        if (c->tok_counter - c->last_used[ln * 64 + best] > 48 || !c->last_used[ln * 64 + best]) prefetch_expert(c, Ln, best);
+        const uint32_t lu = c->last_used[(size_t)ln * E + best];
+        if (c->tok_counter - lu > 48 || !lu) prefetch_expert(c, Ln, best);
     }
     c->pred_n = np;
     c->pred_layer = ln;
@@ -925,10 +1193,10 @@ static void moe_ffn(Context *c, const Layer *L, int layer, int n) {
     job_add_f(c, &L->router, c->h, D, n, c->rlog, E);
     job_run(c, CAT_ROUTER);
 
-    int cnt[64] = {0}, off[65];
+    int cnt[MAX_EXPERT] = {0}, off[MAX_EXPERT + 1];
     for (int t = 0; t < n; t++) {
         float *lg = c->rlog + (size_t)t * E;
-        float p[64], sc[64];
+        float p[MAX_EXPERT], sc[MAX_EXPERT];
         if (m->gating == 1) {
             float mx = -1e30f, s = 0;
             for (int e = 0; e < E; e++) if (lg[e] > mx) mx = lg[e];
@@ -952,10 +1220,8 @@ static void moe_ffn(Context *c, const Layer *L, int layer, int n) {
             w[k] = p[best];
             wsum += p[best];
             if (c->gpu) gpu_note_usage(c->gpu, layer, best);
-            if (layer < 64) {
-                c->stats.expert_hits[layer * 64 + best]++;
-                c->last_used[layer * 64 + best] = c->tok_counter;
-            }
+            if (layer < 64 && best < 64) c->stats.expert_hits[layer * 64 + best]++;
+            c->last_used[(size_t)layer * E + best] = c->tok_counter;
         }
         if (m->norm_topk && wsum > 0)
             for (int k = 0; k < K; k++) w[k] /= wsum;
@@ -999,7 +1265,7 @@ static void moe_ffn(Context *c, const Layer *L, int layer, int n) {
 
     /* assignment list grouped by expert; gather quantized inputs */
     quantize_rows(c->h, n, D, c->hq);
-    int fill[64];
+    int fill[MAX_EXPERT];
     memcpy(fill, off, sizeof(int) * E);
     for (int t = 0; t < n; t++)
         for (int k = 0; k < K; k++) {
@@ -1246,10 +1512,8 @@ static void forward_token_gpu(Context *c, int token, float *all_logits) {
         memcpy(w, ret + 2 * K, sizeof(float) * K);
         for (int k = 0; k < K; k++) {
             gpu_note_usage(g, l, sel[k]);
-            if (l < 64) {
-                c->stats.expert_hits[l * 64 + sel[k]]++;
-                c->last_used[l * 64 + sel[k]] = c->tok_counter;
-            }
+            if (l < 64 && sel[k] < 64) c->stats.expert_hits[l * 64 + sel[k]]++;
+            c->last_used[(size_t)l * m->n_expert + sel[k]] = c->tok_counter;
             c->stats.gpu_experts += slot[k] >= 0;
         }
         if (c->pfq) {
@@ -1295,6 +1559,7 @@ static void run_layers(Context *c, int n) {
         }
         for (int t = 0; t < n; t++) rmsnorm(c->h + (size_t)t * D, c->x + (size_t)t * D, L->attn_norm, D, m->eps);
         if (L->is_attn) attention_block(c, L, n);
+        else if (L->is_delta) deltanet_block(c, L, n);
         else shortconv_block(c, L, n);
         if (L->post_op_norm)
             for (int t = 0; t < n; t++) rmsnorm(c->out + (size_t)t * D, c->out + (size_t)t * D, L->post_op_norm, D, m->eps);
@@ -1302,6 +1567,7 @@ static void run_layers(Context *c, int n) {
         for (int t = 0; t < n; t++) rmsnorm(c->h + (size_t)t * D, c->x + (size_t)t * D, L->ffn_norm, D, m->eps);
         if (L->is_moe) moe_ffn(c, L, l, n);
         else dense_ffn(c, L, n);
+        if (L->sh_up.data) shared_expert(c, L, n);
         if (L->post_ffn_norm)
             for (int t = 0; t < n; t++) rmsnorm(c->out + (size_t)t * D, c->out + (size_t)t * D, L->post_ffn_norm, D, m->eps);
         for (size_t i = 0; i < (size_t)n * D; i++) c->x[i] += c->out[i];

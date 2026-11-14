@@ -65,6 +65,7 @@ typedef struct {
     PithosLock *lock;
     int t_im_end, t_eot, t_eos, t_think_end, t_tc_start, t_tc_end;
     int lfm3;                   /* LFM3 template: XML tool calls, <tools> block, <think></think> on past turns */
+    int qwen;                   /* Qwen3.5 / 3.6 template (render_chat_qwen), XML tool calls as LFM3 */
     int reasons;                /* template_reasons: 0 for LFM3-Audio (no reasoning blocks) */
     int t_audio, t_think_start, t_audio_out, t_text_end, t_mixed_start, t_audio_start;
     /* Audio of the request being rendered, under the lock (audio_begin / audio_end): render_content
@@ -447,7 +448,7 @@ static void render_content(Buf *b, const Json *c) {
         for (const Json *it = c->child; it; it = it->next) {
             if (it->t == J_STR) { buf_add(b, it->s, it->len); continue; }
             const char *type = json_str(json_get(it, "type"), NULL);
-            if (type && !strcmp(type, "image")) buf_add(b, S.lfm3 ? "<|vision_start|><|image|><|vision_end|>" : "<image>", -1);
+            if (type && !strcmp(type, "image")) buf_add(b, S.qwen ? "<|vision_start|><|image_pad|><|vision_end|>" : S.lfm3 ? "<|vision_start|><|image|><|vision_end|>" : "<image>", -1);
             else if (type && !strcmp(type, "text")) buf_add(b, json_str(json_get(it, "text"), ""), -1);
             else if (type && !strcmp(type, "input_audio")) audio_part(b, json_get(it, "input_audio"));
             else json_write(b, it);
@@ -705,10 +706,198 @@ static int render_assistant_lfm3(Buf *b, const Json *m, int keep, char *err, int
     return ok;
 }
 
+/* ------------------------------------------------------------------ chat template (Qwen3.5 / 3.6) */
+
+static const char qwen_tools_rules[] =
+    "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n"
+    "<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+    "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
+    "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
+    "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested "
+    "within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n"
+    "- You may provide optional reasoning for your function call in natural language BEFORE the function call, "
+    "but NOT after\n- If there is no function call available, answer the question like normal with your current "
+    "knowledge and do not tell the user about function calls\n</IMPORTANT>";
+
+/* render_content(content)|trim into b (reset first); the view of the trimmed text in *s, *n */
+static void content_trim(Buf *b, const Json *c, const char **s, int *n) {
+    b->n = 0;
+    render_content(b, c);
+    *s = b->s ? b->s : "";
+    *n = b->n;
+    trim_view(s, n);
+}
+
+static int starts_with(const char *s, int n, const char *p) {
+    const int k = (int)strlen(p);
+    return n >= k && !memcmp(s, p, (size_t)k);
+}
+
+/* One assistant message. keep: its reasoning is written (turns after the last user query, or
+ * preserve_thinking); otherwise only the answer. */
+static int render_assistant_qwen(Buf *b, const Json *m, int keep, char *err, int errlen) {
+    Buf cb = { 0 };
+    const char *cs, *rs = "";
+    int cn, rn = 0;
+    content_trim(&cb, json_get(m, "content"), &cs, &cn);
+    const Json *th = json_get(m, "reasoning_content");
+    if (!th || th->t != J_STR) th = json_get(m, "reasoning");
+    if (!th || th->t != J_STR) th = json_get(m, "thinking");
+    const char *end = find_in(cs, cn, "</think>");
+    if (th && th->t == J_STR) {
+        rs = th->s;
+        rn = th->len;
+    } else if (end) {
+        /* content.split('</think>')[0].rstrip('\n').split('<think>')[-1].lstrip('\n') */
+        rs = cs;
+        rn = (int)(end - cs);
+        while (rn > 0 && rs[rn - 1] == '\n') rn--;
+        for (const char *p; (p = find_in(rs, rn, "<think>")) != NULL;) { rn -= (int)(p + 7 - rs); rs = p + 7; }
+        while (rn > 0 && *rs == '\n') { rs++; rn--; }
+    }
+    if (end) {   /* content.split('</think>')[-1].lstrip('\n') */
+        const char *last = end;
+        for (const char *p = end + 8; (p = find_in(p, (int)(cs + cn - p), "</think>")) != NULL; p += 8) last = p;
+        cn -= (int)(last + 8 - cs);
+        cs = last + 8;
+        while (cn > 0 && *cs == '\n') { cs++; cn--; }
+    }
+    trim_view(&rs, &rn);
+    buf_add(b, "<|im_start|>assistant\n", -1);
+    if (keep) {
+        buf_add(b, "<think>\n", -1);
+        buf_add(b, rs, rn);
+        buf_add(b, "\n</think>\n\n", -1);
+    }
+    buf_add(b, cs, cn);
+    const char *ct = cs;
+    int ctn = cn;
+    trim_view(&ct, &ctn);
+    const Json *calls = json_get(m, "tool_calls");
+    int ok = 1;
+    if (calls && calls->t == J_ARR)
+        for (const Json *tc = calls->child; tc && ok; tc = tc->next) {
+            const Json *fn = json_get(tc, "function");
+            if (!fn) fn = tc;
+            const char *name = json_str(json_get(fn, "name"), NULL);
+            if (!name) { snprintf(err, (size_t)errlen, "tool call without a function name"); ok = 0; break; }
+            buf_add(b, tc != calls->child ? "\n<tool_call>\n<function=" : ctn ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=", -1);
+            buf_add(b, name, -1);
+            buf_add(b, ">\n", 2);
+            const Json *args = json_get(fn, "arguments");
+            Json *parsed = NULL;
+            if (args && args->t == J_STR) {   /* OpenAI clients send arguments as a JSON-encoded string */
+                parsed = json_parse(args->s, args->len, err, errlen);
+                if (!parsed && args->len > 0) {
+                    const char *t = args->s;
+                    while (*t == ' ') t++;
+                    if (*t) { snprintf(err, (size_t)errlen, "tool call arguments are not valid JSON"); ok = 0; break; }
+                }
+                args = parsed;
+            }
+            if (args && args->t == J_OBJ)
+                for (const Json *a = args->child; a; a = a->next) {
+                    buf_add(b, "<parameter=", -1);
+                    buf_add(b, a->key, -1);
+                    buf_add(b, ">\n", 2);
+                    render_value_lfm3(b, a);   /* strings verbatim, the rest as JSON */
+                    buf_add(b, "\n</parameter>\n", -1);
+                }
+            json_free(parsed);
+            buf_add(b, "</function>\n</tool_call>", -1);
+        }
+    if (ok && err) err[0] = 0;
+    buf_add(b, "<|im_end|>\n", -1);
+    buf_free(&cb);
+    return ok;
+}
+
+static void push_segment(Toks *out, Buf *text, const Buf *seg, int **bounds, int *nb, int *cap) {
+    if (*nb == *cap) { *cap *= 2; *bounds = (int *)realloc(*bounds, sizeof(int) * (size_t)*cap); }
+    (*bounds)[(*nb)++] = out->n;
+    toks_text(out, seg->s ? seg->s : "", seg->n);
+    if (text) buf_add(text, seg->s ? seg->s : "", seg->n);
+}
+
+/* render_chat for Qwen's template: no BOS; the tools block and the system message in one system
+ * turn; tool results inside user turns; every content trimmed. */
+static int render_chat_qwen(const Json *messages, const Json *tools, int preserve_thinking, int think, Toks *out,
+                            int **bounds, int *nbounds, Buf *text, char *err, int errlen) {
+    int nb = 0, cap = messages->n + 2, ok = 1;
+    *bounds = (int *)malloc(sizeof(int) * (size_t)cap);
+    Buf seg = { 0 }, cb = { 0 };
+    const char *cs;
+    int cn;
+    const Json *first = messages->child;
+    const int has_sys = first && !strcmp(json_str(json_get(first, "role"), ""), "system");
+    if (tools && tools->t == J_ARR && tools->n > 0) {
+        buf_add(&seg, "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>", -1);
+        for (const Json *t = tools->child; t; t = t->next) {
+            buf_add(&seg, "\n", 1);
+            json_write(&seg, t);
+        }
+        buf_add(&seg, "\n</tools>", -1);
+        buf_add(&seg, qwen_tools_rules, -1);
+        if (has_sys) {
+            content_trim(&cb, json_get(first, "content"), &cs, &cn);
+            if (cn) { buf_add(&seg, "\n\n", 2); buf_add(&seg, cs, cn); }
+        }
+        buf_add(&seg, "<|im_end|>\n", -1);
+    } else if (has_sys) {
+        content_trim(&cb, json_get(first, "content"), &cs, &cn);
+        buf_add(&seg, "<|im_start|>system\n", -1);
+        buf_add(&seg, cs, cn);
+        buf_add(&seg, "<|im_end|>\n", -1);
+    }
+    if (seg.n) push_segment(out, text, &seg, bounds, &nb, &cap);
+    /* the last user message that is not a wrapped tool result */
+    int idx = 0, last_query = -1;
+    for (const Json *m = first; m; m = m->next, idx++) {
+        if (strcmp(json_str(json_get(m, "role"), ""), "user")) continue;
+        content_trim(&cb, json_get(m, "content"), &cs, &cn);
+        if (!(starts_with(cs, cn, "<tool_response>") && cn >= 16 && !memcmp(cs + cn - 16, "</tool_response>", 16)))
+            last_query = idx;
+    }
+    idx = 0;
+    const Json *prev = NULL;
+    for (const Json *m = first; m && ok; prev = m, m = m->next, idx++) {
+        const char *role = json_str(json_get(m, "role"), NULL);
+        if (!role) { snprintf(err, (size_t)errlen, "message %d has no role", idx); ok = 0; break; }
+        if (idx == 0 && has_sys) continue;   /* in the system turn above */
+        seg.n = 0;
+        if (!strcmp(role, "assistant")) {
+            ok = render_assistant_qwen(&seg, m, preserve_thinking || idx > last_query, err, errlen);
+        } else if (!strcmp(role, "tool")) {
+            content_trim(&cb, json_get(m, "content"), &cs, &cn);
+            if (prev && strcmp(json_str(json_get(prev, "role"), ""), "tool")) buf_add(&seg, "<|im_start|>user", -1);
+            buf_add(&seg, "\n<tool_response>\n", -1);
+            buf_add(&seg, cs, cn);
+            buf_add(&seg, "\n</tool_response>", -1);
+            if (!m->next || strcmp(json_str(json_get(m->next, "role"), ""), "tool")) buf_add(&seg, "<|im_end|>\n", -1);
+        } else {
+            content_trim(&cb, json_get(m, "content"), &cs, &cn);
+            buf_add(&seg, "<|im_start|>", -1);
+            buf_add(&seg, role, -1);
+            buf_add(&seg, "\n", 1);
+            buf_add(&seg, cs, cn);
+            buf_add(&seg, "<|im_end|>\n", -1);
+        }
+        if (ok) push_segment(out, text, &seg, bounds, &nb, &cap);
+    }
+    seg.n = 0;
+    buf_add(&seg, think ? think_on_prompt(CHAT_QWEN) : think_off_prompt(CHAT_QWEN), -1);
+    push_segment(out, text, &seg, bounds, &nb, &cap);
+    *nbounds = nb;
+    buf_free(&seg);
+    buf_free(&cb);
+    return ok;
+}
+
 /* Renders the conversation into tokens; bounds[] receives the token position where each
  * message starts (the last one is the start of the generation prompt). */
 static int render_chat(const Json *messages, const Json *tools, int preserve_thinking, int think, Toks *out,
                        int **bounds, int *nbounds, Buf *text, char *err, int errlen) {
+    if (S.qwen) return render_chat_qwen(messages, tools, preserve_thinking, think, out, bounds, nbounds, text, err, errlen);
     const Json *msg = messages->child;
     Buf sys = { 0 }, seg = { 0 };
     int nb = 0, cap = messages->n + 2;
@@ -1075,9 +1264,18 @@ int think_parse(const char *s, int *budget) {
 /* The generation prompt with the reasoning off. LFM3's template writes "<think></think>"
  * (enable_thinking=false), but with it LFM3 often reasons anyway inside the answer; one newline
  * inside the block avoids most of that (measured: 13 of 30 GSM8K answers reasoned, then 3).
- * LFM2.5 has no switch in its template; the plain empty block works best for it. */
-const char *think_off_prompt(int lfm3) {
-    return lfm3 ? "<|im_start|>assistant\n<think>\n</think>\n" : "<|im_start|>assistant\n<think></think>";
+ * LFM2.5 has no switch in its template; the plain empty block works best for it. Qwen: its template's. */
+const char *think_off_prompt(int family) {
+    return family == CHAT_QWEN ? "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+           : family == CHAT_LFM3 ? "<|im_start|>assistant\n<think>\n</think>\n" : "<|im_start|>assistant\n<think></think>";
+}
+
+const char *think_on_prompt(int family) {
+    return family == CHAT_QWEN ? "<|im_start|>assistant\n<think>\n" : "<|im_start|>assistant\n<think>";
+}
+
+int chat_family(const Model *m) {
+    return !strcmp(m->arch, "qwen35moe") ? CHAT_QWEN : !strcmp(m->arch, "lfm3") ? CHAT_LFM3 : CHAT_LFM2;
 }
 
 int template_reasons(const Model *m) {
@@ -1249,12 +1447,12 @@ static int on_token(Gen *g, int tok) {
     if (g->chat && tok == S.t_tc_end && g->state == ST_TOOL) {
         int calls_before = g->calls.n;
         const char *raw = g->toolraw.s ? g->toolraw.s : "";
-        if (!(S.lfm3 ? parse_tool_call_xml(raw, g->toolraw.n, &g->calls, &g->ncalls)
+        if (!(S.lfm3 || S.qwen ? parse_tool_call_xml(raw, g->toolraw.n, &g->calls, &g->ncalls)
                      : parse_tool_calls(raw, g->toolraw.n, &g->calls, &g->ncalls))) {
             g->calls.n = calls_before;
-            buf_add(&g->content, S.lfm3 ? "<tool_call>" : "<|tool_call_start|>", -1); /* not parseable: keep it visible */
+            buf_add(&g->content, S.lfm3 || S.qwen ? "<tool_call>" : "<|tool_call_start|>", -1); /* not parseable: keep it visible */
             buf_add(&g->content, raw, g->toolraw.n);
-            buf_add(&g->content, S.lfm3 ? "</tool_call>" : "<|tool_call_end|>", -1);
+            buf_add(&g->content, S.lfm3 || S.qwen ? "</tool_call>" : "<|tool_call_end|>", -1);
         }
         g->state = ST_CONTENT;
         return 0;
@@ -1363,7 +1561,7 @@ static void generate(Gen *g, float *lg, const Toks *prompt) {
     }
     if (g->state == ST_TOOL) {
         /* unterminated tool call block: show it as text */
-        buf_add(&g->content, S.lfm3 ? "<tool_call>" : "<|tool_call_start|>", -1);
+        buf_add(&g->content, S.lfm3 || S.qwen ? "<tool_call>" : "<|tool_call_start|>", -1);
         buf_add(&g->content, g->toolraw.s ? g->toolraw.s : "", g->toolraw.n);
     }
     if (g->finish == FIN_STOP && g->ncalls) g->finish = FIN_TOOLS;
@@ -1745,7 +1943,8 @@ static void handle_chat(Conn *c, const Json *body) {
         /* the answer as the next request will send it back */
         Json *msg = json_parse(mj.s, mj.n, NULL, 0);
         int ok = msg != NULL;
-        if (ok && S.lfm3) ok = render_assistant_lfm3(&a, msg, preserve, err, sizeof(err));
+        if (ok && S.qwen) ok = render_assistant_qwen(&a, msg, preserve, err, sizeof(err));
+        else if (ok && S.lfm3) ok = render_assistant_lfm3(&a, msg, preserve, err, sizeof(err));
         else if (ok) ok = render_assistant(&a, g.reasoning.s, g.reasoning.n, g.content.s, g.content.n, preserve,
                                            json_get(msg, "tool_calls"), err, sizeof(err));
         if (ok) {
@@ -2343,10 +2542,11 @@ void server_attach(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *t
     S.t_text_end = tok_find(tk, "<|text_end|>");
     S.t_mixed_start = tok_find(tk, "<|mixed_start|>");
     S.t_audio_start = tok_find(tk, "<|audio_start|>");
-    S.lfm3 = !strcmp(m->arch, "lfm3");
+    S.lfm3 = chat_family(m) == CHAT_LFM3;
+    S.qwen = chat_family(m) == CHAT_QWEN;
     S.reasons = template_reasons(m);
-    S.t_tc_start = tok_find(tk, S.lfm3 ? "<tool_call>" : "<|tool_call_start|>");
-    S.t_tc_end = tok_find(tk, S.lfm3 ? "</tool_call>" : "<|tool_call_end|>");
+    S.t_tc_start = tok_find(tk, S.lfm3 || S.qwen ? "<tool_call>" : "<|tool_call_start|>");
+    S.t_tc_end = tok_find(tk, S.lfm3 || S.qwen ? "</tool_call>" : "<|tool_call_end|>");
     S.rng = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ull | 1;
 }
 
