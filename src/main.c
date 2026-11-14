@@ -727,10 +727,10 @@ static int chat_turn(Engine *e, const char *user, int first) {
     free(p.s);
     CtxSnapshot snap;
     ctx_snapshot(e->ctx, &snap);
-    /* after audio, or for a template without reasoning blocks, the generation prompt of
-     * LFM3-Audio's template: no reasoning block */
-    const int plain = heard || !template_reasons(e->m);
-    const int think = e->a->think_budget != THINK_OFF && !plain;
+    /* after audio, or with the reasoning off for a template without reasoning blocks, the
+     * generation prompt of LFM3-Audio's template: no reasoning block */
+    const int think = e->a->think_budget != THINK_OFF && !heard;
+    const int plain = heard || (!think && !template_reasons(e->m));
     if (!feed_text(e, plain ? "<|im_start|>assistant\n"
                             : think ? "<|im_start|>assistant\n<think>" : think_off_prompt(!strcmp(e->m->arch, "lfm3")))) {
         ctx_snapshot_free(&snap);

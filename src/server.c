@@ -779,11 +779,12 @@ static int render_chat(const Json *messages, const Json *tools, int preserve_thi
     }
     if (nb == cap) { cap++; *bounds = (int *)realloc(*bounds, sizeof(int) * (size_t)cap); }
     (*bounds)[nb++] = out->n;
-    /* after audio, or for a template without reasoning blocks, the plain generation prompt of
-     * LFM3-Audio's template (the model may open <think> itself) */
+    /* after audio, or with the reasoning off for a template without reasoning blocks, the plain
+     * generation prompt of LFM3-Audio's template (after audio the model may open <think> itself) */
     const char *gp = t_voice ? "<|im_start|>assistant\n<|mixed_start|>"
-                     : !S.reasons || (t_collect && S.n_clips) ? "<|im_start|>assistant\n"
-                     : think ? "<|im_start|>assistant\n<think>" : think_off_prompt(S.lfm3);
+                     : t_collect && S.n_clips ? "<|im_start|>assistant\n"
+                     : think ? "<|im_start|>assistant\n<think>"
+                     : S.reasons ? think_off_prompt(S.lfm3) : "<|im_start|>assistant\n";
     toks_text(out, gp, -1);
     if (text) buf_add(text, gp, -1);
     *nbounds = nb;
@@ -1686,7 +1687,7 @@ static void handle_chat(Conn *c, const Json *body) {
         return;
     }
     g.n_prompt = t.n;
-    if (audio || voice || !S.reasons) {
+    if (audio || voice) {
         g.state = ST_CONTENT;
         g.skip_ws = 1;
     }
