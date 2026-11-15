@@ -1,7 +1,7 @@
 'use strict';
 
 const REPO = 'https://github.com/benmaster82/Pithos';
-// The validated models, as in models.tsv. big is the engine's default (no -m needed).
+// The models, as in models.tsv. big is the engine's default (no -m needed).
 const MODELS = {
   big:{id:'lfm2.5-24b',name:'LFM2.5-24B-A2B',file:'LFM2.5-24B-A2B-Q4_K_M.gguf',
     url:'https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF/resolve/0912d33141f77e10705345a6732bfd83f0252fdc/LFM2.5-24B-A2B-Q4_K_M.gguf',
@@ -29,7 +29,13 @@ const MODELS = {
       hash:'1a3a895160aad17c1f52117a6ee4cea8e68988651ea5a33c5b990539e8eae81d'},
     download:'1.3 GB',ram:'4',gpu:'2.7× real time',cpu:'~1× real time',cpuBench:'speech output',
     disk:'At least 2 GB free for the model',diskDetail:'About 1.3 GB to download: the model and its audio projector. Allow extra room for the compiler and, if used, Ubuntu.',
-    blurb:'LFM3 with ears and a voice (experimental): transcription and translation in 18 languages, speech output, and voice conversations on the /talk page.'}
+    blurb:'LFM3 with ears and a voice (experimental): transcription and translation in 18 languages, speech output, and voice conversations on the /talk page.'},
+  qwen:{id:'qwen3.6-35b',name:'Qwen3.6-35B-A3B',file:'Qwen3.6-35B-A3B-Q4_K_M.gguf',
+    url:'https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF/resolve/52f9f9b8052fb9c8b69bba4a95eda0f319ac3d2a/Qwen3.6-35B-A3B-Q4_K_M.gguf',
+    hash:'f4ffe03c9139e6a905a5d346f77d9fabdd179367c3280dfd005d1e75ca5ed8c8',
+    download:'20.5 GB',ram:'16',gpu:'13–22 tok/s',cpu:'6–7 tok/s',
+    disk:'At least 21 GB free for the model',diskDetail:'About 20.5 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
+    blurb:'35 billion parameters, about 3 billion active per token, with Gated DeltaNet layers (experimental). The largest: it reasons and calls tools, runs from disk when RAM is short, and is at its best with a GPU.'}
 };
 // " -m models/FILE" for a model that is not the engine's default
 const modelArg = (m, windows) => m === MODELS.big ? '' : windows ? ` -m models\\${m.file}` : ` -m models/${m.file}`;

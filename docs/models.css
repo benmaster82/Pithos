@@ -5,6 +5,7 @@
 .model-tabs button span{font:11px/1.5 var(--mono);letter-spacing:.2px}
 .model-tabs button:hover{border-color:#edf6ff70}
 .model-tabs button[aria-selected="true"]{border-color:var(--ink);background:#131c26}
+.model-tabs button:last-child:nth-child(odd){grid-column:1/-1}
 .model-tabs button:focus-visible{outline:2px solid var(--ink);outline-offset:2px}
 .model-card{padding:18px 18px 4px}
 .model-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;margin:0;border:1px solid #edf6ff1f;border-radius:10px;overflow:hidden;background:#edf6ff1f}
