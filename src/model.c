@@ -1142,6 +1142,18 @@ static void shared_expert(Context *c, const Layer *L, int n) {
     }
 }
 
+/* the k best of sc[n], best first and the lower index first among equal scores: the same as k
+ * passes of argmax over the experts not chosen yet, in one pass */
+static void top_k(const float *sc, int n, int k, int *out) {
+    int m = 0;
+    for (int e = 0; e < n; e++) {
+        if (m == k && !(sc[e] > sc[out[k - 1]])) continue;
+        int j = m < k ? m++ : k - 1;
+        for (; j > 0 && sc[e] > sc[out[j - 1]]; j--) out[j] = out[j - 1];
+        out[j] = e;
+    }
+}
+
 static void prefetch_expert(Context *c, const Layer *L, int e) {
     prefetcher_push(c->pfq, L->gate_exps.data + (size_t)e * L->gate_exps.expert_stride, L->gate_exps.expert_stride);
     prefetcher_push(c->pfq, L->up_exps.data + (size_t)e * L->up_exps.expert_stride, L->up_exps.expert_stride);
@@ -1158,7 +1170,7 @@ static void predict_next_experts(Context *c, int layer) {
     if (ln >= m->n_layer || ln >= 64 || !m->layers[ln].is_moe) return;
     const Layer *Ln = &m->layers[ln];
     const int D = m->dim, E = m->n_expert;
-    float hn[8192], sc[MAX_EXPERT];
+    float hn[8192], sc[MAX_EXPERT] = {0};
     const float *rl = c->pred_lg;
     if (!rl) {
         if (D > 8192 || Ln->router.type != GGML_F32) return;
@@ -1177,14 +1189,9 @@ static void predict_next_experts(Context *c, int layer) {
     int np = m->n_expert_used + 2;
     if (np > E) np = E;
     prefetcher_clear(c->pfq);
+    top_k(sc, E, np, c->pred);
     for (int k = 0; k < np; k++) {
-        int best = -1;
-        for (int e = 0; e < E; e++) {
-            int used = 0;
-            for (int j = 0; j < k; j++) used |= c->pred[j] == e;
-            if (!used && (best < 0 || sc[e] > sc[best])) best = e;
-        }
-        c->pred[k] = best;
+        const int best = c->pred[k];
         /* experts used in the last few dozen tokens are almost surely resident: skip them */
         if (c->gpu && gpu_resident(c->gpu, ln, best)) continue; /* served from VRAM */
         if (c->vk_exp && vk_expert_resident(c->vk, ln, best)) continue;
@@ -1224,14 +1231,9 @@ static void moe_ffn(Context *c, const Layer *L, int layer, int n) {
         int *sel = c->sel + (size_t)t * K;
         float *w = c->selw + (size_t)t * K;
         float wsum = 0;
+        top_k(sc, E, K, sel);
         for (int k = 0; k < K; k++) {
-            int best = -1;
-            for (int e = 0; e < E; e++) {
-                int used = 0;
-                for (int j = 0; j < k; j++) used |= sel[j] == e;
-                if (!used && (best < 0 || sc[e] > sc[best])) best = e;
-            }
-            sel[k] = best;
+            const int best = sel[k];
             w[k] = p[best];
             wsum += p[best];
             if (c->gpu) gpu_note_usage(c->gpu, layer, best);

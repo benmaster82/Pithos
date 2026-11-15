@@ -344,6 +344,32 @@ float reduce_sum128(uint li, float v) {
     return r;
 }
 
+groupshared float gm8[8][256];
+groupshared uint gq8[8][256];
+
+// quant_block for up to 8 blocks at once (value j of each thread in block j), with one reduction
+void quant_blocks8(uint li, float v[8], uint nb, uint qo) {
+    [unroll] for (uint j = 0; j < 8; j++) gm8[j][li] = abs(v[j]);
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = 128; s > 0; s >>= 1) {
+        if (li < s) [unroll] for (uint j2 = 0; j2 < 8; j2++) gm8[j2][li] = max(gm8[j2][li], gm8[j2][li + s]);
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float amax[8];
+    [unroll] for (uint j3 = 0; j3 < 8; j3++) {
+        amax[j3] = gm8[j3][0];
+        const float iscale = amax[j3] > 0 ? 127.0 / amax[j3] : 0;
+        gq8[j3][li] = uint(clamp(int(round(v[j3] * iscale)), -127, 127)) & 255;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    for (uint j4 = 0; j4 < nb; j4++) {
+        const uint o = qo + j4 * Q8_BYTES;
+        if (li < 64) U.Store(o + Q8_QS + 4 * li, gq8[j4][4 * li] | (gq8[j4][4 * li + 1] << 8) | (gq8[j4][4 * li + 2] << 16) | (gq8[j4][4 * li + 3] << 24));
+        if (li == 0) stu(o + Q8_D, amax[j4] > 0 ? 1.0 / (127.0 / amax[j4]) : 0);
+    }
+    GroupMemoryBarrierWithGroupSync();
+}
+
 // x = embedding (mode 0), x += out (mode 1) or x += s * out + y + g (mode 2: out the shared
 // expert, y and s from the CPU in IN, g the experts the GPU computed unless NONE); then Q8_K of
 // rmsnorm(x) * norm weight, and the same values as floats at h unless NONE. One group per token.
@@ -365,11 +391,14 @@ void moe_resid(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
         ss += v * v;
     }
     const float s = rsqrt(reduce_sum(li, ss) / D + eps);
-    for (uint b = 0; b < D / 256; b++) {
-        const uint i = b * 256 + li;
-        const float v = ldu(xo + 4 * i) * s * ldw(nw + 4 * i);
-        if (C1.w != NONE) stu(ho + 4 * i, v);
-        quant_block(li, v, qo + b * Q8_BYTES);
+    for (uint b0 = 0; b0 < D / 256; b0 += 8) {
+        float v[8];
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const uint i = (b0 + j) * 256 + li;
+            v[j] = b0 + j < D / 256 ? ldu(xo + 4 * i) * s * ldw(nw + 4 * i) : 0;
+            if (C1.w != NONE && b0 + j < D / 256) stu(ho + 4 * i, v[j]);
+        }
+        quant_blocks8(li, v, min(8u, D / 256 - b0), qo + b0 * Q8_BYTES);
     }
 }
 
@@ -561,13 +590,16 @@ void qattn(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     }
 }
 
+[[vk::binding(8, 0)]] StructuredBuffer<uint4> SW4 : register(t4);   // SW as 16-byte words
+[[vk::binding(0, 0)]] RWStructuredBuffer<uint4> U4 : register(u4);   // U as 16-byte words
+
 // The router's logits (f32 weights in SW): out[t][r] = row r . x_t, or . rmsnorm(x_t) * norm
-// weight unless NONE. Groups: 8 rows, 8 tokens; 32 threads per row.
+// weight unless NONE. Groups: 4 rows, 8 tokens; 64 threads per row.
 // C0: dim, x, n, out   C1: weights, rows, out row (floats), norm weight   C2: eps
 [numthreads(256, 1, 1)]
 void router(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
-    const uint D = C0.x, t0 = gid.y * 8, nt = min(8u, C0.z - t0), nw = C1.w, lane = li % 32;
-    const uint r = gid.x * 8 + li / 32, wo = C1.x + 4 * min(r, C1.y - 1) * D;
+    const uint D = C0.x, t0 = gid.y * 8, nt = min(8u, C0.z - t0), nw = C1.w, lane = li % 64;
+    const uint r = gid.x * 4 + li / 64, wo = C1.x + 4 * min(r, C1.y - 1) * D;
     if (nw != NONE) {
         for (uint tt = 0; tt < nt; tt++) {
             float ss = 0;
@@ -582,16 +614,16 @@ void router(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     }
     float acc[8];
     [unroll] for (uint k = 0; k < 8; k++) acc[k] = 0;
-    for (uint i = 4 * lane; i < D; i += 128) {
-        float4 w = asfloat(SW.Load4(wo + 4 * i));
-        if (nw != NONE) w *= asfloat(SW.Load4(nw + 4 * i));
+    for (uint i = 4 * lane; i < D; i += 256) {
+        float4 w = asfloat(SW4[(wo + 4 * i) >> 4]);
+        if (nw != NONE) w *= asfloat(SW4[(nw + 4 * i) >> 4]);
         [unroll] for (uint k = 0; k < 8; k++)
-            if (k < nt) acc[k] += dot(w, asfloat(U.Load4(C0.y + 4 * ((t0 + k) * D + i))));
+            if (k < nt) acc[k] += dot(w, asfloat(U4[(C0.y + 4 * ((t0 + k) * D + i)) >> 4]));
     }
     for (uint k = 0; k < nt; k++) {
         gs[li] = acc[k];
         GroupMemoryBarrierWithGroupSync();
-        [unroll] for (uint s = 16; s > 0; s >>= 1) {
+        [unroll] for (uint s = 32; s > 0; s >>= 1) {
             if (lane < s) gs[li] += gs[li + s];
             GroupMemoryBarrierWithGroupSync();
         }

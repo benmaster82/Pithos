@@ -76,6 +76,8 @@ typedef struct VkDevice_T *VkDevice;
 typedef struct VkQueue_T *VkQueue;
 typedef struct VkCommandBuffer_T *VkCommandBuffer;
 /* non-dispatchable handles are 64-bit on every platform */
+typedef uint64_t VkQueryPool;
+typedef struct { int sType; const void *pNext; VkFlags flags; int queryType; uint32_t queryCount; VkFlags stats; } VkQueryPoolCreateInfo;
 typedef uint64_t VkBuffer, VkDeviceMemory, VkShaderModule, VkPipeline, VkPipelineLayout, VkPipelineCache,
     VkDescriptorSetLayout, VkDescriptorPool, VkDescriptorSet, VkCommandPool, VkFence, VkSampler;
 
@@ -316,6 +318,12 @@ typedef struct {
     VkResult(VKAPI *GetFenceStatus)(VkDevice, VkFence);
     VkResult(VKAPI *WaitForFences)(VkDevice, uint32_t, const VkFence *, VkBool32, uint64_t);
     VkResult(VKAPI *DeviceWaitIdle)(VkDevice);
+    /* PITHOS_VK_PROF only: timestamps */
+    VkResult(VKAPI *CreateQueryPool)(VkDevice, const VkQueryPoolCreateInfo *, const void *, VkQueryPool *);
+    void(VKAPI *DestroyQueryPool)(VkDevice, VkQueryPool, const void *);
+    void(VKAPI *CmdResetQueryPool)(VkCommandBuffer, VkQueryPool, uint32_t, uint32_t);
+    void(VKAPI *CmdWriteTimestamp)(VkCommandBuffer, VkFlags, VkQueryPool, uint32_t);
+    VkResult(VKAPI *GetQueryPoolResults)(VkDevice, VkQueryPool, uint32_t, uint32_t, size_t, void *, VkDeviceSize, VkFlags);
 } VkApi;
 
 /* the loader and the instance-level entry points; 0 if Vulkan is not installed */
@@ -358,6 +366,10 @@ static int vk_load_device(VkApi *vk, VkDevice dev) {
     LOAD(CmdCopyBuffer); LOAD(CmdPipelineBarrier); LOAD(QueueSubmit); LOAD(CreateFence); LOAD(DestroyFence);
     LOAD(ResetFences); LOAD(GetFenceStatus); LOAD(WaitForFences); LOAD(DeviceWaitIdle);
 #undef LOAD
+#define LOAD_OPT(f) *(void **)&vk->f = (void *)vk->GetDeviceProcAddr(dev, "vk" #f)
+    LOAD_OPT(CreateQueryPool); LOAD_OPT(DestroyQueryPool); LOAD_OPT(CmdResetQueryPool); LOAD_OPT(CmdWriteTimestamp);
+    LOAD_OPT(GetQueryPoolResults);
+#undef LOAD_OPT
     return 1;
 }
 
@@ -424,7 +436,12 @@ typedef struct {
     VkFence fence;
     VkDescriptorPool dpool;         /* the sets of one submit (reset after it) */
     int recording, nsets, inflight; /* inflight: kicked, not waited for */
+    VkQueryPool qp;                 /* PITHOS_VK_PROF: a timestamp after each dispatch, with its tag */
+    int nq;
+    const char *qtag[MAX_SETS + 1];
 } Lane;
+
+#define PROF_TAGS 48
 
 struct Vulkan {
     VkApi vk;
@@ -445,6 +462,10 @@ struct Vulkan {
     VkPipeline pso_mvx[N_KERNELS];  /* pso_mv for the routed experts in VRAM (MV_EXPERTS) */
     int mv_rows;                    /* rows per group of the pso_mv kernels: 8, or 16 with the Intel build */
     int broken;
+    /* PITHOS_VK_PROF=1: GPU time per tag of the decode passes, printed by vk_destroy */
+    int prof, prof_on, prof_passes, prof_n;
+    const char *tag, *prof_tag[PROF_TAGS];
+    double prof_ms[PROF_TAGS];
     VBuf consts, dummy;             /* the constants rings (MAX_SETS slots per lane); a stand-in for unused bindings */
     VMat *mats;                     /* sorted by host address */
     int nmats, n_big, n_split;      /* matrices too large for the GPU / split into parts */
@@ -554,6 +575,11 @@ static VkCommandBuffer cmd(Vulkan *v) {
         /* what earlier submits wrote (KV cache, state, copies) is visible to this one */
         VkMemoryBarrier mb = {ST_MEMORY_BARRIER, NULL, AC_MEMORY_WRITE, AC_MEMORY_READ | AC_MEMORY_WRITE};
         v->vk.CmdPipelineBarrier(v->ln->cb, PS_ALL, PS_ALL, 0, 1, &mb, 0, NULL, 0, NULL);
+        if (v->ln->qp) {
+            v->vk.CmdResetQueryPool(v->ln->cb, v->ln->qp, 0, MAX_SETS + 1);
+            v->vk.CmdWriteTimestamp(v->ln->cb, 0x2000 /* bottom of pipe */, v->ln->qp, 0);
+            v->ln->nq = 1;
+        }
     }
     return v->ln->cb;
 }
@@ -602,6 +628,18 @@ static int wait_gpu(Vulkan *v) {
         return 0;
     }
     v->ln->nsets = 0;
+    if (v->ln->qp && v->ln->nq > 1 && v->prof_on) {
+        static uint64_t ts[MAX_SETS + 1];
+        if (v->vk.GetQueryPoolResults(v->dev, v->ln->qp, 0, (uint32_t)v->ln->nq, sizeof(ts), ts, 8, 0x1 | 0x2) == VK_SUCCESS)
+            for (int i = 1; i < v->ln->nq; i++) {
+                const char *tg = v->ln->qtag[i] ? v->ln->qtag[i] : "other";
+                int k = 0;
+                while (k < v->prof_n && strcmp(v->prof_tag[k], tg)) k++;
+                if (k == v->prof_n && k < PROF_TAGS) v->prof_tag[v->prof_n++] = tg;
+                if (k < PROF_TAGS) v->prof_ms[k] += (double)(ts[i] - ts[i - 1]) * v->props.limits.timestampPeriod * 1e-6;
+            }
+    }
+    v->ln->nq = 0;
     return v->vk.ResetFences(v->dev, 1, &v->ln->fence) == VK_SUCCESS &&
            v->vk.ResetCommandPool(v->dev, v->ln->pool, 0) == VK_SUCCESS &&
            v->vk.ResetDescriptorPool(v->dev, v->ln->dpool, 0) == VK_SUCCESS;
@@ -681,6 +719,10 @@ static int dispatch(Vulkan *v, VkPipeline p, const uint32_t *c, int nc, Bind u0,
     v->vk.CmdBindPipeline(cb, BIND_COMPUTE, p);
     v->vk.CmdBindDescriptorSets(cb, BIND_COMPUTE, v->layout, 0, 1, &set, 1, &coff);
     v->vk.CmdDispatch(cb, gx, gy, 1);
+    if (v->ln->qp && v->ln->nq <= MAX_SETS) {
+        v->ln->qtag[v->ln->nq] = v->tag;
+        v->vk.CmdWriteTimestamp(cb, 0x2000, v->ln->qp, (uint32_t)v->ln->nq++);
+    }
     return 1;
 }
 
@@ -966,6 +1008,11 @@ Vulkan *vk_create(const Model *m, int device, char *info, int infolen) {
              v->vk.CreateFence(v->dev, &fi, NULL, &ln->fence) == VK_SUCCESS;
     }
     ok = ok && create_pipelines(v);
+    v->prof = getenv("PITHOS_VK_PROF") && v->vk.CreateQueryPool && v->props.limits.timestampPeriod > 0;
+    for (int i = 0; i < 2 && ok && v->prof; i++) {
+        VkQueryPoolCreateInfo qi2 = {11 /* VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO */, NULL, 0, 2 /* timestamp */, MAX_SETS + 1, 0};
+        if (v->vk.CreateQueryPool(v->dev, &qi2, NULL, &v->lanes[i].qp) != VK_SUCCESS) v->lanes[i].qp = 0;
+    }
     if (!ok) {
         snprintf(info, (size_t)infolen, "Vulkan setup failed on %s", name);
         vk_destroy(v);
@@ -1026,8 +1073,18 @@ void vk_destroy(Vulkan *v) {
         if (v->cpool) v->vk.DestroyDescriptorPool(v->dev, v->cpool, NULL);
         if (v->layout) v->vk.DestroyPipelineLayout(v->dev, v->layout, NULL);
         if (v->dsl) v->vk.DestroyDescriptorSetLayout(v->dev, v->dsl, NULL);
+        if (v->prof && v->prof_passes) {
+            double tot = 0;
+            fprintf(stderr, "Vulkan GPU time per decode pass (%d passes):\n", v->prof_passes);
+            for (int k = 0; k < v->prof_n; k++) {
+                fprintf(stderr, "  %-14s %7.3f ms\n", v->prof_tag[k], v->prof_ms[k] / v->prof_passes);
+                tot += v->prof_ms[k];
+            }
+            fprintf(stderr, "  %-14s %7.3f ms\n", "total", tot / v->prof_passes);
+        }
         for (int i = 0; i < 2; i++) {
             Lane *ln = &v->lanes[i];
+            if (ln->qp) v->vk.DestroyQueryPool(v->dev, ln->qp, NULL);
             if (ln->dpool) v->vk.DestroyDescriptorPool(v->dev, ln->dpool, NULL);
             if (ln->fence) v->vk.DestroyFence(v->dev, ln->fence, NULL);
             if (ln->pool) v->vk.DestroyCommandPool(v->dev, ln->pool, NULL);   /* frees the command buffer */
@@ -1170,6 +1227,7 @@ typedef struct VDense {
     size_t xo_xg, xo_eg, xo_eu, xo_eq, xo_eo, o_ge;   /* the GPU's experts: inputs, gate, up, Q8_K, outputs, sum */
     size_t in_c;                    /* in: the table of their sum, [n][K] (row, weight) */
     int ge_on;                      /* o_ge holds the GPU's experts of the last callback, for the next add */
+    int sh_done;                    /* the shared expert of the callback's layer ran on lane 1 already */
     VBuf hrb;                       /* h, the router logits and the prediction, read back at every layer */
     VkMoeFn moe;
     void *moe_arg;
@@ -1549,6 +1607,7 @@ static int finish_pass(Vulkan *v, int ok, int n, float *logits, float *x_last) {
     const Model *m = t->m;
     const int D = t->D;
     const uint32_t nb = (uint32_t)(D / QK_K);
+    v->tag = "logits";
     if (ok && logits) {
         size_t xo = t->o_hq + (size_t)(n - 1) * nb * Q8_BYTES;
         if (xo % v->props.limits.minStorageBufferOffsetAlignment) {   /* not bindable there: move the row */
@@ -1609,23 +1668,35 @@ static int hybrid_mixer(Vulkan *v, int l, int t0, int n, int pos0) {
     const int D = t->D, hd = t->hd, qd = t->qd, kvd = t->kvd, vd = t->vd, vh = t->vh;
     const uint32_t un = (uint32_t)n, E1 = (uint32_t)t->E + 1;
     const size_t T = (size_t)t0, hq = t->o_hq + T * (D / QK_K) * Q8_BYTES, out = t->o_out + T * D * 4;
+    v->tag = "resid";
     int ok = l == 0 || moe_resid(v, 2, X->attn_norm, t->o_sh, NONE_OFF, t0, n);
     if (L->is_delta) {
+        v->tag = "d.qkv";
         const size_t big = t->o_big + T * t->qkvw * 4, z = t->o_z + T * vd * 4, tmp = t->o_tmp + T * vd * 4;
         const size_t al = t->o_al + T * vh * 4, be = t->o_be + T * vh * 4;
-        ok = ok && tok_mm(v, X->ssm_qkv, hq, big, n, t->qkvw) && tok_mm(v, X->ssm_z, hq, z, n, vd) &&
-             tok_mm(v, X->ssm_alpha, hq, al, n, vh) && tok_mm(v, X->ssm_beta, hq, be, n, vh);
+        ok = ok && tok_mm(v, X->ssm_qkv, hq, big, n, t->qkvw);
+        v->tag = "d.z";
+        ok = ok && tok_mm(v, X->ssm_z, hq, z, n, vd);
+        v->tag = "d.ab";
+        ok = ok && tok_mm(v, X->ssm_alpha, hq, al, n, vh) && tok_mm(v, X->ssm_beta, hq, be, n, vh);
         compute_barrier(v);
         const uint32_t cc[16] = {(uint32_t)t->qkvw, (uint32_t)big, (uint32_t)t->qkvw * 4, un, X->ssm_conv, X->state,
                                  (uint32_t)t->kconv};
         const uint32_t cr[16] = {(uint32_t)big, (uint32_t)t->qkvw * 4, (uint32_t)z, (uint32_t)vd * 4, (uint32_t)al, (uint32_t)be,
                                  (uint32_t)tmp, un, X->state + (uint32_t)(4 * (t->kconv - 1) * t->qkvw), (uint32_t)t->kh,
                                  (uint32_t)vh, fbits(m->eps), X->ssm_a, X->ssm_dt, X->ssm_norm, fbits(1.f / sqrtf((float)m->ssm_d))};
-        ok = ok && tok_run(v, T_DCONV, cc, (uint32_t)(t->qkvw + 255) / 256, 1) && tok_run(v, T_DREC, cr, (uint32_t)vh, 1) &&
-             quant_tmp(v, vd, t0, n) && tok_mm(v, X->ssm_out, t->o_q2 + T * (vd / QK_K) * Q8_BYTES, out, n, D);
+        v->tag = "d.conv";
+        ok = ok && tok_run(v, T_DCONV, cc, (uint32_t)(t->qkvw + 255) / 256, 1);
+        v->tag = "d.rec";
+        ok = ok && tok_run(v, T_DREC, cr, (uint32_t)vh, 1);
+        v->tag = "d.quant";
+        ok = ok && quant_tmp(v, vd, t0, n);
+        v->tag = "d.out";
+        ok = ok && tok_mm(v, X->ssm_out, t->o_q2 + T * (vd / QK_K) * Q8_BYTES, out, n, D);
     } else {
         const size_t qg = t->o_qg + T * 2 * qd * 4, kv = t->o_kv + T * 2 * kvd * 4, q = t->o_q + T * qd * 4;
         const size_t g = t->o_g + T * qd * 4, tmp = t->o_tmp + T * qd * 4;
+        v->tag = "a.qkv";
         ok = ok && tok_mm(v, X->wq, hq, qg, n, 2 * qd) && tok_mm(v, X->wk, hq, kv, n, 2 * kvd) &&
              tok_mm(v, X->wv, hq, kv + 4 * (size_t)kvd, n, 2 * kvd);
         compute_barrier(v);
@@ -1638,19 +1709,25 @@ static int hybrid_mixer(Vulkan *v, int l, int t0, int n, int pos0) {
         const uint32_t ca[16] = {(uint32_t)hd, (uint32_t)q, (uint32_t)g, (uint32_t)tmp, (uint32_t)kbase,
                                  (uint32_t)(t->kv_half + kbase), (uint32_t)kvd, (uint32_t)qd, (uint32_t)pos0,
                                  (uint32_t)(t->nh / t->nkv), 0, 0, fbits(1.f / sqrtf((float)hd))};
-        ok = ok && tok_run(v, T_QPREP, cp, (uint32_t)(t->nh + t->nkv), un) && tok_run(v, T_QATTN, ca, (uint32_t)t->nh, un) &&
-             quant_tmp(v, qd, t0, n) && tok_mm(v, X->wo, t->o_q2 + T * (qd / QK_K) * Q8_BYTES, out, n, D);
+        v->tag = "a.prep";
+        ok = ok && tok_run(v, T_QPREP, cp, (uint32_t)(t->nh + t->nkv), un);
+        v->tag = "a.attn";
+        ok = ok && tok_run(v, T_QATTN, ca, (uint32_t)t->nh, un);
+        v->tag = "a.out";
+        ok = ok && quant_tmp(v, qd, t0, n) && tok_mm(v, X->wo, t->o_q2 + T * (qd / QK_K) * Q8_BYTES, out, n, D);
     }
     compute_barrier(v);
+    v->tag = "resid";
     ok = ok && moe_resid(v, 1, X->ffn_norm, t->o_out, (uint32_t)t->o_h, t0, n);
+    v->tag = "router";
     const int pred = n == 1 && l + 1 < m->n_layer;
     const size_t h = t->o_h + T * D * 4, rl = t->o_rl + T * E1 * 4;
     const uint32_t cl[16] = {(uint32_t)D, (uint32_t)h, un, (uint32_t)rl, X->router, E1, E1, NONE_OFF};
-    ok = ok && tok_run(v, T_ROUTER, cl, (E1 + 7) / 8, (un + 7) / 8);
+    ok = ok && tok_run(v, T_ROUTER, cl, (E1 + 3) / 4, (un + 7) / 8);
     if (pred) {
         const uint32_t cn[16] = {(uint32_t)D, (uint32_t)(t->o_x + T * D * 4), 1, (uint32_t)t->o_pl, t->layers[l + 1].router,
                                  (uint32_t)t->E, (uint32_t)t->E, t->layers[l + 1].ffn_norm, fbits(m->eps)};
-        ok = ok && tok_run(v, T_ROUTER, cn, (uint32_t)(t->E + 7) / 8, 1);
+        ok = ok && tok_run(v, T_ROUTER, cn, (uint32_t)(t->E + 3) / 4, 1);
     }
     barrier(v, PS_COMPUTE, AC_SHADER_WRITE, PS_TRANSFER, AC_TRANSFER_READ);
     copy(v, &t->hrb, T * D * 4, &t->scratch, h, (VkDeviceSize)n * D * 4);
@@ -1668,6 +1745,7 @@ static int hybrid_shared(Vulkan *v, int l, int t0, int n) {
     const size_t hq = t->o_hq + T * (t->D / QK_K) * Q8_BYTES, fg = t->o_fg + T * Fs * 4, fu = t->o_fu + T * Fs * 4;
     const size_t fq = t->o_fq + T * (Fs / QK_K) * Q8_BYTES;
     const uint32_t cs[16] = {(uint32_t)fg, (uint32_t)fu, (uint32_t)fq, (uint32_t)Fs};
+    v->tag = "shared";
     int ok = tok_mm(v, X->sh_gate, hq, fg, n, t->Fs) && tok_mm(v, X->sh_up, hq, fu, n, t->Fs);
     compute_barrier(v);
     ok = ok && tok_run(v, T_SILU, cs, (uint32_t)(Fs / QK_K), (uint32_t)n) &&
@@ -1700,6 +1778,8 @@ static int hybrid_forward(Vulkan *v, const float *x, int n, const float *rope_cs
     t->in_s = t->in_y + 4 * (size_t)n * D;
     t->in_c = (t->in_s + 4 * (size_t)n + 255) & ~(size_t)255;
     t->ge_on = 0;
+    v->prof_on = n == 1;
+    v->prof_passes += n == 1 && v->prof;
     t->hb_rl = 4 * (size_t)n * D;
     t->hb_pl = t->hb_rl + 4 * (size_t)n * (t->E + 1);
     memcpy(t->in.map, x, sizeof(float) * (size_t)n * D);
@@ -1709,10 +1789,13 @@ static int hybrid_forward(Vulkan *v, const float *x, int n, const float *rope_cs
     const int na = n >= 32 && !getenv("PITHOS_VK_NOSPLIT") ? (n / 2 + 15) & ~15 : n, nb = n - na;
     t->cur_split = nb > 0;   /* the GPU is busy with the other half: the CPU computes every expert */
     if (!nb) {
+        /* the shared expert runs on lane 1 with the experts in VRAM, while the CPU computes the
+         * others; without those, before the next residual add */
         for (int l = 0; l < nl && ok; l++) {
-            ok = hybrid_mixer(v, l, 0, n, pos0) && hybrid_shared(v, l, 0, n) && submit(v);
+            ok = hybrid_mixer(v, l, 0, n, pos0) && submit(v);
+            t->sh_done = 0;
             if (ok) hybrid_moe(v, l, 0, n);
-            ok = ok && !v->broken;   /* the experts on the GPU failed */
+            ok = ok && !v->broken && (t->sh_done || hybrid_shared(v, l, 0, n));   /* !broken: the experts on the GPU failed */
         }
     } else {
         ok = ok && hybrid_mixer(v, 0, 0, na, pos0) && hybrid_shared(v, 0, 0, na) && submit(v);
@@ -1872,6 +1955,9 @@ int vk_moe_begin(Vulkan *v, int layer, const int *a_expert, const int *a_tok, co
         return 0;
     }
     const int D = t->D, F = p->tm[layer * 3].rows, nbufs = (p->n_slots + p->per_buf - 1) / p->per_buf;
+    int ok = hybrid_shared(v, layer, t->cur_t0, t->cur_n);
+    t->sh_done = 1;
+    v->tag = "experts";
     const size_t nbq = (size_t)(D / QK_K) * Q8_BYTES, nbf = (size_t)(F / QK_K) * Q8_BYTES;
     /* rows by buffer: those of buffer b from rb[b], a multiple of XP_PAD */
     int cnt[8] = {0}, rb[9], fill[8] = {0};
@@ -1894,7 +1980,6 @@ int vk_moe_begin(Vulkan *v, int layer, const int *a_expert, const int *a_tok, co
             tab[2 * (k * XP_ROWS + r) + 1] = k < 2 ? (uint32_t)(t->cur_t0 + a_tok[i]) : (uint32_t)r;
         }
     }
-    int ok = 1;
     for (int b = 0; b < nbufs && ok; b++) {
         if (!cnt[b]) continue;
         const Bind w = {&p->bufs[b], 0}, in = {&t->scratch, t->o_hq};
