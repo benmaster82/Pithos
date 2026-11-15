@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <b>A dependency-free C inference engine for Liquid AI's LFM2 / LFM2.5 / LFM3 models.</b><br>
+  <b>A dependency-free C inference engine for Liquid AI's LFM2 / LFM2.5 / LFM3 models and Qwen3.6.</b><br>
   Terminal chat, an OpenAI-compatible server, a web agent, a terminal agent and a voice, all in one executable.
 </p>
 
@@ -135,13 +135,14 @@ On Linux / macOS the binary is `build/pithos`, with the same options. For the co
 [Xbox One](#xbox-one): the app is built on a Windows PC and installed over the network.
 
 ### Downloading the model
-Three models are validated. Choose by the memory of your computer:
+Three models are validated, and Qwen3.6 is experimental. Choose by the memory of your computer:
 
 | Model | Download | RAM | Best for |
 |---|---:|---:|---|
 | [LFM2.5-24B-A2B](#downloading-the-model) (the reference, MoE) | 13.5 GiB | 16 GB | the deepest answers; it also runs when the model does not fit in RAM, from disk |
 | [LFM2.5-8B-A1B](#lfm25-8b-a1b-the-middle-ground) (MoE) | 4.8 GiB | 8 GB | a larger model on the CPU: it fits in RAM and generates as fast as LFM3-1.7B there |
 | [LFM3-1.7B](#lfm3-17b-small-and-fast) (dense) | 1.0 GiB | 4 GB | modest hardware, the fastest with a GPU (the whole model in VRAM), the Xbox One |
+| [Qwen3.6-35B-A3B](#qwen36-35b-a3b-experimental) (MoE, experimental) | 19.1 GiB | 16 GB | the largest; it runs from disk when it does not fit in RAM, best with a GPU |
 
 For speech, [LFM3-Audio-2B](#lfm3-audio-2b-speech-input-and-output-experimental) (experimental,
 1.2 GiB with its audio projector, 4 GB of RAM) transcribes, translates, speaks and holds voice
@@ -351,6 +352,49 @@ of speech in 1.7 s); the transcription itself then runs like any prompt, on the 
 one. On test recordings in English and Italian (16, 22 and 44.1 kHz, up to a minute) the
 transcriptions are the same as llama.cpp's on the CPU, OpenCL and Vulkan, and what Pithos says is
 transcribed back word for word.
+
+### Qwen3.6-35B-A3B (experimental)
+[Qwen/Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B) is the largest model Pithos runs:
+35 billion parameters, 256 experts of which 8 (plus a shared one) work on each token, about 3 billion
+active, and hybrid layers: 30 Gated DeltaNet layers and 10 of gated attention. It reasons before it
+answers and calls tools in XML, with the same chat, server, Pandora and terminal agent as the LFM
+models. The 19.1 GiB file does not fit in 16 GB of RAM: the experts stream from disk at first, and
+the ones in use stay in RAM.
+
+With Vulkan (the default for this model on a discrete NVIDIA GPU) every layer runs on the GPU and the
+routed experts on the CPU; the most used experts also live in the VRAM that is left (1.1 GB on a 4 GB
+GPU, about 60% of each token's experts), and the GPU computes them while the CPU computes the others.
+Prompts of 32 tokens or more are cut in two halves, so that the GPU works on one while the CPU computes
+the experts of the other.
+
+| Qwen3.6-35B-A3B on the reference laptop (6-core CPU, 16 GB, 4 GB laptop GPU), `--bench 512,128`, warm | Prompt | Generation |
+|---|---:|---:|
+| llama.cpp b12179, CPU only | 8.1 tok/s | 4.4 tok/s |
+| Pithos, CPU only (`--gpu off`) | 13.6 tok/s | 7.3 tok/s |
+| llama.cpp, Vulkan, every routed expert on the CPU (`-ngl 99 -ncmoe 40`) | 28.9 tok/s | 11.8 tok/s |
+| llama.cpp, Vulkan, the experts of 2 layers in VRAM (`-ngl 99 -ncmoe 38`) | 25.5 tok/s | 12.5 tok/s |
+| **Pithos, Vulkan (default here)** | **82 tok/s** | **22 tok/s** (24–25 after a short prompt) |
+
+The first run reads the experts from disk: 18 tok/s of prompt and 13 of generation with the GPU. The
+tool definitions of the agent and of the web UI (about 4,000 tokens) are read once, then reused from
+the prompt cache, even after a restart: a new session starts in seconds. Perplexity on the model
+license text: 1.451 (llama.cpp 1.467).
+
+| | |
+|---|---|
+| File | `Qwen3.6-35B-A3B-Q4_K_M.gguf` from [ggml-org/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF) |
+| Size | 20,542,732,576 bytes (19.1 GiB): keep about 21 GB free on the disk |
+| SHA-256 | `f4ffe03c9139e6a905a5d346f77d9fabdd179367c3280dfd005d1e75ca5ed8c8` |
+| Direct link | https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF/resolve/main/Qwen3.6-35B-A3B-Q4_K_M.gguf |
+| License | Apache 2.0 (see the model card) |
+
+Download it with the same commands as above (replace the file name and the URL), then pass it
+with `-m`:
+
+```
+build/pithos -m models/Qwen3.6-35B-A3B-Q4_K_M.gguf -i
+build/pithos -m models/Qwen3.6-35B-A3B-Q4_K_M.gguf --server --open
+```
 
 ## Results
 
