@@ -17,7 +17,8 @@ If prerequisites are missing, show the package commands and ask before installin
                  (13.5 GiB); --download-model=lfm2.5-8b the 8B MoE (4.8 GiB),
                  --download-model=lfm3-1.7b the small one (1.0 GiB),
                  --download-model=lfm3-audio-2b the speech model (1.2 GiB, with
-                 its audio projector)
+                 its audio projector), --download-model=qwen3.6-35b Qwen3.6
+                 35B MoE (19.1 GiB, experimental)
   --list-models  List the downloadable models (models.tsv) and exit without building
   --native       Optimize for this CPU; do not use for distributable binaries
   --jobs N       Parallel build jobs, 1-256 (default: detected CPU count, max 256)

@@ -313,8 +313,8 @@ class BuildScriptTests(unittest.TestCase):
     def test_list_models_reads_the_real_catalog_without_building(self):
         result = self.run_build('--list-models')
         self.assertEqual(result.returncode, 0, result.stderr)
-        for text in ('lfm2.5-24b', 'lfm2.5-8b', 'lfm3-1.7b', 'lfm3-audio-2b.mmproj', '(default)', '13.5 GiB', '4.8 GiB',
-                     '1.0 GiB', '164 MiB', 'validated'):
+        for text in ('lfm2.5-24b', 'lfm2.5-8b', 'lfm3-1.7b', 'lfm3-audio-2b.mmproj', 'qwen3.6-35b', '(default)', '13.5 GiB',
+                     '4.8 GiB', '1.0 GiB', '164 MiB', '19.1 GiB', 'validated'):
             self.assertIn(text, result.stdout)
         self.assertFalse(self.builds())
         self.assertFalse(self.events('curl'))
