@@ -48,10 +48,12 @@ int  vk_dense_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *info
 int  vk_dense_forward(Vulkan *v, const float *x, int n, const float *rope_cs, const float *rope_swa, int pos0,
                       float *logits, float *x_last);
 /* qwen35moe runs the same way, except for the routed experts: at every layer the GPU stops and
- * fn gets the residual stream x and its normalized rows h [n][dim] of the pass's tokens; it
- * writes the weighted sum of their experts to y [n][dim] and the shared expert's gate to s [n].
- * Set it before vk_dense_forward. */
-typedef void (*VkMoeFn)(void *arg, int layer, const float *x, const float *h, int n, float *y, float *s);
+ * fn gets the normalized rows h [n][dim] of the pass's tokens and their router logits lg
+ * [n][n_expert + 1] (the last one: the shared expert's gate input . h); for a single token, pred
+ * has the next layer's router logits of the residual stream, to read its experts ahead (else
+ * NULL). fn writes the weighted sum of the experts to y [n][dim] and the shared expert's gate to
+ * s [n]. Set it before vk_dense_forward. */
+typedef void (*VkMoeFn)(void *arg, int layer, const float *h, const float *lg, const float *pred, int n, float *y, float *s);
 void vk_dense_set_moe(Vulkan *v, VkMoeFn fn, void *arg);
 /* copy KV rows [r0, r1) / the convolution state (DeltaNet's included) between the host arrays and the GPU copy */
 void vk_dense_kv(Vulkan *v, uint16_t *kc, uint16_t *vc, int r0, int r1, int to_gpu);

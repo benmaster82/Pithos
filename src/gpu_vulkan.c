@@ -382,7 +382,7 @@ static VkInstance vk_instance(VkApi *vk) {
 
 enum { K_Q4_K, K_Q6_K, K_Q8_0, N_KERNELS };
 enum { T_RESID, T_QUANT, T_SILU, T_CONV, T_PREP, T_ATTN, T_CONV_CHUNK, T_CONV_STATE, T_ATTN_CHUNK,
-       T_MOE_RESID, T_DCONV, T_DREC, T_QPREP, T_QATTN, N_TOKEN_KERNELS };   /* kernels_dx_token.hlsl */
+       T_MOE_RESID, T_DCONV, T_DREC, T_QPREP, T_QATTN, T_ROUTER, N_TOKEN_KERNELS };   /* kernels_dx_token.hlsl */
 enum { B_U0 = 0, B_U1 = 1, B_U2 = 2, B_T0 = 8, B_T1 = 9, B_CONST = 16 };   /* descriptor bindings */
 
 typedef struct {
@@ -426,7 +426,7 @@ struct Vulkan {
     int nsets_cached;
     VkPipeline pso[N_KERNELS], pso_mv[N_KERNELS], pso_tok[N_TOKEN_KERNELS];
     int mv_rows;                    /* rows per group of the pso_mv kernels: 8, or 16 with the Intel build */
-    int recording, nsets, broken;
+    int recording, nsets, broken, inflight;   /* inflight: a command buffer kicked, not waited for */
     VBuf consts, dummy;             /* the constants ring (MAX_SETS slots); a stand-in for unused bindings */
     VMat *mats;                     /* sorted by host address */
     int nmats, n_big, n_split;      /* matrices too large for the GPU / split into parts */
@@ -525,7 +525,10 @@ static int vbuf_reserve(Vulkan *v, VBuf *b, VkDeviceSize size, int host) {
     return vbuf_create(v, b, (size + 0xFFFFF) & ~(VkDeviceSize)0xFFFFF, host);
 }
 
+static int wait_gpu(Vulkan *v);
+
 static VkCommandBuffer cmd(Vulkan *v) {
+    if (v->inflight) wait_gpu(v);   /* its buffer and sets are about to be reused */
     if (!v->recording) {
         VkCommandBufferBeginInfo bi = {ST_COMMAND_BUFFER_BEGIN_INFO, NULL, CB_ONE_TIME, NULL};
         v->vk.BeginCommandBuffer(v->cb, &bi);
@@ -548,8 +551,8 @@ static void copy(Vulkan *v, const VBuf *dst, VkDeviceSize doff, const VBuf *src,
     v->vk.CmdCopyBuffer(cmd(v), src->buf, dst->buf, 1, &r);
 }
 
-/* end the command buffer, run it, wait, and get ready for the next one */
-static int submit(Vulkan *v) {
+/* end the command buffer and start it on the GPU; wait_gpu waits for it */
+static int kick(Vulkan *v) {
     if (!v->recording) return 1;
     v->recording = 0;
     if (v->vk.EndCommandBuffer(v->cb) != VK_SUCCESS) {
@@ -557,14 +560,25 @@ static int submit(Vulkan *v) {
         return 0;
     }
     VkSubmitInfo si = {ST_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &v->cb, 0, NULL};
-    VkResult r = v->vk.QueueSubmit(v->queue, 1, &si, v->fence);
-    if (r == VK_SUCCESS) {
-        /* poll for up to 50 ms (PITHOS_VK_SPIN, in ms): waking up from vkWaitForFences can take
-         * about a millisecond, 8% of a token on a GTX 1650 */
-        const double t0 = time_sec(), spin = getenv("PITHOS_VK_SPIN") ? atof(getenv("PITHOS_VK_SPIN")) * 1e-3 : 50e-3;
-        while ((r = v->vk.GetFenceStatus(v->dev, v->fence)) == VK_NOT_READY && time_sec() - t0 < spin) cpu_relax();
-        if (r == VK_NOT_READY) r = v->vk.WaitForFences(v->dev, 1, &v->fence, 1, 60000000000ull);
+    const VkResult r = v->vk.QueueSubmit(v->queue, 1, &si, v->fence);
+    if (r != VK_SUCCESS) {
+        fprintf(stderr, "Vulkan: the GPU did not complete the work (error %d)\n", (int)r);
+        return 0;
     }
+    v->inflight = 1;
+    return 1;
+}
+
+/* wait for the kicked command buffer, and get ready for the next one */
+static int wait_gpu(Vulkan *v) {
+    if (!v->inflight) return 1;
+    v->inflight = 0;
+    /* poll for up to 50 ms (PITHOS_VK_SPIN, in ms): waking up from vkWaitForFences can take
+     * about a millisecond, 8% of a token on a GTX 1650 */
+    const double t0 = time_sec(), spin = getenv("PITHOS_VK_SPIN") ? atof(getenv("PITHOS_VK_SPIN")) * 1e-3 : 50e-3;
+    VkResult r;
+    while ((r = v->vk.GetFenceStatus(v->dev, v->fence)) == VK_NOT_READY && time_sec() - t0 < spin) cpu_relax();
+    if (r == VK_NOT_READY) r = v->vk.WaitForFences(v->dev, 1, &v->fence, 1, 60000000000ull);
     if (r != VK_SUCCESS) {
         fprintf(stderr, "Vulkan: the GPU did not complete the work (error %d)\n", (int)r);
         return 0;
@@ -573,6 +587,11 @@ static int submit(Vulkan *v) {
     return v->vk.ResetFences(v->dev, 1, &v->fence) == VK_SUCCESS &&
            v->vk.ResetCommandPool(v->dev, v->pool, 0) == VK_SUCCESS &&
            v->vk.ResetDescriptorPool(v->dev, v->dpool, 0) == VK_SUCCESS;
+}
+
+/* end the command buffer, run it, wait, and get ready for the next one */
+static int submit(Vulkan *v) {
+    return kick(v) && wait_gpu(v);
 }
 
 typedef struct { const VBuf *b; VkDeviceSize off; } Bind;
@@ -680,7 +699,7 @@ static int create_pipelines(Vulkan *v) {
         {g_vk_attn_chunk, sizeof(g_vk_attn_chunk), "attn_chunk"},
         {g_vk_moe_resid, sizeof(g_vk_moe_resid), "moe_resid"}, {g_vk_delta_conv, sizeof(g_vk_delta_conv), "delta_conv"},
         {g_vk_delta_rec, sizeof(g_vk_delta_rec), "delta_rec"}, {g_vk_qattn_prep, sizeof(g_vk_qattn_prep), "qattn_prep"},
-        {g_vk_qattn, sizeof(g_vk_qattn), "qattn"},
+        {g_vk_qattn, sizeof(g_vk_qattn), "qattn"}, {g_vk_router, sizeof(g_vk_router), "router"},
     };
     /* Intel: the matmul kernels built for its GPUs (kernels_dx.hlsl); PITHOS_VK_INTEL=0: the common ones */
     static const struct { const unsigned char *code; size_t size; } intel_k[2 * N_KERNELS] = {
@@ -1084,6 +1103,7 @@ typedef struct {
     const VMat *wq, *wk, *wv, *wo, *gate, *in_proj, *out_proj, *w_gate, *w_up, *w_down;
     /* Qwen: DeltaNet weights in sw, the layer's state in cs, the DeltaNet and shared-expert matrices */
     uint32_t ssm_conv, ssm_a, ssm_dt, ssm_norm, state;
+    uint32_t router;                /* the router [n_expert][dim], then the shared expert's gate input, in sw */
     const VMat *ssm_qkv, *ssm_z, *ssm_alpha, *ssm_beta, *ssm_out, *sh_gate, *sh_up, *sh_down;
 } VLayer;
 
@@ -1100,8 +1120,10 @@ typedef struct VDense {
     size_t cs_bytes;                /* the convolution / DeltaNet state, as the CPU keeps it */
     /* Qwen (hybrid): the routed experts on the CPU, through moe() at every layer */
     int hybrid, qd, qkvw, vd, vh, kh, kconv, n_rot, Fs;
-    size_t o_h, o_z, o_al, o_be, o_q2, o_qg, o_kv, o_q, o_g, o_sh;
-    VBuf hrb;                       /* x and h of the chunk, read back at every layer */
+    int E;
+    size_t o_h, o_z, o_al, o_be, o_q2, o_qg, o_kv, o_q, o_g, o_sh, o_rl, o_pl;
+    size_t in_rope, in_y, in_s, hb_rl, hb_pl;   /* this pass's offsets in in and hrb */
+    VBuf hrb;                       /* h, the router logits and the prediction, read back at every layer */
     VkMoeFn moe;
     void *moe_arg;
 } VDense;
@@ -1272,10 +1294,12 @@ static int hybrid_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *
     const int D = m->dim, hd = m->head_dim, d = m->ssm_d;
     const VMat *output = find_mat(v, m->output.data);
     int ok = D % QK_K == 0 && d == 128 && hd % 2 == 0 && hd <= 512 && m->n_rot <= hd && m->q_gate && m->ssm_conv_k >= 2 &&
-             m->ssm_conv_k <= 8 && m->ff_shexp % QK_K == 0 && (m->n_head * hd) % QK_K == 0 && output && output->nparts;
+             m->ssm_conv_k <= 8 && m->ff_shexp % QK_K == 0 && (m->n_head * hd) % QK_K == 0 && output && output->nparts &&
+             v->props.limits.maxComputeWorkGroupInvocations >= 512 && v->props.limits.maxComputeWorkGroupSize[0] >= 512;   /* delta_rec */
     for (int l = 0; l < m->n_layer && ok; l++) {
         const Layer *L = &m->layers[l];
-        ok = L->is_moe && L->sh_up.data && (L->is_delta || L->is_attn) && !L->post_op_norm && !L->post_ffn_norm;
+        ok = L->is_moe && L->sh_up.data && L->sh_inp && L->router.type == GGML_F32 &&
+             (L->is_delta || L->is_attn) && !L->post_op_norm && !L->post_ffn_norm;
     }
     if (!ok) {
         snprintf(info, (size_t)infolen, "this model needs the CPU for part of each token");
@@ -1299,6 +1323,7 @@ static int hybrid_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *
     t->kconv = m->ssm_conv_k;
     t->n_rot = m->n_rot;
     t->Fs = m->ff_shexp;
+    t->E = m->n_expert;
     t->n_attn = m->n_attn;
     t->output = output;
     t->layers = (VLayer *)calloc((size_t)m->n_layer, sizeof(VLayer));
@@ -1334,6 +1359,13 @@ static int hybrid_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *
             X->ssm_out = find_mat(v, L->ssm_out.data);
             ok = X->ssm_qkv && X->ssm_z && X->ssm_alpha && X->ssm_beta && X->ssm_out && L->ssm_conv && L->ssm_a && L->ssm_dt &&
                  L->ssm_norm;
+        }
+        {   /* the router's rows and the gate input as one f32 matrix */
+            float *r = (float *)malloc(sizeof(float) * (size_t)(t->E + 1) * D);
+            memcpy(r, L->router.data, sizeof(float) * (size_t)t->E * D);
+            memcpy(r + (size_t)t->E * D, L->sh_inp, sizeof(float) * (size_t)D);
+            X->router = add_vec(&sw, &len, &cap, r, (size_t)(t->E + 1) * D);
+            free(r);
         }
         X->sh_gate = find_mat(v, L->sh_gate.data);
         X->sh_up = find_mat(v, L->sh_up.data);
@@ -1371,12 +1403,14 @@ static int hybrid_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *
     t->o_fg = carve(&top, B * (size_t)t->Fs * 4);
     t->o_fu = carve(&top, B * (size_t)t->Fs * 4);
     t->o_fq = carve(&top, B * (size_t)(t->Fs / QK_K) * Q8_BYTES);
+    t->o_rl = carve(&top, B * (size_t)(t->E + 1) * 4);
+    t->o_pl = carve(&top, (size_t)t->E * 4);
     t->o_logits = carve(&top, (size_t)m->n_vocab * 4);
     t->o_last = carve(&top, (size_t)(D / QK_K) * Q8_BYTES);
     t->kv_half = (size_t)t->n_attn * (size_t)n_ctx * (size_t)t->kvd * 2;
     const size_t kv_bytes = t->kv_half ? 2 * t->kv_half : 256, max_buf = v->props.limits.maxStorageBufferRange;
     const VkDeviceSize align = v->props.limits.minStorageBufferOffsetAlignment;
-    if (kv_bytes > max_buf || top > max_buf || t->cs_bytes > max_buf || (4 * (VkDeviceSize)t->kvd) % align) {
+    if (kv_bytes > max_buf || top > max_buf || t->cs_bytes > max_buf || len * 4 > max_buf || (4 * (VkDeviceSize)t->kvd) % align) {
         dense_free(v);
         free(sw);
         snprintf(info, (size_t)infolen, "a %d-token KV cache (%.0f MB) exceeds the %u MB buffer limit: lower -c", n_ctx,
@@ -1387,7 +1421,7 @@ static int hybrid_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *
          vbuf_create(v, &t->cs, t->cs_bytes, HOST_NONE) && vbuf_create(v, &t->sw, len * 4, HOST_NONE) &&
          vbuf_create(v, &t->in, B * (size_t)(2 * D + hd + 1) * 4, HOST_UPLOAD) &&
          vbuf_create(v, &t->lrb, (size_t)(m->n_vocab + D) * 4, HOST_READBACK) &&
-         vbuf_create(v, &t->hrb, 2 * B * D * 4, HOST_READBACK) && vbuf_reserve(v, &v->up, len * 4, HOST_UPLOAD);
+         vbuf_create(v, &t->hrb, (B * (D + t->E + 1) + t->E) * 4, HOST_READBACK) && vbuf_reserve(v, &v->up, len * 4, HOST_UPLOAD);
     if (ok) {
         memcpy(v->up.map, sw, len * 4);
         copy(v, &t->sw, 0, &v->up, 0, len * 4);
@@ -1468,83 +1502,151 @@ static int finish_pass(Vulkan *v, int ok, int n, float *logits, float *x_last) {
     return 1;
 }
 
-/* x += s * shared + y (mode 2), or x += out (mode 1), or the embeddings (mode 0); the Q8_K of its
- * norm at o_hq, and the floats at h unless NONE_OFF */
-static int moe_resid(Vulkan *v, uint32_t mode, uint32_t norm, size_t out, uint32_t h, size_t in_y, size_t in_s, int n) {
+/* qwen35moe. The buffers of a pass hold its tokens' rows; the functions below work on the rows of
+ * the tokens [t0, t0 + n). */
+
+/* x += s * shared + y (mode 2), or x += out (mode 1), or the embeddings (mode 0, t0 = 0); the Q8_K
+ * of its norm at o_hq, and the floats at h unless NONE_OFF */
+static int moe_resid(Vulkan *v, uint32_t mode, uint32_t norm, size_t out, uint32_t h, int t0, int n) {
     const VDense *t = v->dense;
-    const uint32_t c[16] = {(uint32_t)t->D, (uint32_t)t->o_x, (uint32_t)out, (uint32_t)t->o_hq, mode, norm,
-                            fbits(t->m->eps), h, (uint32_t)in_y, (uint32_t)in_s};
+    const size_t r = (size_t)t0 * t->D * 4;
+    const uint32_t c[16] = {(uint32_t)t->D, (uint32_t)(t->o_x + r), (uint32_t)(out + r),
+                            (uint32_t)(t->o_hq + (size_t)t0 * (t->D / QK_K) * Q8_BYTES), mode, norm, fbits(t->m->eps),
+                            h == NONE_OFF ? NONE_OFF : (uint32_t)(h + r), (uint32_t)(t->in_y + r), (uint32_t)(t->in_s + 4 * (size_t)t0)};
     return tok_run(v, T_MOE_RESID, c, 1, (uint32_t)n);
 }
 
 /* Q8_K rows of the floats at o_tmp (width floats per token) into o_q2 */
-static int quant_tmp(Vulkan *v, int width, int n) {
+static int quant_tmp(Vulkan *v, int width, int t0, int n) {
     const VDense *t = v->dense;
     const uint32_t nbw = (uint32_t)(width / QK_K);
-    const uint32_t c[16] = {(uint32_t)t->o_tmp, (uint32_t)t->o_q2, (uint32_t)width * 4, nbw * Q8_BYTES};
+    const uint32_t c[16] = {(uint32_t)(t->o_tmp + (size_t)t0 * width * 4), (uint32_t)(t->o_q2 + (size_t)t0 * nbw * Q8_BYTES),
+                            (uint32_t)width * 4, nbw * Q8_BYTES};
     return tok_run(v, T_QUANT, c, nbw, (uint32_t)n);
 }
 
-/* qwen35moe: one submit per layer; the CPU computes the routed experts in between (moe) */
+/* layer l up to the routed experts: the residual add of layer l - 1's (from the CPU, in IN), the
+ * mixer, its residual add and the router (for one token also the next layer's, to read its
+ * experts ahead); then h and the logits are copied to hrb */
+static int hybrid_mixer(Vulkan *v, int l, int t0, int n, int pos0) {
+    VDense *t = v->dense;
+    const Model *m = t->m;
+    const Layer *L = &m->layers[l];
+    const VLayer *X = &t->layers[l];
+    const int D = t->D, hd = t->hd, qd = t->qd, kvd = t->kvd, vd = t->vd, vh = t->vh;
+    const uint32_t un = (uint32_t)n, E1 = (uint32_t)t->E + 1;
+    const size_t T = (size_t)t0, hq = t->o_hq + T * (D / QK_K) * Q8_BYTES, out = t->o_out + T * D * 4;
+    int ok = l == 0 || moe_resid(v, 2, X->attn_norm, t->o_sh, NONE_OFF, t0, n);
+    if (L->is_delta) {
+        const size_t big = t->o_big + T * t->qkvw * 4, z = t->o_z + T * vd * 4, tmp = t->o_tmp + T * vd * 4;
+        const size_t al = t->o_al + T * vh * 4, be = t->o_be + T * vh * 4;
+        ok = ok && tok_mm(v, X->ssm_qkv, hq, big, n, t->qkvw) && tok_mm(v, X->ssm_z, hq, z, n, vd) &&
+             tok_mm(v, X->ssm_alpha, hq, al, n, vh) && tok_mm(v, X->ssm_beta, hq, be, n, vh);
+        compute_barrier(v);
+        const uint32_t cc[16] = {(uint32_t)t->qkvw, (uint32_t)big, (uint32_t)t->qkvw * 4, un, X->ssm_conv, X->state,
+                                 (uint32_t)t->kconv};
+        const uint32_t cr[16] = {(uint32_t)big, (uint32_t)t->qkvw * 4, (uint32_t)z, (uint32_t)vd * 4, (uint32_t)al, (uint32_t)be,
+                                 (uint32_t)tmp, un, X->state + (uint32_t)(4 * (t->kconv - 1) * t->qkvw), (uint32_t)t->kh,
+                                 (uint32_t)vh, fbits(m->eps), X->ssm_a, X->ssm_dt, X->ssm_norm, fbits(1.f / sqrtf((float)m->ssm_d))};
+        ok = ok && tok_run(v, T_DCONV, cc, (uint32_t)(t->qkvw + 255) / 256, 1) && tok_run(v, T_DREC, cr, (uint32_t)vh, 1) &&
+             quant_tmp(v, vd, t0, n) && tok_mm(v, X->ssm_out, t->o_q2 + T * (vd / QK_K) * Q8_BYTES, out, n, D);
+    } else {
+        const size_t qg = t->o_qg + T * 2 * qd * 4, kv = t->o_kv + T * 2 * kvd * 4, q = t->o_q + T * qd * 4;
+        const size_t g = t->o_g + T * qd * 4, tmp = t->o_tmp + T * qd * 4;
+        ok = ok && tok_mm(v, X->wq, hq, qg, n, 2 * qd) && tok_mm(v, X->wk, hq, kv, n, 2 * kvd) &&
+             tok_mm(v, X->wv, hq, kv + 4 * (size_t)kvd, n, 2 * kvd);
+        compute_barrier(v);
+        const size_t kbase = (size_t)L->attn_idx * (size_t)t->n_ctx * (size_t)kvd * 2;
+        const size_t krow = kbase + (size_t)pos0 * (size_t)kvd * 2;
+        const uint32_t cp[16] = {(uint32_t)hd, (uint32_t)qg, (uint32_t)kv, (uint32_t)t->nh, X->q_norm, X->k_norm,
+                                 (uint32_t)(t->in_rope + T * hd * 4), fbits(m->eps), (uint32_t)krow,
+                                 (uint32_t)(t->kv_half + krow), (uint32_t)t->n_rot, (uint32_t)q, (uint32_t)g, (uint32_t)qd,
+                                 (uint32_t)kvd};
+        const uint32_t ca[16] = {(uint32_t)hd, (uint32_t)q, (uint32_t)g, (uint32_t)tmp, (uint32_t)kbase,
+                                 (uint32_t)(t->kv_half + kbase), (uint32_t)kvd, (uint32_t)qd, (uint32_t)pos0,
+                                 (uint32_t)(t->nh / t->nkv), 0, 0, fbits(1.f / sqrtf((float)hd))};
+        ok = ok && tok_run(v, T_QPREP, cp, (uint32_t)(t->nh + t->nkv), un) && tok_run(v, T_QATTN, ca, (uint32_t)t->nh, un) &&
+             quant_tmp(v, qd, t0, n) && tok_mm(v, X->wo, t->o_q2 + T * (qd / QK_K) * Q8_BYTES, out, n, D);
+    }
+    compute_barrier(v);
+    ok = ok && moe_resid(v, 1, X->ffn_norm, t->o_out, (uint32_t)t->o_h, t0, n);
+    const int pred = n == 1 && l + 1 < m->n_layer;
+    const size_t h = t->o_h + T * D * 4, rl = t->o_rl + T * E1 * 4;
+    const uint32_t cl[16] = {(uint32_t)D, (uint32_t)h, un, (uint32_t)rl, X->router, E1, E1, NONE_OFF};
+    ok = ok && tok_run(v, T_ROUTER, cl, (E1 + 7) / 8, (un + 7) / 8);
+    if (pred) {
+        const uint32_t cn[16] = {(uint32_t)D, (uint32_t)(t->o_x + T * D * 4), 1, (uint32_t)t->o_pl, t->layers[l + 1].router,
+                                 (uint32_t)t->E, (uint32_t)t->E, t->layers[l + 1].ffn_norm, fbits(m->eps)};
+        ok = ok && tok_run(v, T_ROUTER, cn, (uint32_t)(t->E + 7) / 8, 1);
+    }
+    barrier(v, PS_COMPUTE, AC_SHADER_WRITE, PS_TRANSFER, AC_TRANSFER_READ);
+    copy(v, &t->hrb, T * D * 4, &t->scratch, h, (VkDeviceSize)n * D * 4);
+    copy(v, &t->hrb, t->hb_rl + T * E1 * 4, &t->scratch, rl, (VkDeviceSize)n * E1 * 4);
+    if (pred) copy(v, &t->hrb, t->hb_pl, &t->scratch, t->o_pl, (VkDeviceSize)t->E * 4);
+    barrier(v, PS_TRANSFER, AC_TRANSFER_WRITE, PS_HOST, AC_HOST_READ);
+    return ok;
+}
+
+/* the shared expert of layer l into o_sh (scaled on the next residual add by the CPU's gate) */
+static int hybrid_shared(Vulkan *v, int l, int t0, int n) {
+    VDense *t = v->dense;
+    const VLayer *X = &t->layers[l];
+    const size_t T = (size_t)t0, Fs = (size_t)t->Fs;
+    const size_t hq = t->o_hq + T * (t->D / QK_K) * Q8_BYTES, fg = t->o_fg + T * Fs * 4, fu = t->o_fu + T * Fs * 4;
+    const size_t fq = t->o_fq + T * (Fs / QK_K) * Q8_BYTES;
+    const uint32_t cs[16] = {(uint32_t)fg, (uint32_t)fu, (uint32_t)fq, (uint32_t)Fs};
+    int ok = tok_mm(v, X->sh_gate, hq, fg, n, t->Fs) && tok_mm(v, X->sh_up, hq, fu, n, t->Fs);
+    compute_barrier(v);
+    ok = ok && tok_run(v, T_SILU, cs, (uint32_t)(Fs / QK_K), (uint32_t)n) &&
+         tok_mm(v, X->sh_down, fq, t->o_sh + T * t->D * 4, n, t->D);
+    compute_barrier(v);
+    return ok;
+}
+
+/* the CPU's part of layer l: the routed experts, from what hybrid_mixer read back */
+static void hybrid_moe(Vulkan *v, int l, int t0, int n) {
+    VDense *t = v->dense;
+    const size_t D = (size_t)t->D, E1 = (size_t)t->E + 1;
+    const float *hb = (const float *)t->hrb.map;
+    const int pred = n == 1 && l + 1 < t->m->n_layer;
+    t->moe(t->moe_arg, l, hb + (size_t)t0 * D, hb + t->hb_rl / 4 + (size_t)t0 * E1, pred ? hb + t->hb_pl / 4 : NULL, n,
+           (float *)(t->in.map + t->in_y) + (size_t)t0 * D, (float *)(t->in.map + t->in_s) + t0);
+}
+
+/* qwen35moe: the GPU stops at every layer for the CPU's experts. A pass of 32 tokens or more is
+ * cut in two halves (PITHOS_VK_NOSPLIT: not), and the GPU computes a layer of one half while the
+ * CPU computes the experts of the other. */
 static int hybrid_forward(Vulkan *v, const float *x, int n, const float *rope_cs, int pos0, float *logits, float *x_last) {
     VDense *t = v->dense;
     const Model *m = t->m;
-    const int D = t->D, hd = t->hd, qd = t->qd, kvd = t->kvd, vd = t->vd, vh = t->vh;
-    const uint32_t un = (uint32_t)n;
-    const size_t in_rope = 4 * (size_t)n * D, in_y = in_rope + 4 * (size_t)n * hd, in_s = in_y + 4 * (size_t)n * D;
+    const int D = t->D, hd = t->hd, nl = m->n_layer;
+    t->in_rope = 4 * (size_t)n * D;
+    t->in_y = t->in_rope + 4 * (size_t)n * hd;
+    t->in_s = t->in_y + 4 * (size_t)n * D;
+    t->hb_rl = 4 * (size_t)n * D;
+    t->hb_pl = t->hb_rl + 4 * (size_t)n * (t->E + 1);
     memcpy(t->in.map, x, sizeof(float) * (size_t)n * D);
-    memcpy(t->in.map + in_rope, rope_cs, sizeof(float) * (size_t)n * hd);
-    int ok = moe_resid(v, 0, t->layers[0].attn_norm, t->o_out, NONE_OFF, in_y, in_s, n);
-    for (int l = 0; l < m->n_layer && ok; l++) {
-        const Layer *L = &m->layers[l];
-        const VLayer *X = &t->layers[l];
-        if (L->is_delta) {
-            ok = tok_mm(v, X->ssm_qkv, t->o_hq, t->o_big, n, t->qkvw) && tok_mm(v, X->ssm_z, t->o_hq, t->o_z, n, vd) &&
-                 tok_mm(v, X->ssm_alpha, t->o_hq, t->o_al, n, vh) && tok_mm(v, X->ssm_beta, t->o_hq, t->o_be, n, vh);
-            compute_barrier(v);
-            const uint32_t cc[16] = {(uint32_t)t->qkvw, (uint32_t)t->o_big, (uint32_t)t->qkvw * 4, un, X->ssm_conv, X->state,
-                                     (uint32_t)t->kconv};
-            const uint32_t cr[16] = {(uint32_t)t->o_big, (uint32_t)t->qkvw * 4, (uint32_t)t->o_z, (uint32_t)vd * 4,
-                                     (uint32_t)t->o_al, (uint32_t)t->o_be, (uint32_t)t->o_tmp, un,
-                                     X->state + (uint32_t)(4 * (t->kconv - 1) * t->qkvw), (uint32_t)t->kh, (uint32_t)vh,
-                                     fbits(m->eps), X->ssm_a, X->ssm_dt, X->ssm_norm, fbits(1.f / sqrtf((float)m->ssm_d))};
-            ok = ok && tok_run(v, T_DCONV, cc, (uint32_t)(t->qkvw + 255) / 256, 1) && tok_run(v, T_DREC, cr, (uint32_t)vh, 1) &&
-                 quant_tmp(v, vd, n) && tok_mm(v, X->ssm_out, t->o_q2, t->o_out, n, D);
-        } else {
-            ok = tok_mm(v, X->wq, t->o_hq, t->o_qg, n, 2 * qd) && tok_mm(v, X->wk, t->o_hq, t->o_kv, n, 2 * kvd) &&
-                 tok_mm(v, X->wv, t->o_hq, t->o_kv + 4 * (size_t)kvd, n, 2 * kvd);
-            compute_barrier(v);
-            const size_t kbase = (size_t)L->attn_idx * (size_t)t->n_ctx * (size_t)kvd * 2;
-            const size_t krow = kbase + (size_t)pos0 * (size_t)kvd * 2;
-            const uint32_t cp[16] = {(uint32_t)hd, (uint32_t)t->o_qg, (uint32_t)t->o_kv, (uint32_t)t->nh, X->q_norm, X->k_norm,
-                                     (uint32_t)in_rope, fbits(m->eps), (uint32_t)krow, (uint32_t)(t->kv_half + krow),
-                                     (uint32_t)t->n_rot, (uint32_t)t->o_q, (uint32_t)t->o_g, (uint32_t)qd, (uint32_t)kvd};
-            const uint32_t ca[16] = {(uint32_t)hd, (uint32_t)t->o_q, (uint32_t)t->o_g, (uint32_t)t->o_tmp, (uint32_t)kbase,
-                                     (uint32_t)(t->kv_half + kbase), (uint32_t)kvd, (uint32_t)qd, (uint32_t)pos0,
-                                     (uint32_t)(t->nh / t->nkv), 0, 0, fbits(1.f / sqrtf((float)hd))};
-            ok = ok && tok_run(v, T_QPREP, cp, (uint32_t)(t->nh + t->nkv), un) && tok_run(v, T_QATTN, ca, (uint32_t)t->nh, un) &&
-                 quant_tmp(v, qd, n) && tok_mm(v, X->wo, t->o_q2, t->o_out, n, D);
+    memcpy(t->in.map + t->in_rope, rope_cs, sizeof(float) * (size_t)n * hd);
+    int ok = moe_resid(v, 0, t->layers[0].attn_norm, t->o_out, NONE_OFF, 0, n);
+    /* the first half: a multiple of 16 tokens, so that its rows of every buffer stay bindable */
+    const int na = n >= 32 && !getenv("PITHOS_VK_NOSPLIT") ? (n / 2 + 15) & ~15 : n, nb = n - na;
+    if (!nb) {
+        for (int l = 0; l < nl && ok; l++) {
+            ok = hybrid_mixer(v, l, 0, n, pos0) && hybrid_shared(v, l, 0, n) && submit(v);
+            if (ok) hybrid_moe(v, l, 0, n);
         }
-        compute_barrier(v);
-        ok = ok && moe_resid(v, 1, X->ffn_norm, t->o_out, (uint32_t)t->o_h, in_y, in_s, n);
-        /* the shared expert, scaled on the next add by the gate the CPU computes */
-        const uint32_t cs[16] = {(uint32_t)t->o_fg, (uint32_t)t->o_fu, (uint32_t)t->o_fq, (uint32_t)t->Fs};
-        ok = ok && tok_mm(v, X->sh_gate, t->o_hq, t->o_fg, n, t->Fs) && tok_mm(v, X->sh_up, t->o_hq, t->o_fu, n, t->Fs);
-        compute_barrier(v);
-        ok = ok && tok_run(v, T_SILU, cs, (uint32_t)(t->Fs / QK_K), un) && tok_mm(v, X->sh_down, t->o_fq, t->o_sh, n, D);
-        barrier(v, PS_COMPUTE, AC_SHADER_WRITE, PS_TRANSFER, AC_TRANSFER_READ);
-        const VkDeviceSize rows = (VkDeviceSize)n * D * 4;
-        copy(v, &t->hrb, 0, &t->scratch, t->o_x, rows);
-        copy(v, &t->hrb, rows, &t->scratch, t->o_h, rows);
-        barrier(v, PS_TRANSFER, AC_TRANSFER_WRITE, PS_HOST, AC_HOST_READ);
-        if (!ok || !submit(v)) {
-            ok = 0;
-            break;
+    } else {
+        ok = ok && hybrid_mixer(v, 0, 0, na, pos0) && hybrid_shared(v, 0, 0, na) && submit(v);
+        for (int l = 0; l < nl && ok; l++) {
+            ok = hybrid_mixer(v, l, na, nb, pos0 + na) && hybrid_shared(v, l, na, nb) && kick(v);
+            if (ok) hybrid_moe(v, l, 0, na);
+            ok = wait_gpu(v) && ok;
+            if (l + 1 < nl) ok = ok && hybrid_mixer(v, l + 1, 0, na, pos0) && hybrid_shared(v, l + 1, 0, na) && kick(v);
+            if (ok) hybrid_moe(v, l, na, nb);
+            ok = wait_gpu(v) && ok;
         }
-        const float *hx = (const float *)t->hrb.map;
-        t->moe(t->moe_arg, l, hx, hx + (size_t)n * D, n, (float *)(t->in.map + in_y), (float *)(t->in.map + in_s));
-        ok = moe_resid(v, 2, l + 1 < m->n_layer ? t->layers[l + 1].attn_norm : t->final_norm, t->o_sh, NONE_OFF, in_y, in_s, n);
     }
+    ok = ok && moe_resid(v, 2, t->final_norm, t->o_sh, NONE_OFF, 0, n);
     return finish_pass(v, ok, n, logits, x_last);
 }
 

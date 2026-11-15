@@ -396,43 +396,76 @@ void delta_conv(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
 }
 
 groupshared float dq[128], dk[128];
+groupshared float2 d2[512];
 
-// the gated delta rule of one V head (128 threads, one value column of S each) over the n tokens
-// in order: q and k L2-normalized (q also by 1/sqrt(d)); S = decay S + k u^T with
-// u = beta (v - decay S^T k); o = S^T q; then RMSNorm of o times the norm weight and silu(z).
+// the sums of v over the 512 threads
+float2 reduce2_512(uint li, float2 v) {
+    d2[li] = v;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = 256; s > 0; s >>= 1) {
+        if (li < s) d2[li] += d2[li + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    const float2 r = d2[0];
+    GroupMemoryBarrierWithGroupSync();
+    return r;
+}
+
+// the gated delta rule of one V head over the n tokens in order: q and k L2-normalized (q also
+// by 1/sqrt(d)); S = decay S + k u^T with u = beta (v - decay S^T k); o = S^T q; then RMSNorm of
+// o times the norm weight and silu(z). 512 threads: value column c = li % 128 of S, rows
+// [32 (li / 128), +32), kept in registers over the tokens.
 // Groups: V heads (V head j reads K head j % kh).
 // C0: rows (q | k | v), row bytes, z rows, z and out row bytes   C1: alpha rows, beta rows (vh floats), out, n
 // C2: S of this layer (in CS), kh, vh, eps   C3: ssm_a, dt bias, norm weight (offsets in SW), 1/sqrt(d)
-[numthreads(128, 1, 1)]
+[numthreads(512, 1, 1)]
 void delta_rec(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
-    const uint d = 128, j = gid.x, kh = C2.y, vh = C2.z, kj = j % kh, n = C1.w;
+    const uint d = 128, j = gid.x, kh = C2.y, vh = C2.z, kj = j % kh, n = C1.w, c = li % 128, i0 = (li / 128) * 32;
     const float eps = asfloat(C2.w), qs = asfloat(C3.w);
-    const float A = ldw(C3.x + 4 * j), dt = ldw(C3.y + 4 * j), nw = ldw(C3.z + 4 * li);
-    const uint so = C2.x + 4 * j * d * d + 4 * li;    // S[i][li] at so + 4 * i * d
+    const float A = ldw(C3.x + 4 * j), dt = ldw(C3.y + 4 * j), nw = ldw(C3.z + 4 * c);
+    const uint so = C2.x + 4 * (j * d * d + i0 * d + c);    // S[i0 + k][c] at so + 4 * k * d
+    float S[32];
+    [unroll] for (uint k = 0; k < 32; k++) S[k] = asfloat(CS.Load(so + 4 * k * d));
     for (uint t = 0; t < n; t++) {
         const uint row = C0.x + t * C0.y;
-        const float q = ldu(row + 4 * (kj * d + li)), k = ldu(row + 4 * (kh * d + kj * d + li));
-        const float v = ldu(row + 4 * (2 * kh * d + j * d + li));
-        const float nq = sqrt(reduce_sum128(li, q * q)), nk = sqrt(reduce_sum128(li, k * k));
-        dq[li] = q / max(nq, eps) * qs;
-        dk[li] = k / max(nk, eps);
+        float q = 0, kk = 0;
+        if (li < 128) {
+            q = ldu(row + 4 * (kj * d + li));
+            kk = ldu(row + 4 * (kh * d + kj * d + li));
+        }
+        const float2 nn = sqrt(reduce2_512(li, float2(q * q, kk * kk)));
+        if (li < 128) {
+            dq[li] = q / max(nn.x, eps) * qs;
+            dk[li] = kk / max(nn.y, eps);
+        }
         GroupMemoryBarrierWithGroupSync();
+        const float v = ldu(row + 4 * (2 * kh * d + j * d + c));
         const float x = ldu(C1.x + 4 * (t * vh + j)) + dt, beta = ldu(C1.y + 4 * (t * vh + j));
         const float sp = x > 20 ? x : log(1 + exp(x));
         const float decay = exp(sp * A), b = 1 / (1 + exp(-beta));
         float u = 0;
-        for (uint i = 0; i < d; i++) u += asfloat(CS.Load(so + 4 * i * d)) * dk[i];
+        [unroll] for (uint k1 = 0; k1 < 32; k1++) u += S[k1] * dk[i0 + k1];
+        d2[li].x = u;
+        GroupMemoryBarrierWithGroupSync();
+        u = d2[c].x + d2[c + 128].x + d2[c + 256].x + d2[c + 384].x;
         u = b * (v - decay * u);
         float o = 0;
-        for (uint i2 = 0; i2 < d; i2++) {
-            const float sv = decay * asfloat(CS.Load(so + 4 * i2 * d)) + dk[i2] * u;
-            CS.Store(so + 4 * i2 * d, asuint(sv));
-            o += sv * dq[i2];
+        [unroll] for (uint k2 = 0; k2 < 32; k2++) {
+            S[k2] = decay * S[k2] + dk[i0 + k2] * u;
+            o += S[k2] * dq[i0 + k2];
         }
-        const float r = rsqrt(reduce_sum128(li, o * o) / d + eps);
-        const float z = ldu(C0.z + t * C0.w + 4 * (j * d + li));
-        stu(C1.z + t * C0.w + 4 * (j * d + li), o * r * nw * (z / (1 + exp(-z))));
+        GroupMemoryBarrierWithGroupSync();
+        d2[li].y = o;
+        GroupMemoryBarrierWithGroupSync();
+        o = d2[c].y + d2[c + 128].y + d2[c + 256].y + d2[c + 384].y;
+        GroupMemoryBarrierWithGroupSync();
+        const float r = rsqrt(reduce2_512(li, float2(li < 128 ? o * o : 0, 0)).x / d + eps);
+        if (li < 128) {
+            const float z = ldu(C0.z + t * C0.w + 4 * (j * d + li));
+            stu(C1.z + t * C0.w + 4 * (j * d + li), o * r * nw * (z / (1 + exp(-z))));
+        }
     }
+    [unroll] for (uint k3 = 0; k3 < 32; k3++) CS.Store(so + 4 * k3 * d, asuint(S[k3]));
 }
 
 // Qwen attention, per head: q heads [q | gate] -> RMSNorm and NEOX RoPE of the first n_rot
@@ -524,6 +557,45 @@ void qattn(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
         const uint oo = 4 * (t * qd + h * hd + 2 * p);
         stu(C0.w + oo, acc.x * inv * ldu(C0.z + oo));
         stu(C0.w + oo + 4, acc.y * inv * ldu(C0.z + oo + 4));
+    }
+}
+
+// The router's logits (f32 weights in SW): out[t][r] = row r . x_t, or . rmsnorm(x_t) * norm
+// weight unless NONE. Groups: 8 rows, 8 tokens; 32 threads per row.
+// C0: dim, x, n, out   C1: weights, rows, out row (floats), norm weight   C2: eps
+[numthreads(256, 1, 1)]
+void router(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint D = C0.x, t0 = gid.y * 8, nt = min(8u, C0.z - t0), nw = C1.w, lane = li % 32;
+    const uint r = gid.x * 8 + li / 32, wo = C1.x + 4 * min(r, C1.y - 1) * D;
+    if (nw != NONE) {
+        for (uint tt = 0; tt < nt; tt++) {
+            float ss = 0;
+            for (uint i = li; i < D; i += 256) {
+                const float v = ldu(C0.y + 4 * ((t0 + tt) * D + i));
+                ss += v * v;
+            }
+            const float s = rsqrt(reduce_sum(li, ss) / D + asfloat(C2.x));
+            if (li == 0) gp[tt] = s;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    float acc[8];
+    [unroll] for (uint k = 0; k < 8; k++) acc[k] = 0;
+    for (uint i = 4 * lane; i < D; i += 128) {
+        float4 w = asfloat(SW.Load4(wo + 4 * i));
+        if (nw != NONE) w *= asfloat(SW.Load4(nw + 4 * i));
+        [unroll] for (uint k = 0; k < 8; k++)
+            if (k < nt) acc[k] += dot(w, asfloat(U.Load4(C0.y + 4 * ((t0 + k) * D + i))));
+    }
+    for (uint k = 0; k < nt; k++) {
+        gs[li] = acc[k];
+        GroupMemoryBarrierWithGroupSync();
+        [unroll] for (uint s = 16; s > 0; s >>= 1) {
+            if (lane < s) gs[li] += gs[li + s];
+            GroupMemoryBarrierWithGroupSync();
+        }
+        if (lane == 0 && r < C1.y) stu(C0.w + 4 * ((t0 + k) * C1.z + r), gs[li] * (nw != NONE ? gp[k] : 1));
+        GroupMemoryBarrierWithGroupSync();
     }
 }
 #endif
