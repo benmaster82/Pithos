@@ -116,6 +116,11 @@ prompt 328 tok/s, generation 82 (Direct3D 12: 336 / 70).
 - [ ] **Live ASR** (`Perform live ASR.`, English, ~1 s chunks): captions while the user speaks.
 
 ## Done
+- v0.7.5: Qwen3.6-35B-A3B (experimental), on the CPU and with Vulkan (every layer on the GPU, the
+  routed experts on the CPU, the most used ones in VRAM; prompt halves overlapped with the CPU);
+  its model card's sampling, `--presence-penalty`; tool definitions reused from the prompt cache
+  across sessions; XML tool arguments typed by the tool's schema;
+  `build.sh --download-model=qwen3.6-35b`.
 - v0.7.0: LFM3-Audio-2B, speech input (`--audio`, `input_audio` parts,
   `/v1/audio/transcriptions` and `translations`), speech output (`--tts`, `/v1/audio/speech` in
   WAV, PCM or MP3, streamed), spoken answers in English, dictation and voice mode in Pandora, the
