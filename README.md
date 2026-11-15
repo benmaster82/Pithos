@@ -14,6 +14,7 @@
   <img alt="Xbox One in Developer Mode" src="https://img.shields.io/badge/Xbox%20One-Developer%20Mode-107c10">
   <img alt="GPU: OpenCL, Direct3D 12 or Vulkan, optional" src="https://img.shields.io/badge/GPU-OpenCL%20%7C%20Direct3D%2012%20%7C%20Vulkan%2C%20optional-f5a05a">
   <a href="#lfm3-audio-2b-speech-input-and-output-experimental"><img alt="Speech in and out with LFM3-Audio" src="https://img.shields.io/badge/speech-LFM3--Audio%20in%20%26%20out-14b8a6"></a>
+  <a href="#qwen36-35b-a3b-experimental"><img alt="Qwen3.6-35B-A3B (experimental)" src="https://img.shields.io/badge/model-Qwen3.6--35B--A3B%20%28experimental%29-6366f1"></a>
   <a href="#server-and-web-chat"><img alt="OpenAI-compatible API: chat and audio" src="https://img.shields.io/badge/API-OpenAI--compatible%20chat%20%26%20audio-6b7280"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-2ea043"></a>
 </p>
