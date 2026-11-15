@@ -4,6 +4,12 @@
 #include <string.h>
 
 #define MAX_CK 64
+/* Qwen's recurrent state is ~63 MB a checkpoint (LFM's a few hundred KB): at most this many
+ * bytes of them in memory, and the first two and last two only in a stored session when they
+ * are over DISK_CK_BYTES (a new conversation reuses the system prompt and the tools, a
+ * continued one the end) */
+#define CK_BYTES (512ull << 20)
+#define DISK_CK_BYTES (256ull << 20)
 #define FILE_EXT ".pithoskv"
 
 typedef struct {
@@ -32,7 +38,7 @@ struct PCache {
     /* active session: what the context holds now */
     int *toks, n, cap;
     CtxSnapshot ck[MAX_CK];
-    int nck;
+    int nck, max_ck;
     int src;                /* stored session this one continues (overwritten on save), -1 = new */
     /* stored sessions */
     Stored *files;
@@ -140,6 +146,9 @@ PCache *pcache_create(Context *c, const char *dir, uint64_t model_id, int max_fi
     pc->max_bytes = max_bytes;
     pc->src = -1;
     pc->next_id = 1;
+    const uint64_t cb = ctx_conv_bytes(c);
+    pc->max_ck = cb && CK_BYTES / cb < MAX_CK ? (int)(CK_BYTES / cb) : MAX_CK;
+    if (pc->max_ck < 4) pc->max_ck = 4;
     if (dir && *dir && dir_create(dir)) {
         snprintf(pc->dir, sizeof(pc->dir), "%s", dir);
         pc->use_disk = 1;
@@ -277,7 +286,7 @@ float *pcache_feed(PCache *pc, const int *toks, int n) {
 
 void pcache_checkpoint(PCache *pc) {
     if (pc->n == 0 || (pc->nck > 0 && pc->ck[pc->nck - 1].pos == pc->n)) return;
-    if (pc->nck == MAX_CK) {
+    if (pc->nck == pc->max_ck) {
         /* drop the checkpoint whose removal leaves the smallest gap (keep the latest one) */
         int vi = 0, vgap = 0;
         for (int i = 0; i < pc->nck - 1; i++) {
@@ -306,26 +315,30 @@ int pcache_save(PCache *pc) {
     memcpy(h.magic, MAGIC, 8);
     h.model_id = pc->model_id;
     h.n = pc->n;
-    h.nck = pc->nck;
     h.conv_bytes = ctx_conv_bytes(pc->c);
+    int sel[MAX_CK], ns = 0;   /* the checkpoints written */
+    const int few = (uint64_t)h.conv_bytes * (uint64_t)pc->nck > DISK_CK_BYTES && pc->nck > 4;
+    for (int k = 0; k < pc->nck; k++)
+        if (!few || k < 2 || k >= pc->nck - 2) sel[ns++] = k;
+    h.nck = ns;
     h.kv_row_bytes = ctx_kv_bytes(pc->c, 1);
     h.seq = ++pc->seq;
     FILE *f = file_open(tmp, "wb");
     if (!f) return 0;
     int ok = fwrite(&h, sizeof(h), 1, f) == 1 && fwrite(pc->toks, sizeof(int), (size_t)pc->n, f) == (size_t)pc->n;
-    for (int k = 0; ok && k < pc->nck; k++) ok = fwrite(&pc->ck[k].pos, sizeof(int), 1, f) == 1;
-    for (int k = 0; ok && k < pc->nck; k++) ok = fwrite(pc->ck[k].conv, 1, h.conv_bytes, f) == h.conv_bytes;
+    for (int k = 0; ok && k < ns; k++) ok = fwrite(&pc->ck[sel[k]].pos, sizeof(int), 1, f) == 1;
+    for (int k = 0; ok && k < ns; k++) ok = fwrite(pc->ck[sel[k]].conv, 1, h.conv_bytes, f) == h.conv_bytes;
     ok = ok && ctx_kv_write(pc->c, pc->n, f);
     ok = (fclose(f) == 0) && ok;
     if (!ok || !file_rename(tmp, path)) { file_remove(tmp); return 0; }
 
     s.n = pc->n;
-    s.nck = pc->nck;
+    s.nck = ns;
     s.seq = h.seq;
     s.toks = (int *)malloc(sizeof(int) * (size_t)s.n);
     memcpy(s.toks, pc->toks, sizeof(int) * (size_t)s.n);
     s.ckpos = (int *)malloc(sizeof(int) * (size_t)s.nck);
-    for (int k = 0; k < s.nck; k++) s.ckpos[k] = pc->ck[k].pos;
+    for (int k = 0; k < s.nck; k++) s.ckpos[k] = pc->ck[sel[k]].pos;
     s.bytes = sizeof(h) + sizeof(int) * (uint64_t)(s.n + s.nck) + h.conv_bytes * s.nck + h.kv_row_bytes * s.n;
     if (pc->src >= 0) {
         stored_free(&pc->files[pc->src]);

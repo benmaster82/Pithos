@@ -840,7 +840,16 @@ static int render_chat_qwen(const Json *messages, const Json *tools, int preserv
         buf_add(&seg, qwen_tools_rules, -1);
         if (has_sys) {
             content_trim(&cb, json_get(first, "content"), &cs, &cn);
-            if (cn) { buf_add(&seg, "\n\n", 2); buf_add(&seg, cs, cn); }
+            if (cn) {
+                /* a bound (a checkpoint) after the tools: a system text that changes (the agent's date
+                 * and folder) does not make them be read again. After the "\n\n": "</IMPORTANT>\n\n" is
+                 * one pre-token of Qwen's tokenizer, and the trimmed text starts a new one, so the
+                 * tokens are those of the whole text */
+                buf_add(&seg, "\n\n", 2);
+                push_segment(out, text, &seg, bounds, &nb, &cap);
+                seg.n = 0;
+                buf_add(&seg, cs, cn);
+            }
         }
         buf_add(&seg, "<|im_end|>\n", -1);
     } else if (has_sys) {
