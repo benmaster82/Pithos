@@ -1,4 +1,4 @@
-/* sampler.h - temperature / top-k / top-p / min-p / repetition penalty sampling. */
+/* sampler.h - temperature / top-k / top-p / min-p / repetition and presence penalty sampling. */
 #ifndef PITHOS_SAMPLER_H
 #define PITHOS_SAMPLER_H
 
@@ -11,6 +11,7 @@ typedef struct {
     float min_p;         /* <= 0: disabled */
     float repeat_penalty;/* 1: disabled */
     int repeat_last_n;
+    float presence_penalty; /* 0: disabled; subtracted from the logit of every token already in the answer */
     uint64_t seed;
 } SamplerParams;
 
@@ -21,12 +22,16 @@ typedef struct {
     int n_vocab;
     int *idx; float *val;
     int ban[8], n_ban;   /* tokens never sampled (sampler_ban) */
+    unsigned char *seen; /* presence penalty: [n_vocab], the tokens accepted since sampler_output */
+    int out;
 } Sampler;
 
 void sampler_init(Sampler *s, const SamplerParams *p, int n_vocab);
 void sampler_free(Sampler *s);
 void sampler_accept(Sampler *s, int token);
 void sampler_reset_history(Sampler *s);
+/* the answer starts: the presence penalty counts the tokens accepted from now on (not the prompt) */
+void sampler_output(Sampler *s);
 int  sampler_sample(Sampler *s, float *logits);
 /* tokens the sampler never picks (up to 8 in all; out-of-range ids are ignored) */
 void sampler_ban(Sampler *s, const int *ids, int n);

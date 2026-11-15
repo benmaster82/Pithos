@@ -17,6 +17,7 @@ typedef struct {
     const char *api_key;        /* require "Authorization: Bearer KEY" on /v1 (NULL = open) */
     int n_predict;              /* default max new tokens (<= 0: until the context is full) */
     SamplerParams sp;           /* default sampling */
+    int sp_auto;                /* temperature and top-p are Qwen3.6's reasoning defaults (none given) */
     const char *info;           /* hardware summary for /props */
     int verbose;
     int open_browser;           /* open the web UI once the server is listening */

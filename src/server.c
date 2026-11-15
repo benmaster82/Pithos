@@ -1197,11 +1197,26 @@ fail:
     return 0;
 }
 
-/* LFM3: "\n<function=name>\n<parameter=k>\nvalue\n</parameter>\n</function>\n" (the text between
- * <tool_call> and </tool_call>) -> one OpenAI tool_calls element appended to `out`. A value that
- * is valid JSON other than a string (number, true, object...) keeps its type; anything else is
- * a string. */
-static int parse_tool_call_xml(const char *s, int n, Buf *out, int *count) {
+/* The JSON-schema type of parameter key of function name among the request's tools, or NULL */
+static const char *param_type(const Json *tools, const char *name, int nl, const char *key, int kl) {
+    for (const Json *t = tools && tools->t == J_ARR ? tools->child : NULL; t; t = t->next) {
+        const Json *f = json_get(t, "function");
+        const char *fn = json_str(json_get(f, "name"), NULL);
+        if (!fn || (int)strlen(fn) != nl || memcmp(fn, name, (size_t)nl)) continue;
+        const Json *props = json_get(json_get(f, "parameters"), "properties");
+        for (const Json *q = props && props->t == J_OBJ ? props->child : NULL; q; q = q->next)
+            if (q->key && (int)strlen(q->key) == kl && !memcmp(q->key, key, (size_t)kl)) return json_str(json_get(q, "type"), NULL);
+        return NULL;
+    }
+    return NULL;
+}
+
+/* LFM3 / Qwen: "\n<function=name>\n<parameter=k>\nvalue\n</parameter>\n</function>\n" (the text
+ * between <tool_call> and </tool_call>) -> one OpenAI tool_calls element appended to `out`. A
+ * parameter the tool declares as a string stays a string ("570", "0042"); otherwise a value that
+ * is valid JSON other than a string (number, true, object...) keeps its type, and anything else
+ * is a string. */
+static int parse_tool_call_xml(const char *s, int n, const Json *tools, Buf *out, int *count) {
     const char *e = s + n, *p = find_in(s, n, "<function=");
     if (!p) return 0;
     p += 10;
@@ -1235,7 +1250,8 @@ static int parse_tool_call_xml(const char *s, int n, Buf *out, int *count) {
         buf_json_str(&args, key, kl);
         buf_add(&args, ":", 1);
         char err[8];
-        Json *j = vl > 0 ? json_parse(v, vl, err, sizeof(err)) : NULL;
+        const char *ty = param_type(tools, name, nl, key, kl);
+        Json *j = vl > 0 && !(ty && !strcmp(ty, "string")) ? json_parse(v, vl, err, sizeof(err)) : NULL;
         if (j && j->t != J_STR) json_write(&args, j);
         else buf_json_str(&args, v, vl);
         json_free(j);
@@ -1320,6 +1336,7 @@ typedef struct {
     int n_prompt, n_reused, n_gen;
     int think_budget, n_think;  /* THINK_FULL / THINK_OFF / tokens; reasoning tokens so far */
     double t_prompt, t_gen;
+    const Json *tools;          /* the request's tools: the types of their parameters (XML calls) */
 } Gen;
 
 static const char *finish_name(int f) {
@@ -1456,7 +1473,7 @@ static int on_token(Gen *g, int tok) {
     if (g->chat && tok == S.t_tc_end && g->state == ST_TOOL) {
         int calls_before = g->calls.n;
         const char *raw = g->toolraw.s ? g->toolraw.s : "";
-        if (!(S.lfm3 || S.qwen ? parse_tool_call_xml(raw, g->toolraw.n, &g->calls, &g->ncalls)
+        if (!(S.lfm3 || S.qwen ? parse_tool_call_xml(raw, g->toolraw.n, g->tools, &g->calls, &g->ncalls)
                      : parse_tool_calls(raw, g->toolraw.n, &g->calls, &g->ncalls))) {
             g->calls.n = calls_before;
             buf_add(&g->content, S.lfm3 || S.qwen ? "<tool_call>" : "<|tool_call_start|>", -1); /* not parseable: keep it visible */
@@ -1537,6 +1554,7 @@ static void generate(Gen *g, float *lg, const Toks *prompt) {
     }
     int from = prompt->n > g->sp.repeat_last_n ? prompt->n - g->sp.repeat_last_n : 0;
     for (int i = from; i < prompt->n; i++) sampler_accept(&smp, prompt->v[i]);
+    sampler_output(&smp);
     double t0 = time_sec();
     int limit = g->max_tokens > 0 ? g->max_tokens : ctx_n_ctx(S.ctx);
     g->finish = FIN_LENGTH;
@@ -1783,6 +1801,7 @@ static int parse_params(Gen *g, const Json *body, char *err, int errlen) {
     if ((v = json_get(body, "min_p")) && v->t == J_NUM) g->sp.min_p = (float)v->num;
     if ((v = json_get(body, "repeat_penalty")) && v->t == J_NUM) g->sp.repeat_penalty = (float)v->num;
     if ((v = json_get(body, "repeat_last_n")) && v->t == J_NUM) g->sp.repeat_last_n = (int)v->num;
+    if ((v = json_get(body, "presence_penalty")) && v->t == J_NUM) g->sp.presence_penalty = (float)v->num;
     if ((v = json_get(body, "seed")) && v->t == J_NUM) g->sp.seed = (uint64_t)v->num;
     if (g->sp.repeat_last_n < 0) g->sp.repeat_last_n = 64;
     g->max_tokens = S.cfg.n_predict;
@@ -1854,6 +1873,14 @@ static void handle_chat(Conn *c, const Json *body) {
     const Json *kw = json_get(body, "chat_template_kwargs");
     int preserve = json_bool(json_get(kw, "preserve_thinking"), 0);
     g.think_budget = request_think(body);
+    g.tools = json_get(body, "tools");
+    if (g.think_budget == THINK_OFF && S.cfg.sp_auto && S.qwen) {
+        /* Qwen3.6's model card without reasoning: temperature 0.7, top-p 0.8 (unless the request sets them) */
+        const Json *v = json_get(body, "temperature");
+        if (!v || v->t != J_NUM) g.sp.temp = 0.7f;
+        v = json_get(body, "top_p");
+        if (!v || v->t != J_NUM) g.sp.top_p = 0.8f;
+    }
     if (g.think_budget == THINK_OFF) {
         g.state = ST_CONTENT;
         g.skip_ws = 1; /* the answer usually starts with a newline after the empty block */

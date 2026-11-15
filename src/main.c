@@ -51,7 +51,10 @@ typedef struct {
     int bench_pp, bench_tg;
     int think_budget;           /* THINK_FULL / THINK_OFF / reasoning tokens (--reasoning) */
     SamplerParams sp;
+    int sp_set;                 /* SP_* bits: the sampling options given on the command line */
 } Args;
+
+enum { SP_TEMP = 1, SP_TOP_K = 2, SP_TOP_P = 4, SP_MIN_P = 8, SP_REPEAT = 16, SP_PRESENCE = 32 };
 
 static int g_color = 1;
 
@@ -237,12 +240,15 @@ static void usage(void) {
         "  -c, --ctx N             context size in tokens (default 8192, max 131072)\n"
         "  -t, --threads N         worker threads (default: physical cores)\n"
         "  -b, --batch N           prompt-processing batch (default 64)\n"
-        "      --temp F            temperature (default 0.1, model card)\n"
-        "      --top-k N           top-k (default 50)\n"
-        "      --top-p F           top-p (default 1.0 = off)\n"
+        "      --temp F            temperature (default 0.1, model card; Qwen3.6: 1.0)\n"
+        "      --top-k N           top-k (default 50; Qwen3.6: 20)\n"
+        "      --top-p F           top-p (default 1.0 = off; Qwen3.6: 0.95)\n"
         "      --min-p F           min-p (default 0 = off)\n"
-        "      --repeat-penalty F  repetition penalty (default 1.05)\n"
+        "      --repeat-penalty F  repetition penalty (default 1.05; Qwen3.6: 1.0 = off)\n"
         "      --repeat-last-n N   penalty window (default 64)\n"
+        "      --presence-penalty F  subtracted from tokens already in the answer (default 0; Qwen3.6: 1.5)\n"
+        "                          Qwen3.6's are its model card's for reasoning; with the reasoning off\n"
+        "                          the server uses temperature 0.7 and top-p 0.8 (its non-thinking ones)\n"
         "      --seed N            RNG seed (default 42)\n"
         "      --reasoning R       how much the model reasons before answering: high (default, no limit),\n"
         "                          medium, low, off, or a number of tokens; server requests can override it\n"
@@ -428,11 +434,12 @@ static int parse_args(int argc, char **argv, Args *a) {
         else if (!strcmp(s, "-c") || !strcmp(s, "--ctx")) { a->n_ctx = atoi(NEXT()); a->ctx_set = 1; }
         else if (!strcmp(s, "-t") || !strcmp(s, "--threads")) a->threads = atoi(NEXT());
         else if (!strcmp(s, "-b") || !strcmp(s, "--batch")) { a->n_batch = atoi(NEXT()); a->batch_set = 1; }
-        else if (!strcmp(s, "--temp")) a->sp.temp = (float)atof(NEXT());
-        else if (!strcmp(s, "--top-k")) a->sp.top_k = atoi(NEXT());
-        else if (!strcmp(s, "--top-p")) a->sp.top_p = (float)atof(NEXT());
-        else if (!strcmp(s, "--min-p")) a->sp.min_p = (float)atof(NEXT());
-        else if (!strcmp(s, "--repeat-penalty")) a->sp.repeat_penalty = (float)atof(NEXT());
+        else if (!strcmp(s, "--temp")) { a->sp.temp = (float)atof(NEXT()); a->sp_set |= SP_TEMP; }
+        else if (!strcmp(s, "--top-k")) { a->sp.top_k = atoi(NEXT()); a->sp_set |= SP_TOP_K; }
+        else if (!strcmp(s, "--top-p")) { a->sp.top_p = (float)atof(NEXT()); a->sp_set |= SP_TOP_P; }
+        else if (!strcmp(s, "--min-p")) { a->sp.min_p = (float)atof(NEXT()); a->sp_set |= SP_MIN_P; }
+        else if (!strcmp(s, "--repeat-penalty")) { a->sp.repeat_penalty = (float)atof(NEXT()); a->sp_set |= SP_REPEAT; }
+        else if (!strcmp(s, "--presence-penalty")) { a->sp.presence_penalty = (float)atof(NEXT()); a->sp_set |= SP_PRESENCE; }
         else if (!strcmp(s, "--repeat-last-n")) a->sp.repeat_last_n = atoi(NEXT());
         else if (!strcmp(s, "--seed")) a->sp.seed = (uint64_t)strtoull(NEXT(), NULL, 10);
         else if (!strcmp(s, "--reasoning")) {
@@ -595,6 +602,7 @@ static char *generate(Engine *e, int in_think, int *last) {
     double t0 = time_sec();
     int n = 0, skip_ws = !in_think, n_think = 0; /* reasoning off: drop the newline after <think></think> */
     int *forced = NULL, nforced = 0, fi = 0; /* the reasoning close, once the budget is spent */
+    sampler_output(&e->smp);
     for (; n < e->a->n_predict; n++) {
         int tok = fi < nforced ? forced[fi++] : sampler_sample(&e->smp, logits);
         if (tok == e->tok_im_end || tok == e->tok_eot || tok == tok_eos(e->tk)) { *last = tok; break; }
@@ -946,6 +954,16 @@ static int real_main(int argc, char **argv) {
     char err[256];
     Model m;
     if (!model_load(&m, a.model, err, sizeof(err))) { fprintf(stderr, "error: %s\n", err); return 1; }
+    if (chat_family(&m) == CHAT_QWEN) {
+        /* Qwen3.6's model card, thinking mode: near-greedy sampling makes it repeat itself while it
+         * reasons. The options given on the command line win. */
+        if (!(a.sp_set & SP_TEMP)) a.sp.temp = 1.0f;
+        if (!(a.sp_set & SP_TOP_K)) a.sp.top_k = 20;
+        if (!(a.sp_set & SP_TOP_P)) a.sp.top_p = 0.95f;
+        if (!(a.sp_set & SP_MIN_P)) a.sp.min_p = 0.0f;
+        if (!(a.sp_set & SP_REPEAT)) a.sp.repeat_penalty = 1.0f;
+        if (!(a.sp_set & SP_PRESENCE)) a.sp.presence_penalty = 1.5f;
+    }
     Tokenizer *tk = tok_load(&m.gguf, err, sizeof(err));
     if (!tk) { fprintf(stderr, "error: %s\n", err); return 1; }
     char moe[64] = "", swa[48] = "", rec[32];
@@ -1134,6 +1152,7 @@ static int real_main(int argc, char **argv) {
         sc.api_key = a.api_key;
         sc.n_predict = a.n_predict;
         sc.sp = a.sp;
+        sc.sp_auto = chat_family(&m) == CHAT_QWEN && !(a.sp_set & (SP_TEMP | SP_TOP_P));
         sc.info = info;
         sc.verbose = a.verbose || a.stats;
         sc.open_browser = a.open_browser;

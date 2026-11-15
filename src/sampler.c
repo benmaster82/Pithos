@@ -1,5 +1,6 @@
 /* sampler.c - see sampler.h. Order follows llama.cpp defaults:
- * penalties -> top-k -> top-p -> min-p -> temperature -> draw. */
+ * penalties -> top-k -> top-p -> min-p -> temperature -> draw. The presence penalty is OpenAI's
+ * (and vLLM's): a fixed amount off every token that is already in the answer. */
 #include "sampler.h"
 #include <math.h>
 #include <stdlib.h>
@@ -24,14 +25,16 @@ void sampler_init(Sampler *s, const SamplerParams *p, int n_vocab) {
     s->hist = (int *)calloc((size_t)s->hist_cap, sizeof(int));
     s->idx = (int *)malloc(sizeof(int) * n_vocab);
     s->val = (float *)malloc(sizeof(float) * n_vocab);
+    if (p->presence_penalty != 0.f) s->seen = (unsigned char *)calloc((size_t)n_vocab, 1);
 }
 
 void sampler_free(Sampler *s) {
-    free(s->hist); free(s->idx); free(s->val);
+    free(s->hist); free(s->idx); free(s->val); free(s->seen);
     memset(s, 0, sizeof(*s));
 }
 
 void sampler_accept(Sampler *s, int token) {
+    if (s->seen && s->out && token >= 0 && token < s->n_vocab) s->seen[token] = 1;
     if (s->hist_n < s->hist_cap) s->hist[s->hist_n++] = token;
     else {
         memmove(s->hist, s->hist + 1, sizeof(int) * (size_t)(s->hist_cap - 1));
@@ -40,6 +43,11 @@ void sampler_accept(Sampler *s, int token) {
 }
 
 void sampler_reset_history(Sampler *s) { s->hist_n = 0; }
+
+void sampler_output(Sampler *s) {
+    s->out = 1;
+    if (s->seen) memset(s->seen, 0, (size_t)s->n_vocab);
+}
 
 /* partial selection: move the k largest (by val) to the front, sorted descending */
 static void top_k_sort(int *idx, float *val, int n, int k) {
@@ -102,6 +110,9 @@ int sampler_sample(Sampler *s, float *logits) {
             logits[t] = logits[t] > 0 ? logits[t] / s->p.repeat_penalty : logits[t] * s->p.repeat_penalty;
         }
     }
+    if (s->seen)
+        for (int t = 0; t < n; t++)
+            if (s->seen[t]) logits[t] -= s->p.presence_penalty;
     if (s->p.temp <= 0) {
         int best = 0;
         for (int i = 1; i < n; i++) if (logits[i] > logits[best]) best = i;
