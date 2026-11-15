@@ -33,7 +33,7 @@ const MODELS = {
   qwen:{id:'qwen3.6-35b',name:'Qwen3.6-35B-A3B',file:'Qwen3.6-35B-A3B-Q4_K_M.gguf',
     url:'https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF/resolve/52f9f9b8052fb9c8b69bba4a95eda0f319ac3d2a/Qwen3.6-35B-A3B-Q4_K_M.gguf',
     hash:'f4ffe03c9139e6a905a5d346f77d9fabdd179367c3280dfd005d1e75ca5ed8c8',
-    download:'20.5 GB',ram:'16',gpu:'13–22 tok/s',cpu:'6–7 tok/s',
+    download:'20.5 GB',ram:'16',gpu:'10–13 tok/s',gpuBench:'benchmark 22',cpu:'5–7 tok/s',cpuBench:'benchmark 7.3',
     disk:'At least 21 GB free for the model',diskDetail:'About 20.5 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
     blurb:'35 billion parameters, about 3 billion active per token, with Gated DeltaNet layers (experimental). The largest: it reasons and calls tools, runs from disk when RAM is short, and is at its best with a GPU.'}
 };
@@ -157,7 +157,8 @@ function renderModel() {
   document.querySelector('#model-card').setAttribute('aria-labelledby',`model-${state.model}`);
   document.querySelector('#model-size').textContent=m.download;
   document.querySelector('#model-ram').textContent=`${m.ram} GB`;
-  document.querySelector('#model-gpu').textContent=m.gpu;
+  const gpu=document.querySelector('#model-gpu');gpu.textContent=m.gpu;
+  if(m.gpuBench){const small=document.createElement('small');small.textContent=m.gpuBench;gpu.append(small);}
   const cpu=document.querySelector('#model-cpu');cpu.textContent=m.cpu;
   if(m.cpuBench){const small=document.createElement('small');small.textContent=m.cpuBench;cpu.append(small);}
   document.querySelector('#model-blurb').textContent=m.blurb;
