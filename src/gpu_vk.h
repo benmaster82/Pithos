@@ -55,6 +55,19 @@ int  vk_dense_forward(Vulkan *v, const float *x, int n, const float *rope_cs, co
  * s [n]. Set it before vk_dense_forward. */
 typedef void (*VkMoeFn)(void *arg, int layer, const float *h, const float *lg, const float *pred, int n, float *y, float *s);
 void vk_dense_set_moe(Vulkan *v, VkMoeFn fn, void *arg);
+/* ---- the most used routed experts in VRAM (a discrete GPU, with the qwen35moe pass): inside fn,
+ * when vk_moe_ready(n) says that n assignments (at most VK_MOE_MAX) can run on the GPU now,
+ * vk_moe_begin starts the resident ones (expert a_expert[i] on token a_tok[i] of fn's rows,
+ * weight a_w[i]); the GPU adds their weighted sum to the residual stream itself, so y leaves
+ * them out. 0: the GPU failed (the pass fails). vk_note_usage / vk_rebalance: the cache policy,
+ * as gpu_note_usage / gpu_rebalance in gpu.h. */
+#define VK_MOE_MAX 256
+int  vk_experts_on(const Vulkan *v);
+int  vk_expert_resident(const Vulkan *v, int layer, int expert);
+int  vk_moe_ready(const Vulkan *v, int n);
+int  vk_moe_begin(Vulkan *v, int layer, const int *a_expert, const int *a_tok, const float *a_w, int n);
+void vk_note_usage(Vulkan *v, int layer, int expert);
+void vk_rebalance(Vulkan *v, int max_uploads);
 /* copy KV rows [r0, r1) / the convolution state (DeltaNet's included) between the host arrays and the GPU copy */
 void vk_dense_kv(Vulkan *v, uint16_t *kc, uint16_t *vc, int r0, int r1, int to_gpu);
 void vk_dense_conv(Vulkan *v, float *conv, int to_gpu);

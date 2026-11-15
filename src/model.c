@@ -442,6 +442,7 @@ struct Context {
     int dx_chunks;              /* prompt chunks too */
     Vulkan *vk;                 /* optional Vulkan GPU for matmuls (instead of dx) */
     int vk_min;                 /* tokens per batch from which matmuls go to vk */
+    int vk_exp;                 /* the Vulkan pass keeps the most used experts in VRAM */
     int vk_dense, vk_chunks;    /* as dx_dense / dx_chunks, on vk */
     int gpu_lost;               /* the whole-pass GPU failed with the KV cache and state on it */
     int n_lost;                 /* how many times that happened (ctx_lost) */
@@ -601,6 +602,7 @@ int ctx_set_vk(Context *c, struct Vulkan *v, char *info, int infolen) {
     c->vk_dense = v && !c->gpu_dense && !c->dx_dense && !(dense && dense[0] == '0') &&
                   vk_dense_init(v, c->m, c->n_ctx, c->n_batch, info, infolen);
     c->vk_chunks = c->vk_dense && !(chunks && chunks[0] == '0');   /* =0: prompts through the matmuls only */
+    c->vk_exp = c->vk_dense && vk_experts_on(v);
     c->kv_gpu_n = 0;
     c->conv_gpu_ok = 0;
     return c->vk_dense;
@@ -1185,6 +1187,7 @@ static void predict_next_experts(Context *c, int layer) {
         c->pred[k] = best;
         /* experts used in the last few dozen tokens are almost surely resident: skip them */
         if (c->gpu && gpu_resident(c->gpu, ln, best)) continue; /* served from VRAM */
+        if (c->vk_exp && vk_expert_resident(c->vk, ln, best)) continue;
         const uint32_t lu = c->last_used[(size_t)ln * E + best];
         if (c->tok_counter - lu > 48 || !lu) prefetch_expert(c, Ln, best);
     }
@@ -1232,6 +1235,7 @@ static void moe_ffn(Context *c, const Layer *L, int layer, int n) {
             w[k] = p[best];
             wsum += p[best];
             if (c->gpu) gpu_note_usage(c->gpu, layer, best);
+            if (c->vk_exp) vk_note_usage(c->vk, layer, best);
             if (layer < 64 && best < 64) c->stats.expert_hits[layer * 64 + best]++;
             c->last_used[(size_t)layer * E + best] = c->tok_counter;
         }
@@ -1242,9 +1246,10 @@ static void moe_ffn(Context *c, const Layer *L, int layer, int n) {
     /* (token, expert) pairs whose expert is cached in VRAM run on the GPU, concurrently
      * with the CPU computing the others */
     int ng = 0;
-    if (c->gpu) {
+    const int vk = !c->gpu && c->vk_exp && n * K <= VK_MOE_MAX && vk_moe_ready(c->vk, n * K);   /* the Vulkan pass's experts in VRAM */
+    if (c->gpu || vk) {
         for (int i = 0; i < n * K; i++) {
-            c->on_gpu[i] = gpu_resident(c->gpu, layer, c->sel[i]);
+            c->on_gpu[i] = vk ? vk_expert_resident(c->vk, layer, c->sel[i]) : gpu_resident(c->gpu, layer, c->sel[i]);
             if (c->on_gpu[i]) {
                 c->ga_e[ng] = c->sel[i];
                 c->ga_t[ng] = i / K;
@@ -1252,7 +1257,13 @@ static void moe_ffn(Context *c, const Layer *L, int layer, int n) {
                 ng++;
             }
         }
-        if (ng) gpu_moe_begin(c->gpu, layer, c->h, n, c->ga_e, c->ga_t, ng);
+        if (ng && vk) {   /* the GPU adds them to the residual stream itself */
+            float gw[VK_MOE_MAX];
+            for (int i = 0; i < n * K; i++)
+                if (c->on_gpu[i]) gw[-1 - c->tok_a[i]] = c->selw[i];
+            vk_moe_begin(c->vk, layer, c->ga_e, c->ga_t, gw, ng);
+        }
+        else if (ng) gpu_moe_begin(c->gpu, layer, c->h, n, c->ga_e, c->ga_t, ng);
         c->stats.gpu_experts += (uint64_t)ng;
     } else {
         memset(c->on_gpu, 0, sizeof(int) * (size_t)n * K);
@@ -1324,7 +1335,7 @@ static void moe_ffn(Context *c, const Layer *L, int layer, int n) {
             for (int i = 0; i < D; i++) o[i] += w * eo[i];
         }
     }
-    if (ng) {
+    if (ng && !vk) {
         double tw = time_sec();
         gpu_moe_end(c->gpu, c->gy);
         c->stats.t_gpu_wait += time_sec() - tw;
@@ -1692,6 +1703,7 @@ float *ctx_forward(Context *c, const int *tokens, int n) {
         forward_chunk(c, tokens + i, nb, i + nb == n, NULL);
         c->stats.t_forward += time_sec() - t0;
         if (c->gpu) gpu_rebalance(c->gpu, nb == 1 ? 2 : 16);
+        if (c->vk_exp) vk_rebalance(c->vk, nb == 1 ? 2 : 16);
         if (lost_state(c)) return NULL;
     }
     return c->logits;

@@ -344,10 +344,10 @@ float reduce_sum128(uint li, float v) {
     return r;
 }
 
-// x = embedding (mode 0), x += out (mode 1) or x += s * out + y (mode 2: out the shared expert,
-// y and s from the CPU in IN); then Q8_K of rmsnorm(x) * norm weight, and the same values as
-// floats at h unless NONE. One group per token.
-// C0: dim, x, out, q   C1: mode, norm weight, eps, h   C2: y (offset in IN), s (offset in IN)
+// x = embedding (mode 0), x += out (mode 1) or x += s * out + y + g (mode 2: out the shared
+// expert, y and s from the CPU in IN, g the experts the GPU computed unless NONE); then Q8_K of
+// rmsnorm(x) * norm weight, and the same values as floats at h unless NONE. One group per token.
+// C0: dim, x, out, q   C1: mode, norm weight, eps, h   C2: y (offset in IN), s (offset in IN), g
 [numthreads(256, 1, 1)]
 void moe_resid(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     const uint D = C0.x, t = gid.y, xo = C0.y + 4 * t * D, oo = C0.z + 4 * t * D, eo = 4 * t * D;
@@ -359,7 +359,8 @@ void moe_resid(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
         float v;
         if (mode == 0) v = asfloat(IN.Load(eo + 4 * i));
         else if (mode == 1) v = ldu(xo + 4 * i) + ldu(oo + 4 * i);
-        else v = ldu(xo + 4 * i) + g * ldu(oo + 4 * i) + asfloat(IN.Load(C2.x + 4 * (t * D + i)));
+        else v = ldu(xo + 4 * i) + g * ldu(oo + 4 * i) + asfloat(IN.Load(C2.x + 4 * (t * D + i))) +
+                 (C2.z != NONE ? ldu(C2.z + 4 * (t * D + i)) : 0);
         stu(xo + 4 * i, v);
         ss += v * v;
     }
@@ -597,5 +598,19 @@ void router(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
         if (lane == 0 && r < C1.y) stu(C0.w + 4 * ((t0 + k) * C1.z + r), gs[li] * (nw != NONE ? gp[k] : 1));
         GroupMemoryBarrierWithGroupSync();
     }
+}
+
+// the routed experts the GPU computed, weighted, per token: out[t] = sum over k of w * row,
+// from a table in IN of K (row, weight) pairs per token (row NONE: none).
+// Groups: 256 values, tokens.  C0: dim, rows (dim floats each), out, K   C1: table
+[numthreads(256, 1, 1)]
+void moe_combine(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint D = C0.x, t = gid.y, i = gid.x * 256 + li, K = C0.w;
+    float acc = 0;
+    for (uint k = 0; k < K; k++) {
+        const uint e = C1.x + 8 * (t * K + k), row = IN.Load(e);
+        if (row != NONE) acc += asfloat(IN.Load(e + 4)) * ldu(C0.y + 4 * (row * D + i));
+    }
+    stu(C0.z + 4 * (t * D + i), acc);
 }
 #endif

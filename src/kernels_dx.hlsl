@@ -50,6 +50,15 @@ cbuffer P : register(b0) {
 [[vk::binding(1, 0)]] RWStructuredBuffer<uint4> X4 : register(u4);
 #endif
 
+#ifdef MV_EXPERTS
+// the routed experts in VRAM (Vulkan): row t of the output is assignment t, whose matrix starts
+// at byte XT[2t] of W and whose input is row XT[2t + 1] of X
+[[vk::binding(9, 0)]] ByteAddressBuffer XT : register(t5);
+#define MV_BASES const uint wbase = XT.Load(8 * t) + r * wrow, xbase = XT.Load(8 * t + 4) * xrow
+#else
+#define MV_BASES const uint wbase = r * wrow, xbase = t * xrow
+#endif
+
 groupshared float4 Ws[32 * 16];     // [k][row / 4]
 groupshared float4 Xs[32 * 16];     // [k][token / 4]
 
@@ -354,7 +363,7 @@ void mv_q4_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     const uint r = gid.x * (MV_GROUP / MV_LANES) + (li >> MV_LOG2), t = gid.y;
     float sum = 0;
     if (r < rows) {
-        const uint wbase = r * wrow, xbase = t * xrow;
+        MV_BASES;
         for (uint p = li & (MV_LANES - 1); p < nb * 4; p += MV_LANES) {
             const uint b = p >> 2, pp = p & 3;
             const uint wb = wbase + b * Q4K_BYTES, xb = xbase + b * Q8_BYTES;
@@ -421,7 +430,7 @@ void mv_q6_K(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     const uint r = gid.x * (MV_GROUP / MV_LANES) + (li >> MV_LOG2), t = gid.y;
     float sum = 0;
     if (r < rows) {
-        const uint wbase = r * wrow, xbase = t * xrow;
+        MV_BASES;
         for (uint p = li & (MV_LANES - 1); p < nb * 4; p += MV_LANES) {
             const uint b = p >> 2, h = (p & 3) >> 1, a = p & 1;
             const uint wb = wbase + b * Q6K_BYTES, xb = xbase + b * Q8_BYTES;
@@ -468,7 +477,7 @@ void mv_q8_0(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     const uint r = gid.x * (MV_GROUP / MV_LANES) + (li >> MV_LOG2), t = gid.y;
     float sum = 0;
     if (r < rows) {
-        const uint wbase = r * wrow, xbase = t * xrow;
+        MV_BASES;
         for (uint p = li & (MV_LANES - 1); p < nb * 4; p += MV_LANES) {
             const uint b = p >> 2, pp = p & 3;
             const uint wq = (wbase + b * Q80_BYTES) / 16, xb = xbase + b * Q8_BYTES, xq = (xb + Q8_QS) / 16 + pp * 4;

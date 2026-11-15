@@ -42,6 +42,15 @@ void vk_dense_kv(Vulkan *v, uint16_t *kc, uint16_t *vc, int r0, int r1, int to_g
 }
 void vk_dense_conv(Vulkan *v, float *conv, int to_gpu) { (void)v; (void)conv; (void)to_gpu; }
 void vk_dense_set_moe(Vulkan *v, VkMoeFn fn, void *arg) { (void)v; (void)fn; (void)arg; }
+int vk_experts_on(const Vulkan *v) { (void)v; return 0; }
+int vk_expert_resident(const Vulkan *v, int layer, int expert) { (void)v; (void)layer; (void)expert; return 0; }
+int vk_moe_ready(const Vulkan *v, int n) { (void)v; (void)n; return 0; }
+int vk_moe_begin(Vulkan *v, int layer, const int *a_expert, const int *a_tok, const float *a_w, int n) {
+    (void)v; (void)layer; (void)a_expert; (void)a_tok; (void)a_w; (void)n;
+    return 0;
+}
+void vk_note_usage(Vulkan *v, int layer, int expert) { (void)v; (void)layer; (void)expert; }
+void vk_rebalance(Vulkan *v, int max_uploads) { (void)v; (void)max_uploads; }
 
 #else
 
@@ -382,7 +391,7 @@ static VkInstance vk_instance(VkApi *vk) {
 
 enum { K_Q4_K, K_Q6_K, K_Q8_0, N_KERNELS };
 enum { T_RESID, T_QUANT, T_SILU, T_CONV, T_PREP, T_ATTN, T_CONV_CHUNK, T_CONV_STATE, T_ATTN_CHUNK,
-       T_MOE_RESID, T_DCONV, T_DREC, T_QPREP, T_QATTN, T_ROUTER, N_TOKEN_KERNELS };   /* kernels_dx_token.hlsl */
+       T_MOE_RESID, T_DCONV, T_DREC, T_QPREP, T_QATTN, T_ROUTER, T_COMBINE, N_TOKEN_KERNELS };   /* kernels_dx_token.hlsl */
 enum { B_U0 = 0, B_U1 = 1, B_U2 = 2, B_T0 = 8, B_T1 = 9, B_CONST = 16 };   /* descriptor bindings */
 
 typedef struct {
@@ -407,6 +416,16 @@ enum { HOST_NONE, HOST_UPLOAD, HOST_READBACK };
 #define SET_CACHE 2048      /* slots of the descriptor set cache (half of them usable) */
 typedef struct { VkBuffer buf[5]; VkDeviceSize off[5]; VkDescriptorSet set; } SetEntry;
 
+/* A command buffer with what one submit of it needs. Lane 0 runs the passes; lane 1 the routed
+ * experts in VRAM, kicked while lane 0 is recorded (the queue keeps the order of the submits). */
+typedef struct {
+    VkCommandPool pool;
+    VkCommandBuffer cb;
+    VkFence fence;
+    VkDescriptorPool dpool;         /* the sets of one submit (reset after it) */
+    int recording, nsets, inflight; /* inflight: kicked, not waited for */
+} Lane;
+
 struct Vulkan {
     VkApi vk;
     VkInstance inst;
@@ -416,18 +435,17 @@ struct Vulkan {
     VkDevice dev;
     VkQueue queue;
     uint32_t family;
-    VkCommandPool pool;
-    VkCommandBuffer cb;
-    VkFence fence;
+    Lane lanes[2], *ln;             /* the command buffers; ln: the one being recorded */
     VkDescriptorSetLayout dsl;
     VkPipelineLayout layout;
-    VkDescriptorPool dpool, cpool;  /* sets of one submit (reset after it) / of the cache */
+    VkDescriptorPool cpool;         /* the sets of the cache */
     SetEntry sets[SET_CACHE];
     int nsets_cached;
     VkPipeline pso[N_KERNELS], pso_mv[N_KERNELS], pso_tok[N_TOKEN_KERNELS];
+    VkPipeline pso_mvx[N_KERNELS];  /* pso_mv for the routed experts in VRAM (MV_EXPERTS) */
     int mv_rows;                    /* rows per group of the pso_mv kernels: 8, or 16 with the Intel build */
-    int recording, nsets, broken, inflight;   /* inflight: a command buffer kicked, not waited for */
-    VBuf consts, dummy;             /* the constants ring (MAX_SETS slots); a stand-in for unused bindings */
+    int broken;
+    VBuf consts, dummy;             /* the constants rings (MAX_SETS slots per lane); a stand-in for unused bindings */
     VMat *mats;                     /* sorted by host address */
     int nmats, n_big, n_split;      /* matrices too large for the GPU / split into parts */
     VBuf up, x, o, rb;              /* upload, activations, results, readback */
@@ -528,16 +546,16 @@ static int vbuf_reserve(Vulkan *v, VBuf *b, VkDeviceSize size, int host) {
 static int wait_gpu(Vulkan *v);
 
 static VkCommandBuffer cmd(Vulkan *v) {
-    if (v->inflight) wait_gpu(v);   /* its buffer and sets are about to be reused */
-    if (!v->recording) {
+    if (v->ln->inflight) wait_gpu(v);   /* its buffer and sets are about to be reused */
+    if (!v->ln->recording) {
         VkCommandBufferBeginInfo bi = {ST_COMMAND_BUFFER_BEGIN_INFO, NULL, CB_ONE_TIME, NULL};
-        v->vk.BeginCommandBuffer(v->cb, &bi);
-        v->recording = 1;
+        v->vk.BeginCommandBuffer(v->ln->cb, &bi);
+        v->ln->recording = 1;
         /* what earlier submits wrote (KV cache, state, copies) is visible to this one */
         VkMemoryBarrier mb = {ST_MEMORY_BARRIER, NULL, AC_MEMORY_WRITE, AC_MEMORY_READ | AC_MEMORY_WRITE};
-        v->vk.CmdPipelineBarrier(v->cb, PS_ALL, PS_ALL, 0, 1, &mb, 0, NULL, 0, NULL);
+        v->vk.CmdPipelineBarrier(v->ln->cb, PS_ALL, PS_ALL, 0, 1, &mb, 0, NULL, 0, NULL);
     }
-    return v->cb;
+    return v->ln->cb;
 }
 
 /* one global memory barrier */
@@ -553,40 +571,40 @@ static void copy(Vulkan *v, const VBuf *dst, VkDeviceSize doff, const VBuf *src,
 
 /* end the command buffer and start it on the GPU; wait_gpu waits for it */
 static int kick(Vulkan *v) {
-    if (!v->recording) return 1;
-    v->recording = 0;
-    if (v->vk.EndCommandBuffer(v->cb) != VK_SUCCESS) {
+    if (!v->ln->recording) return 1;
+    v->ln->recording = 0;
+    if (v->vk.EndCommandBuffer(v->ln->cb) != VK_SUCCESS) {
         fprintf(stderr, "Vulkan: invalid command buffer\n");
         return 0;
     }
-    VkSubmitInfo si = {ST_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &v->cb, 0, NULL};
-    const VkResult r = v->vk.QueueSubmit(v->queue, 1, &si, v->fence);
+    VkSubmitInfo si = {ST_SUBMIT_INFO, NULL, 0, NULL, NULL, 1, &v->ln->cb, 0, NULL};
+    const VkResult r = v->vk.QueueSubmit(v->queue, 1, &si, v->ln->fence);
     if (r != VK_SUCCESS) {
         fprintf(stderr, "Vulkan: the GPU did not complete the work (error %d)\n", (int)r);
         return 0;
     }
-    v->inflight = 1;
+    v->ln->inflight = 1;
     return 1;
 }
 
 /* wait for the kicked command buffer, and get ready for the next one */
 static int wait_gpu(Vulkan *v) {
-    if (!v->inflight) return 1;
-    v->inflight = 0;
+    if (!v->ln->inflight) return 1;
+    v->ln->inflight = 0;
     /* poll for up to 50 ms (PITHOS_VK_SPIN, in ms): waking up from vkWaitForFences can take
      * about a millisecond, 8% of a token on a GTX 1650 */
     const double t0 = time_sec(), spin = getenv("PITHOS_VK_SPIN") ? atof(getenv("PITHOS_VK_SPIN")) * 1e-3 : 50e-3;
     VkResult r;
-    while ((r = v->vk.GetFenceStatus(v->dev, v->fence)) == VK_NOT_READY && time_sec() - t0 < spin) cpu_relax();
-    if (r == VK_NOT_READY) r = v->vk.WaitForFences(v->dev, 1, &v->fence, 1, 60000000000ull);
+    while ((r = v->vk.GetFenceStatus(v->dev, v->ln->fence)) == VK_NOT_READY && time_sec() - t0 < spin) cpu_relax();
+    if (r == VK_NOT_READY) r = v->vk.WaitForFences(v->dev, 1, &v->ln->fence, 1, 60000000000ull);
     if (r != VK_SUCCESS) {
         fprintf(stderr, "Vulkan: the GPU did not complete the work (error %d)\n", (int)r);
         return 0;
     }
-    v->nsets = 0;
-    return v->vk.ResetFences(v->dev, 1, &v->fence) == VK_SUCCESS &&
-           v->vk.ResetCommandPool(v->dev, v->pool, 0) == VK_SUCCESS &&
-           v->vk.ResetDescriptorPool(v->dev, v->dpool, 0) == VK_SUCCESS;
+    v->ln->nsets = 0;
+    return v->vk.ResetFences(v->dev, 1, &v->ln->fence) == VK_SUCCESS &&
+           v->vk.ResetCommandPool(v->dev, v->ln->pool, 0) == VK_SUCCESS &&
+           v->vk.ResetDescriptorPool(v->dev, v->ln->dpool, 0) == VK_SUCCESS;
 }
 
 /* end the command buffer, run it, wait, and get ready for the next one */
@@ -650,15 +668,15 @@ static VkDescriptorSet cached_set(Vulkan *v, const Bind b[5]) {
  * is kept). 0 if a descriptor set could not be had. */
 static int dispatch(Vulkan *v, VkPipeline p, const uint32_t *c, int nc, Bind u0, Bind u1, Bind u2, Bind t0, Bind t1,
                     uint32_t gx, uint32_t gy, int cached) {
-    if (v->nsets == MAX_SETS && !submit(v)) return 0;   /* rare: flush and continue in a new command buffer */
+    if (v->ln->nsets == MAX_SETS && !submit(v)) return 0;   /* rare: flush and continue in a new command buffer */
     const Bind b[5] = {u0, u1, u2, t0, t1};
     VkDescriptorSet set = cached ? cached_set(v, b) : 0;
-    if (!set) set = make_set(v, v->dpool, b);
+    if (!set) set = make_set(v, v->ln->dpool, b);
     if (!set) return 0;
-    const uint32_t coff = (uint32_t)v->nsets * CONST_SLOT;
+    const uint32_t coff = (uint32_t)((v->ln - v->lanes) * MAX_SETS + v->ln->nsets) * CONST_SLOT;
     memset(v->consts.map + coff, 0, CONST_SLOT);
     memcpy(v->consts.map + coff, c, sizeof(uint32_t) * (size_t)nc);
-    v->nsets++;
+    v->ln->nsets++;
     VkCommandBuffer cb = cmd(v);
     v->vk.CmdBindPipeline(cb, BIND_COMPUTE, p);
     v->vk.CmdBindDescriptorSets(cb, BIND_COMPUTE, v->layout, 0, 1, &set, 1, &coff);
@@ -682,12 +700,13 @@ static int create_pipelines(Vulkan *v) {
     if (v->vk.CreatePipelineLayout(v->dev, &pi, NULL, &v->layout) != VK_SUCCESS) return 0;
     VkDescriptorPoolSize ps[2] = {{DESC_STORAGE_BUFFER, 5 * MAX_SETS}, {DESC_UNIFORM_DYNAMIC, MAX_SETS}};
     VkDescriptorPoolCreateInfo dpi = {ST_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, MAX_SETS, 2, ps};
-    if (v->vk.CreateDescriptorPool(v->dev, &dpi, NULL, &v->dpool) != VK_SUCCESS) return 0;
+    for (int i = 0; i < 2; i++)
+        if (v->vk.CreateDescriptorPool(v->dev, &dpi, NULL, &v->lanes[i].dpool) != VK_SUCCESS) return 0;
     VkDescriptorPoolSize cps[2] = {{DESC_STORAGE_BUFFER, 5 * SET_CACHE / 2}, {DESC_UNIFORM_DYNAMIC, SET_CACHE / 2}};
     VkDescriptorPoolCreateInfo cpi = {ST_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, SET_CACHE / 2, 2, cps};
     if (v->vk.CreateDescriptorPool(v->dev, &cpi, NULL, &v->cpool) != VK_SUCCESS) return 0;
 
-    static const struct { const unsigned char *code; size_t size; const char *entry; } k[2 * N_KERNELS + N_TOKEN_KERNELS] = {
+    static const struct { const unsigned char *code; size_t size; const char *entry; } k[3 * N_KERNELS + N_TOKEN_KERNELS] = {
         {g_vk_mm_q4_K, sizeof(g_vk_mm_q4_K), "mm_q4_K"}, {g_vk_mm_q6_K, sizeof(g_vk_mm_q6_K), "mm_q6_K"},
         {g_vk_mm_q8_0, sizeof(g_vk_mm_q8_0), "mm_q8_0"},
         {g_vk_mv_q4_K, sizeof(g_vk_mv_q4_K), "mv_q4_K"}, {g_vk_mv_q6_K, sizeof(g_vk_mv_q6_K), "mv_q6_K"},
@@ -700,6 +719,9 @@ static int create_pipelines(Vulkan *v) {
         {g_vk_moe_resid, sizeof(g_vk_moe_resid), "moe_resid"}, {g_vk_delta_conv, sizeof(g_vk_delta_conv), "delta_conv"},
         {g_vk_delta_rec, sizeof(g_vk_delta_rec), "delta_rec"}, {g_vk_qattn_prep, sizeof(g_vk_qattn_prep), "qattn_prep"},
         {g_vk_qattn, sizeof(g_vk_qattn), "qattn"}, {g_vk_router, sizeof(g_vk_router), "router"},
+        {g_vk_moe_combine, sizeof(g_vk_moe_combine), "moe_combine"},
+        {g_vk_mvx_q4_K, sizeof(g_vk_mvx_q4_K), "mv_q4_K"}, {g_vk_mvx_q6_K, sizeof(g_vk_mvx_q6_K), "mv_q6_K"},
+        {g_vk_mvx_q8_0, sizeof(g_vk_mvx_q8_0), "mv_q8_0"},
     };
     /* Intel: the matmul kernels built for its GPUs (kernels_dx.hlsl); PITHOS_VK_INTEL=0: the common ones */
     static const struct { const unsigned char *code; size_t size; } intel_k[2 * N_KERNELS] = {
@@ -711,7 +733,7 @@ static int create_pipelines(Vulkan *v) {
     const char *env = getenv("PITHOS_VK_INTEL");
     const int intel = v->props.vendorID == 0x8086 && !(env && env[0] == '0');
     v->mv_rows = intel ? 16 : 8;
-    for (int i = 0; i < 2 * N_KERNELS + N_TOKEN_KERNELS; i++) {
+    for (int i = 0; i < 3 * N_KERNELS + N_TOKEN_KERNELS; i++) {
         const int own = intel && i < 2 * N_KERNELS;
         const unsigned char *code = own ? intel_k[i].code : k[i].code;
         const size_t size = own ? intel_k[i].size : k[i].size;
@@ -727,32 +749,39 @@ static int create_pipelines(Vulkan *v) {
                                            k[i].entry, NULL},
                                           v->layout, 0, -1};
         VkPipeline *dst = i < N_KERNELS ? &v->pso[i] : i < 2 * N_KERNELS ? &v->pso_mv[i - N_KERNELS]
-                                                                         : &v->pso_tok[i - 2 * N_KERNELS];
+                        : i < 2 * N_KERNELS + N_TOKEN_KERNELS ? &v->pso_tok[i - 2 * N_KERNELS]
+                                                              : &v->pso_mvx[i - 2 * N_KERNELS - N_TOKEN_KERNELS];
         r = v->vk.CreateComputePipelines(v->dev, 0, 1, &ci, NULL, dst);
         v->vk.DestroyShaderModule(v->dev, mod, NULL);
         if (r != VK_SUCCESS) return 0;
     }
-    return vbuf_create(v, &v->consts, (VkDeviceSize)MAX_SETS * CONST_SLOT, HOST_UPLOAD) &&
+    return vbuf_create(v, &v->consts, (VkDeviceSize)2 * MAX_SETS * CONST_SLOT, HOST_UPLOAD) &&
            vbuf_create(v, &v->dummy, 256, HOST_NONE);
 }
 
-static void add_mat(Vulkan *v, const Mat *w, int *cap) {
-    if (!w->data || w->cols % QK_K) return;
-    int kernel = w->type == GGML_Q4_K ? K_Q4_K : w->type == GGML_Q6_K ? K_Q6_K : w->type == GGML_Q8_0 ? K_Q8_0 : -1;
-    if (kernel < 0) return;
-    if (v->nmats == *cap) {
-        *cap = *cap ? *cap * 2 : 64;
-        v->mats = (VMat *)realloc(v->mats, sizeof(VMat) * (size_t)*cap);
-    }
-    VMat *x = &v->mats[v->nmats++];
+/* x describes w (at host), with no GPU buffers yet; 0 if no kernel takes its type */
+static int vmat_init(VMat *x, const Mat *w, const uint8_t *host) {
+    const int kernel = w->type == GGML_Q4_K ? K_Q4_K : w->type == GGML_Q6_K ? K_Q6_K : w->type == GGML_Q8_0 ? K_Q8_0 : -1;
+    if (!host || kernel < 0 || w->cols % QK_K) return 0;
     memset(x, 0, sizeof(*x));
-    x->host = w->data;
+    x->host = host;
     x->kernel = kernel;
     x->rows = w->rows;
     x->K = w->cols;
     x->row_bytes = w->row_bytes;
     x->gpu_row = kernel == K_Q6_K ? (size_t)(w->cols / QK_K) * Q6K_GPU_BYTES
                : kernel == K_Q8_0 ? (size_t)(w->cols / QK_K) * Q80_GPU_BYTES : w->row_bytes;
+    return 1;
+}
+
+static void add_mat(Vulkan *v, const Mat *w, int *cap) {
+    VMat x;
+    if (!vmat_init(&x, w, w->data)) return;
+    if (v->nmats == *cap) {
+        *cap = *cap ? *cap * 2 : 64;
+        v->mats = (VMat *)realloc(v->mats, sizeof(VMat) * (size_t)*cap);
+    }
+    v->mats[v->nmats++] = x;
 }
 
 static int mat_cmp(const void *a, const void *b) {
@@ -927,10 +956,16 @@ Vulkan *vk_create(const Model *m, int device, char *info, int infolen) {
     }
     v->vk.GetDeviceQueue(v->dev, v->family, 0, &v->queue);
     VkCommandBufferAllocateInfo cai = {ST_COMMAND_BUFFER_ALLOCATE_INFO, NULL, 0, 0, 1};
-    int ok = v->vk.CreateCommandPool(v->dev, &cpi, NULL, &v->pool) == VK_SUCCESS;
-    cai.commandPool = v->pool;
-    ok = ok && v->vk.AllocateCommandBuffers(v->dev, &cai, &v->cb) == VK_SUCCESS &&
-         v->vk.CreateFence(v->dev, &fi, NULL, &v->fence) == VK_SUCCESS && create_pipelines(v);
+    int ok = 1;
+    v->ln = &v->lanes[0];
+    for (int i = 0; i < 2 && ok; i++) {
+        Lane *ln = &v->lanes[i];
+        ok = v->vk.CreateCommandPool(v->dev, &cpi, NULL, &ln->pool) == VK_SUCCESS;
+        cai.commandPool = ln->pool;
+        ok = ok && v->vk.AllocateCommandBuffers(v->dev, &cai, &ln->cb) == VK_SUCCESS &&
+             v->vk.CreateFence(v->dev, &fi, NULL, &ln->fence) == VK_SUCCESS;
+    }
+    ok = ok && create_pipelines(v);
     if (!ok) {
         snprintf(info, (size_t)infolen, "Vulkan setup failed on %s", name);
         vk_destroy(v);
@@ -984,15 +1019,19 @@ void vk_destroy(Vulkan *v) {
         for (int k = 0; k < N_KERNELS; k++) {
             if (v->pso[k]) v->vk.DestroyPipeline(v->dev, v->pso[k], NULL);
             if (v->pso_mv[k]) v->vk.DestroyPipeline(v->dev, v->pso_mv[k], NULL);
+            if (v->pso_mvx[k]) v->vk.DestroyPipeline(v->dev, v->pso_mvx[k], NULL);
         }
         for (int k = 0; k < N_TOKEN_KERNELS; k++)
             if (v->pso_tok[k]) v->vk.DestroyPipeline(v->dev, v->pso_tok[k], NULL);
-        if (v->dpool) v->vk.DestroyDescriptorPool(v->dev, v->dpool, NULL);
         if (v->cpool) v->vk.DestroyDescriptorPool(v->dev, v->cpool, NULL);
         if (v->layout) v->vk.DestroyPipelineLayout(v->dev, v->layout, NULL);
         if (v->dsl) v->vk.DestroyDescriptorSetLayout(v->dev, v->dsl, NULL);
-        if (v->fence) v->vk.DestroyFence(v->dev, v->fence, NULL);
-        if (v->pool) v->vk.DestroyCommandPool(v->dev, v->pool, NULL);   /* frees the command buffer */
+        for (int i = 0; i < 2; i++) {
+            Lane *ln = &v->lanes[i];
+            if (ln->dpool) v->vk.DestroyDescriptorPool(v->dev, ln->dpool, NULL);
+            if (ln->fence) v->vk.DestroyFence(v->dev, ln->fence, NULL);
+            if (ln->pool) v->vk.DestroyCommandPool(v->dev, ln->pool, NULL);   /* frees the command buffer */
+        }
         v->vk.DestroyDevice(v->dev, NULL);
     }
     if (v->inst) v->vk.DestroyInstance(v->inst, NULL);
@@ -1000,19 +1039,24 @@ void vk_destroy(Vulkan *v) {
     free(v);
 }
 
+/* out[t][r] (rows orow floats apart) = rows of matrix x (as laid out at w) . the Q8_K rows of n
+ * tokens, xrow bytes apart */
+static int mm_rows(Vulkan *v, const VMat *x, Bind w, int rows, Bind o, Bind in, int n, int orow, uint32_t xrow, int cached) {
+    const uint32_t c[6] = {(uint32_t)rows, (uint32_t)(x->K / QK_K), (uint32_t)n, (uint32_t)x->gpu_row, xrow, (uint32_t)orow};
+    const Bind none = {NULL, 0};
+    return n < VK_MV_TOKENS
+         ? dispatch(v, v->pso_mv[x->kernel], c, 6, o, in, none, w, none, (uint32_t)((rows + v->mv_rows - 1) / v->mv_rows), (uint32_t)n, cached)
+         : dispatch(v, v->pso[x->kernel], c, 6, o, in, none, w, none, (uint32_t)(rows + 63) / 64, (uint32_t)(n + 63) / 64,
+                    cached);
+}
+
 /* out[t][r] (rows orow floats apart) = matrix x . the Q8_K rows of n tokens, one dispatch per part */
 static int mm_dispatch(Vulkan *v, const VMat *x, Bind o, Bind in, int n, int orow, int cached) {
-    const uint32_t nb = (uint32_t)(x->K / QK_K);
-    const Bind none = {NULL, 0};
     int ok = 1;
     for (int p = 0; p < x->nparts && ok; p++) {
         const int r0 = p * x->part_rows, rows = x->rows - r0 < x->part_rows ? x->rows - r0 : x->part_rows;
-        const uint32_t c[6] = {(uint32_t)rows, nb, (uint32_t)n, (uint32_t)x->gpu_row, nb * Q8_BYTES, (uint32_t)orow};
         const Bind op = {o.b, o.off + (VkDeviceSize)r0 * 4}, w = {&x->part[p], 0};
-        ok = n < VK_MV_TOKENS
-           ? dispatch(v, v->pso_mv[x->kernel], c, 6, op, in, none, w, none, (uint32_t)((rows + v->mv_rows - 1) / v->mv_rows), (uint32_t)n, cached)
-           : dispatch(v, v->pso[x->kernel], c, 6, op, in, none, w, none, (uint32_t)(rows + 63) / 64,
-                      (uint32_t)(n + 63) / 64, cached);
+        ok = mm_rows(v, x, w, rows, op, in, n, orow, (uint32_t)(x->K / QK_K) * Q8_BYTES, cached);
     }
     return ok;
 }
@@ -1123,16 +1167,24 @@ typedef struct VDense {
     int E;
     size_t o_h, o_z, o_al, o_be, o_q2, o_qg, o_kv, o_q, o_g, o_sh, o_rl, o_pl;
     size_t in_rope, in_y, in_s, hb_rl, hb_pl;   /* this pass's offsets in in and hrb */
+    size_t xo_xg, xo_eg, xo_eu, xo_eq, xo_eo, o_ge;   /* the GPU's experts: inputs, gate, up, Q8_K, outputs, sum */
+    size_t in_c;                    /* in: the table of their sum, [n][K] (row, weight) */
+    int ge_on;                      /* o_ge holds the GPU's experts of the last callback, for the next add */
     VBuf hrb;                       /* h, the router logits and the prediction, read back at every layer */
     VkMoeFn moe;
     void *moe_arg;
+    int cur_t0, cur_n, cur_split;   /* the rows of the running moe callback, and whether the pass is split */
+    struct VExp *xp;                /* the experts in VRAM, or NULL */
 } VDense;
+
+static void xp_free(Vulkan *v);
 
 static void dense_free(Vulkan *v) {
     VDense *t = v->dense;
     if (!t) return;
     VBuf *bufs[] = {&t->scratch, &t->kv, &t->cs, &t->sw, &t->in, &t->lrb, &t->hrb};
     for (size_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) vbuf_free(v, bufs[i]);
+    xp_free(v);
     free(t->layers);
     free(t);
     v->dense = NULL;
@@ -1288,6 +1340,11 @@ int vk_dense_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *info,
     return 1;
 }
 
+#define XP_MAX_A 256        /* expert assignments per GPU launch */
+#define XP_PAD 32           /* each buffer's rows of a launch start at a multiple of this */
+#define XP_ROWS (XP_MAX_A + 8 * XP_PAD)   /* the rows of a launch, padding included */
+static int xp_init(Vulkan *v, const Model *m, size_t used, double *mb);
+
 /* Qwen3.5 / 3.6 (qwen35moe): every layer but its routed experts on the GPU. The state buffer is
  * the CPU's conv array (only DeltaNet state there), so vk_dense_conv copies it as it is. */
 static int hybrid_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *info, int infolen) {
@@ -1404,6 +1461,15 @@ static int hybrid_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *
     t->o_fu = carve(&top, B * (size_t)t->Fs * 4);
     t->o_fq = carve(&top, B * (size_t)(t->Fs / QK_K) * Q8_BYTES);
     t->o_rl = carve(&top, B * (size_t)(t->E + 1) * 4);
+    {   /* the GPU's experts: XP_MAX_A assignments */
+        const size_t A = XP_ROWS, F = (size_t)m->ff_exp;
+        t->xo_xg = carve(&top, A * (D / QK_K) * Q8_BYTES);
+        t->xo_eg = carve(&top, A * F * 4);
+        t->xo_eu = carve(&top, A * F * 4);
+        t->xo_eq = carve(&top, A * (F / QK_K) * Q8_BYTES);
+        t->xo_eo = carve(&top, A * (size_t)D * 4);
+        t->o_ge = carve(&top, B * (size_t)D * 4);
+    }
     t->o_pl = carve(&top, (size_t)t->E * 4);
     t->o_logits = carve(&top, (size_t)m->n_vocab * 4);
     t->o_last = carve(&top, (size_t)(D / QK_K) * Q8_BYTES);
@@ -1419,7 +1485,7 @@ static int hybrid_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *
     }
     ok = vbuf_create(v, &t->scratch, top, HOST_NONE) && vbuf_create(v, &t->kv, kv_bytes, HOST_NONE) &&
          vbuf_create(v, &t->cs, t->cs_bytes, HOST_NONE) && vbuf_create(v, &t->sw, len * 4, HOST_NONE) &&
-         vbuf_create(v, &t->in, B * (size_t)(2 * D + hd + 1) * 4, HOST_UPLOAD) &&
+         vbuf_create(v, &t->in, B * (size_t)(2 * D + hd + 1) * 4 + B * (size_t)m->n_expert_used * 8 + 256, HOST_UPLOAD) &&
          vbuf_create(v, &t->lrb, (size_t)(m->n_vocab + D) * 4, HOST_READBACK) &&
          vbuf_create(v, &t->hrb, (B * (D + t->E + 1) + t->E) * 4, HOST_READBACK) && vbuf_reserve(v, &v->up, len * 4, HOST_UPLOAD);
     if (ok) {
@@ -1433,8 +1499,13 @@ static int hybrid_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *
         snprintf(info, (size_t)infolen, "not enough GPU memory for a %d-token context and %d-token batches", n_ctx, t->B);
         return 0;
     }
-    snprintf(info, (size_t)infolen, "every layer on the GPU, the routed experts on the CPU, %.0f MB of KV cache, "
-             "%.0f MB of state, %.0f MB of activations", 2.0 * t->kv_half / 1048576.0, t->cs_bytes / 1048576.0,
+    const size_t used = top + kv_bytes + t->cs_bytes + len * 4;
+    double xmb = 0;
+    const int nx = xp_init(v, m, used, &xmb);
+    char xs[96] = "";
+    if (nx) snprintf(xs, sizeof(xs), "; up to %d of the most used ones in VRAM (%.0f MB)", nx, xmb);
+    snprintf(info, (size_t)infolen, "every layer on the GPU, the routed experts on the CPU%s, %.0f MB of KV cache, "
+             "%.0f MB of state, %.0f MB of activations", xs, 2.0 * t->kv_half / 1048576.0, t->cs_bytes / 1048576.0,
              top / 1048576.0);
     return 1;
 }
@@ -1508,11 +1579,13 @@ static int finish_pass(Vulkan *v, int ok, int n, float *logits, float *x_last) {
 /* x += s * shared + y (mode 2), or x += out (mode 1), or the embeddings (mode 0, t0 = 0); the Q8_K
  * of its norm at o_hq, and the floats at h unless NONE_OFF */
 static int moe_resid(Vulkan *v, uint32_t mode, uint32_t norm, size_t out, uint32_t h, int t0, int n) {
-    const VDense *t = v->dense;
+    VDense *t = v->dense;
     const size_t r = (size_t)t0 * t->D * 4;
     const uint32_t c[16] = {(uint32_t)t->D, (uint32_t)(t->o_x + r), (uint32_t)(out + r),
                             (uint32_t)(t->o_hq + (size_t)t0 * (t->D / QK_K) * Q8_BYTES), mode, norm, fbits(t->m->eps),
-                            h == NONE_OFF ? NONE_OFF : (uint32_t)(h + r), (uint32_t)(t->in_y + r), (uint32_t)(t->in_s + 4 * (size_t)t0)};
+                            h == NONE_OFF ? NONE_OFF : (uint32_t)(h + r), (uint32_t)(t->in_y + r), (uint32_t)(t->in_s + 4 * (size_t)t0),
+                            mode == 2 && t->ge_on ? (uint32_t)(t->o_ge + r) : NONE_OFF};
+    if (mode == 2) t->ge_on = 0;   /* added */
     return tok_run(v, T_MOE_RESID, c, 1, (uint32_t)n);
 }
 
@@ -1609,6 +1682,8 @@ static void hybrid_moe(Vulkan *v, int l, int t0, int n) {
     const size_t D = (size_t)t->D, E1 = (size_t)t->E + 1;
     const float *hb = (const float *)t->hrb.map;
     const int pred = n == 1 && l + 1 < t->m->n_layer;
+    t->cur_t0 = t0;
+    t->cur_n = n;
     t->moe(t->moe_arg, l, hb + (size_t)t0 * D, hb + t->hb_rl / 4 + (size_t)t0 * E1, pred ? hb + t->hb_pl / 4 : NULL, n,
            (float *)(t->in.map + t->in_y) + (size_t)t0 * D, (float *)(t->in.map + t->in_s) + t0);
 }
@@ -1623,6 +1698,8 @@ static int hybrid_forward(Vulkan *v, const float *x, int n, const float *rope_cs
     t->in_rope = 4 * (size_t)n * D;
     t->in_y = t->in_rope + 4 * (size_t)n * hd;
     t->in_s = t->in_y + 4 * (size_t)n * D;
+    t->in_c = (t->in_s + 4 * (size_t)n + 255) & ~(size_t)255;
+    t->ge_on = 0;
     t->hb_rl = 4 * (size_t)n * D;
     t->hb_pl = t->hb_rl + 4 * (size_t)n * (t->E + 1);
     memcpy(t->in.map, x, sizeof(float) * (size_t)n * D);
@@ -1630,10 +1707,12 @@ static int hybrid_forward(Vulkan *v, const float *x, int n, const float *rope_cs
     int ok = moe_resid(v, 0, t->layers[0].attn_norm, t->o_out, NONE_OFF, 0, n);
     /* the first half: a multiple of 16 tokens, so that its rows of every buffer stay bindable */
     const int na = n >= 32 && !getenv("PITHOS_VK_NOSPLIT") ? (n / 2 + 15) & ~15 : n, nb = n - na;
+    t->cur_split = nb > 0;   /* the GPU is busy with the other half: the CPU computes every expert */
     if (!nb) {
         for (int l = 0; l < nl && ok; l++) {
             ok = hybrid_mixer(v, l, 0, n, pos0) && hybrid_shared(v, l, 0, n) && submit(v);
             if (ok) hybrid_moe(v, l, 0, n);
+            ok = ok && !v->broken;   /* the experts on the GPU failed */
         }
     } else {
         ok = ok && hybrid_mixer(v, 0, 0, na, pos0) && hybrid_shared(v, 0, 0, na) && submit(v);
@@ -1647,7 +1726,243 @@ static int hybrid_forward(Vulkan *v, const float *x, int n, const float *rope_cs
         }
     }
     ok = ok && moe_resid(v, 2, t->final_norm, t->o_sh, NONE_OFF, 0, n);
-    return finish_pass(v, ok, n, logits, x_last);
+    ok = finish_pass(v, ok, n, logits, x_last);
+    v->ln = &v->lanes[1];
+    if (!wait_gpu(v)) ok = 0;   /* it ran before the pass's end: only its fence is left */
+    v->ln = &v->lanes[0];
+    return ok;
+}
+
+/* ------------------------------------------------------------------ routed experts in VRAM */
+
+/* Slots of whole experts (gate, up, down in the GPU layout) in buffers of up to 1 GB. The
+ * policy is gpu_opencl.c's in short: every routed use adds 1 to the expert's score, every
+ * vk_rebalance multiplies the scores by XP_DECAY and moves the best scored experts in, into a
+ * free slot or over the lowest scored resident one. Its experts were just used, so their pages
+ * are in RAM: packing them costs no disk read. The copies run at the start of the next pass.
+ * A launch runs on lane 1 while the CPU computes the other experts: three matrix-vector
+ * dispatches per buffer (gate, up, down; MV_EXPERTS reads each assignment's matrix and input
+ * row from a table), one SwiGLU over all of them, then their weighted sum per token into o_ge,
+ * which the next residual add (moe_resid) takes; the CPU never waits for it. */
+#define XP_STAGE 16         /* uploads per vk_rebalance at most */
+#define XP_DECAY 0.99f
+
+typedef struct VExp {
+    int nl, E, n_slots, n_free, per_buf;
+    size_t slot_bytes;
+    VBuf *bufs;
+    VMat *tm;                       /* [layer][gate, up, down]: kernels and row sizes */
+    size_t *toff;                   /* [layer][3]: byte offsets in a slot */
+    int *slot_of, *owner;           /* [layer * E + e] -> slot or -1; [slot] -> layer * E + e or -1 */
+    float *score;                   /* [layer * E + e] */
+    VBuf stage, tab;                /* packed experts on their way up; the launch's tables */
+} VExp;
+
+static void xp_free(Vulkan *v) {
+    VExp *p = v->dense ? v->dense->xp : NULL;
+    if (!p) return;
+    for (int i = 0; p->per_buf && i < (p->n_slots + p->per_buf - 1) / p->per_buf; i++) vbuf_free(v, &p->bufs[i]);
+    vbuf_free(v, &p->stage);
+    vbuf_free(v, &p->tab);
+    free(p->bufs);
+    free(p->tm);
+    free(p->toff);
+    free(p->slot_of);
+    free(p->owner);
+    free(p->score);
+    free(p);
+    v->dense->xp = NULL;
+}
+
+/* the slots that fit in the GPU memory left (used: bytes the pass already holds besides the
+ * weights) less a reserve, or PITHOS_VK_EXPERT_MB (0: none); discrete GPUs only */
+static int xp_init(Vulkan *v, const Model *m, size_t used, double *mb) {
+    VDense *t = v->dense;
+    const char *env = getenv("PITHOS_VK_EXPERT_MB");
+    if (v->props.deviceType != 2 && !env) return 0;
+    VExp *p = (VExp *)calloc(1, sizeof(VExp));
+    t->xp = p;
+    p->nl = m->n_layer;
+    p->E = m->n_expert;
+    p->tm = (VMat *)calloc((size_t)p->nl * 3, sizeof(VMat));
+    p->toff = (size_t *)calloc((size_t)p->nl * 3, sizeof(size_t));
+    int ok = 1;
+    for (int l = 0; l < p->nl && ok; l++) {
+        const Layer *L = &m->layers[l];
+        const Mat *ws[3] = {&L->gate_exps, &L->up_exps, &L->down_exps};
+        size_t o = 0;
+        for (int k = 0; k < 3 && ok; k++) {
+            ok = vmat_init(&p->tm[l * 3 + k], ws[k], ws[k]->data);
+            p->toff[l * 3 + k] = o;
+            o += (p->tm[l * 3 + k].gpu_row * (size_t)ws[k]->rows + 255) & ~(size_t)255;
+        }
+        if (o > p->slot_bytes) p->slot_bytes = o;
+    }
+    size_t weights = 0;
+    for (int i = 0; i < v->nmats; i++)
+        if (v->mats[i].nparts) weights += v->mats[i].gpu_row * (size_t)v->mats[i].rows;
+    const double heap = (double)device_memory(&v->vk, v->pd), have = heap - (double)weights - (double)used - 512.0 * 1048576;
+    const double budget = env ? atof(env) * 1048576.0 : have;
+    int want = ok && budget > 0 ? (int)(budget / (double)p->slot_bytes) : 0;
+    if (want > p->nl * p->E) want = p->nl * p->E;
+    const VkDeviceSize lim = v->props.limits.maxStorageBufferRange < (1u << 30) ? v->props.limits.maxStorageBufferRange : (1u << 30);
+    p->per_buf = (int)(lim / p->slot_bytes);
+    if (p->per_buf < 1 || (want + p->per_buf - 1) / p->per_buf > 8) want = 0;   /* XP_ROWS has room for 8 buffers */
+    p->bufs = (VBuf *)calloc(8, sizeof(VBuf));
+    for (int b = 0; b * p->per_buf < want; b++) {   /* as many buffers as the driver gives */
+        const int k = want - b * p->per_buf < p->per_buf ? want - b * p->per_buf : p->per_buf;
+        if (!vbuf_create(v, &p->bufs[b], (VkDeviceSize)k * p->slot_bytes, HOST_NONE)) break;
+        p->n_slots += k;
+    }
+    ok = p->n_slots > 0 && vbuf_create(v, &p->stage, (VkDeviceSize)XP_STAGE * p->slot_bytes, HOST_UPLOAD) &&
+         vbuf_create(v, &p->tab, (VkDeviceSize)3 * XP_ROWS * 8, HOST_UPLOAD);
+    if (!ok) {
+        xp_free(v);
+        return 0;
+    }
+    const size_t ne = (size_t)p->nl * p->E;
+    p->slot_of = (int *)malloc(sizeof(int) * ne);
+    p->score = (float *)calloc(ne, sizeof(float));
+    p->owner = (int *)malloc(sizeof(int) * (size_t)p->n_slots);
+    for (size_t i = 0; i < ne; i++) p->slot_of[i] = -1;
+    for (int i = 0; i < p->n_slots; i++) p->owner[i] = -1;
+    p->n_free = p->n_slots;
+    *mb = (double)p->n_slots * p->slot_bytes / 1048576.0;
+    return p->n_slots;
+}
+
+static VExp *xp_of(const Vulkan *v) {
+    return v && v->dense && !v->broken ? v->dense->xp : NULL;
+}
+
+int vk_experts_on(const Vulkan *v) {
+    return xp_of(v) != NULL;
+}
+
+int vk_expert_resident(const Vulkan *v, int layer, int expert) {
+    const VExp *p = xp_of(v);
+    return p && layer < p->nl && p->slot_of[(size_t)layer * p->E + expert] >= 0;
+}
+
+int vk_moe_ready(const Vulkan *v, int n) {
+    return xp_of(v) && !v->dense->cur_split && n <= XP_MAX_A && !v->lanes[0].recording && !v->lanes[0].inflight;
+}
+
+void vk_note_usage(Vulkan *v, int layer, int expert) {
+    VExp *p = xp_of(v);
+    if (p && layer < p->nl) p->score[(size_t)layer * p->E + expert] += 1.f;
+}
+
+/* matrix x of the experts in buffer w for n assignments: their matrices and input rows in the
+ * table at tab (pairs of uints), outputs orow floats apart at o */
+static int mvx(Vulkan *v, const VMat *x, Bind w, Bind tab, int rows, Bind o, Bind in, int n, int orow, uint32_t xrow) {
+    const uint32_t c[6] = {(uint32_t)rows, (uint32_t)(x->K / QK_K), (uint32_t)n, (uint32_t)x->gpu_row, xrow, (uint32_t)orow};
+    const Bind none = {NULL, 0};
+    return dispatch(v, v->pso_mvx[x->kernel], c, 6, o, in, none, w, tab, (uint32_t)(rows + 7) / 8, (uint32_t)n, 0);
+}
+
+int vk_moe_begin(Vulkan *v, int layer, const int *a_expert, const int *a_tok, const float *a_w, int n) {
+    VExp *p = xp_of(v);
+    if (!p || n < 1 || n > XP_MAX_A) return 0;
+    VDense *t = v->dense;
+    v->ln = &v->lanes[1];   /* lane 0 stays free for the next layer, recorded while this runs */
+    if (!wait_gpu(v)) {
+        v->ln = &v->lanes[0];
+        v->broken = 1;
+        return 0;
+    }
+    const int D = t->D, F = p->tm[layer * 3].rows, nbufs = (p->n_slots + p->per_buf - 1) / p->per_buf;
+    const size_t nbq = (size_t)(D / QK_K) * Q8_BYTES, nbf = (size_t)(F / QK_K) * Q8_BYTES;
+    /* rows by buffer: those of buffer b from rb[b], a multiple of XP_PAD */
+    int cnt[8] = {0}, rb[9], fill[8] = {0};
+    for (int i = 0; i < n; i++) cnt[p->slot_of[(size_t)layer * p->E + a_expert[i]] / p->per_buf]++;
+    rb[0] = 0;
+    for (int b = 0; b < nbufs; b++) rb[b + 1] = (rb[b] + cnt[b] + XP_PAD - 1) / XP_PAD * XP_PAD;
+    uint32_t *tab = (uint32_t *)p->tab.map;   /* [gate, up, down][XP_ROWS][matrix offset, input row] */
+    const int K = t->m->n_expert_used;
+    uint32_t *ct = (uint32_t *)(t->in.map + t->in_c);   /* the sum: [token][K] (row, weight) */
+    int nk[XP_MAX_A] = {0};
+    for (int i = 0; i < t->cur_n * K; i++) ct[2 * i] = NONE_OFF;
+    for (int i = 0; i < n; i++) {
+        const int slot = p->slot_of[(size_t)layer * p->E + a_expert[i]], b = slot / p->per_buf, r = rb[b] + fill[b]++;
+        const uint32_t base = (uint32_t)((size_t)(slot % p->per_buf) * p->slot_bytes);
+        const int tk = a_tok[i];
+        ct[2 * (tk * K + nk[tk])] = (uint32_t)r;
+        memcpy(&ct[2 * (tk * K + nk[tk]++) + 1], &a_w[i], 4);
+        for (int k = 0; k < 3; k++) {
+            tab[2 * (k * XP_ROWS + r)] = base + (uint32_t)p->toff[layer * 3 + k];
+            tab[2 * (k * XP_ROWS + r) + 1] = k < 2 ? (uint32_t)(t->cur_t0 + a_tok[i]) : (uint32_t)r;
+        }
+    }
+    int ok = 1;
+    for (int b = 0; b < nbufs && ok; b++) {
+        if (!cnt[b]) continue;
+        const Bind w = {&p->bufs[b], 0}, in = {&t->scratch, t->o_hq};
+        const Bind tg = {&p->tab, (VkDeviceSize)rb[b] * 8}, tu = {&p->tab, (VkDeviceSize)(XP_ROWS + rb[b]) * 8};
+        const Bind og = {&t->scratch, t->xo_eg + (size_t)rb[b] * F * 4}, ou = {&t->scratch, t->xo_eu + (size_t)rb[b] * F * 4};
+        ok = mvx(v, &p->tm[layer * 3], w, tg, F, og, in, cnt[b], F, (uint32_t)nbq) &&
+             mvx(v, &p->tm[layer * 3 + 1], w, tu, F, ou, in, cnt[b], F, (uint32_t)nbq);
+    }
+    compute_barrier(v);
+    const uint32_t cs[16] = {(uint32_t)t->xo_eg, (uint32_t)t->xo_eu, (uint32_t)t->xo_eq, (uint32_t)F};
+    ok = ok && tok_run(v, T_SILU, cs, (uint32_t)(F / QK_K), (uint32_t)rb[nbufs]);
+    for (int b = 0; b < nbufs && ok; b++) {
+        if (!cnt[b]) continue;
+        const Bind w = {&p->bufs[b], 0}, in = {&t->scratch, t->xo_eq}, td = {&p->tab, (VkDeviceSize)(2 * XP_ROWS + rb[b]) * 8};
+        const Bind o = {&t->scratch, t->xo_eo + (size_t)rb[b] * D * 4};
+        ok = mvx(v, &p->tm[layer * 3 + 2], w, td, D, o, in, cnt[b], D, (uint32_t)nbf);
+    }
+    compute_barrier(v);
+    const uint32_t cc[16] = {(uint32_t)D, (uint32_t)t->xo_eo, (uint32_t)(t->o_ge + (size_t)t->cur_t0 * D * 4), (uint32_t)K,
+                             (uint32_t)t->in_c};
+    ok = ok && tok_run(v, T_COMBINE, cc, (uint32_t)(D / 256), (uint32_t)t->cur_n);
+    ok = kick(v) && ok;
+    v->ln = &v->lanes[0];
+    if (!ok) {
+        v->broken = 1;
+        return 0;
+    }
+    t->ge_on = 1;
+    return 1;
+}
+
+void vk_rebalance(Vulkan *v, int max_uploads) {
+    VExp *p = xp_of(v);
+    if (!p || v->lanes[0].recording || v->lanes[0].inflight) return;   /* the last uploads have not run yet */
+    const int ne = p->nl * p->E;
+    for (int i = 0; i < ne; i++) p->score[i] *= XP_DECAY;
+    int up = p->n_free ? XP_STAGE : max_uploads;
+    if (up > XP_STAGE) up = XP_STAGE;
+    for (int u = 0; u < up; u++) {
+        int best = -1;   /* the best scored expert not in VRAM */
+        for (int i = 0; i < ne; i++)
+            if (p->slot_of[i] < 0 && p->score[i] > 0.5f && (best < 0 || p->score[i] > p->score[best])) best = i;
+        if (best < 0) break;
+        int slot = -1;
+        if (p->n_free) {
+            for (slot = 0; p->owner[slot] >= 0; slot++) {}
+            p->n_free--;
+        } else {
+            for (int s2 = 0; s2 < p->n_slots; s2++)
+                if (slot < 0 || p->score[p->owner[s2]] < p->score[p->owner[slot]]) slot = s2;
+            if (p->score[best] < 1.5f * p->score[p->owner[slot]] + 0.5f) break;   /* not worth a swap */
+            p->slot_of[p->owner[slot]] = -1;
+        }
+        const int l = best / p->E, e = best % p->E;
+        const Layer *L = &v->dense->m->layers[l];
+        const Mat *ws[3] = {&L->gate_exps, &L->up_exps, &L->down_exps};
+        uint8_t *dst = p->stage.map + (size_t)u * p->slot_bytes;
+        for (int k = 0; k < 3; k++) {
+            VMat x = p->tm[l * 3 + k];
+            x.host = ws[k]->data + (size_t)e * ws[k]->expert_stride;
+            pack_rows(&x, 0, x.rows, dst + p->toff[l * 3 + k]);
+        }
+        copy(v, &p->bufs[slot / p->per_buf], (VkDeviceSize)(slot % p->per_buf) * p->slot_bytes, &p->stage,
+             (VkDeviceSize)u * p->slot_bytes, p->slot_bytes);
+        p->owner[slot] = best;
+        p->slot_of[best] = slot;
+    }
+    if (v->ln->recording) barrier(v, PS_TRANSFER, AC_TRANSFER_WRITE, PS_COMPUTE, AC_SHADER_READ);
 }
 
 void vk_dense_set_moe(Vulkan *v, VkMoeFn fn, void *arg) {
