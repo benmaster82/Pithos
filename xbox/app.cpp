@@ -61,6 +61,45 @@ int voice_state();
 std::string voice_status();
 float voice_level();
 float voice_play_level();
+void voice_hands_free(bool on);
+void voice_hands_free_playing(bool on);
+bool voice_hands_free_speech();
+std::vector<unsigned char> voice_hands_free_take(double *secs);
+
+// Who the model is in the voice mode, and how it speaks: its words are heard, not read.
+static const char k_talk_prompt[] =
+    "You are Pithos, a voice assistant that lives on this Xbox. You run entirely on the console, offline: "
+    "nothing the user says leaves the room.\n"
+    "\n"
+    "# Who you are\n"
+    "- Your name is Pithos, like the jar of the Greek myth: what is said stays inside.\n"
+    "- You are warm, calm and quick, with a light touch of wit. You are never servile and never preachy.\n"
+    "- You are a language model (LFM3-Audio by Liquid AI) run by the Pithos engine. Say so only if asked.\n"
+    "\n"
+    "# How you speak\n"
+    "- The user hears you, so be brief: one or two short sentences, about thirty words, never more than fifty, "
+    "even for a big topic.\n"
+    "- Give the essential answer first. If the topic is big, give the gist in one sentence and offer to go on.\n"
+    "- Speak plainly: no lists, headings, markdown, code, emoji or links. Say numbers and symbols the way "
+    "a person would say them.\n"
+    "- Always answer in the language of the user's last message: Italian if they speak Italian, English if "
+    "they speak English, and so on.\n"
+    "- If you did not understand, or the request could mean several things, ask one short question.\n"
+    "- If you do not know something, say so in a few words. Never make up facts, names or numbers.\n"
+    "\n"
+    "# What you can do\n"
+    "- Talk, explain, advise, suggest, tell short stories, play word games and quizzes.\n"
+    "- You have no internet, no tools and no access to the console's apps or settings: if asked for those, "
+    "say so briefly and offer what you can do instead.\n"
+    "\n"
+    "# Examples\n"
+    "User: Spiegami la fotosintesi.\n"
+    "Pithos: In breve, le piante usano la luce del sole per trasformare acqua e anidride carbonica in zuccheri, "
+    "liberando ossigeno. Vuoi che vada piu a fondo?\n"
+    "User: Metti un po' di musica.\n"
+    "Pithos: Non posso usare le app della console, posso solo parlare con te. Se vuoi ti consiglio qualche album.\n"
+    "User: How far is the Moon?\n"
+    "Pithos: About three hundred and eighty thousand kilometres, roughly a light second and a quarter away.";
 void voice_begin();
 std::vector<unsigned char> voice_end(double *secs);
 bool voice_play_ready();
@@ -392,7 +431,7 @@ static std::string error_message(const std::string &body) {
 }
 
 // An answer as the voice should read it: markdown marks, code and links left out, one line.
-static std::string speakable(const std::wstring &w) {
+static std::string speakable(const std::wstring &w, size_t cap = 1400) {
     std::wstring o;
     bool code = false;
     for (size_t i = 0; i < w.size(); i++) {
@@ -410,8 +449,7 @@ static std::string speakable(const std::wstring &w) {
     for (wchar_t c : o)
         if (c != L' ' || (!t.empty() && t.back() != L' ')) t += c;
     while (!t.empty() && t.back() == L' ') t.pop_back();
-    // at most about a minute and a half of speech: cut at a sentence end
-    const size_t cap = 1400;
+    // at most cap characters (1400: about a minute and a half of speech), cut at a sentence end
     if (t.size() > cap) {
         size_t e = t.find_last_of(L".!?", cap);
         t.resize(e != std::wstring::npos && e > cap / 2 ? e + 1 : cap);
@@ -459,6 +497,7 @@ struct App : ApplicationT<App> {
     Button m_talk_button{ nullptr };
     DispatcherTimer m_talk_timer{ nullptr };
     bool m_talk_on = false;
+    bool m_hands_free = false;   // in the voice mode: listening without the trigger (X)
     Windows::Gaming::Input::GamepadButtons m_prev_buttons{};
     // spoken answers: Y reads the last answer (or stops), "Read answers" reads each one
     Button m_read_button{ nullptr };
@@ -838,6 +877,9 @@ struct App : ApplicationT<App> {
             m_talk_timer.Interval(std::chrono::milliseconds(33));
             m_talk_timer.Tick([this](auto &&, auto &&) { talk_tick(); });
         }
+        auto hf = Windows::Storage::ApplicationData::Current().LocalSettings().Values().TryLookup(L"hands_free");
+        m_hands_free = hf && unbox_value_or<bool>(hf, false);
+        voice_hands_free(m_hands_free && voice_state() == 1);
         talk_tick();
         m_talk_timer.Start();
     }
@@ -845,6 +887,7 @@ struct App : ApplicationT<App> {
     void leave_talk() {
         if (!m_talk_on) return;
         m_talk_on = false;
+        voice_hands_free(false);
         m_talk_timer.Stop();
         m_talk_ui.Visibility(Visibility::Collapsed);
         m_main.Visibility(Visibility::Visible);
@@ -871,7 +914,8 @@ struct App : ApplicationT<App> {
     void talk_tick() {
         TalkInfo in;
         const int ps = voice_play_state();
-        if (m_listening) in.state = TALK_LISTENING;
+        in.hands_free = m_hands_free;
+        if (m_listening || (m_hands_free && voice_hands_free_speech())) in.state = TALK_LISTENING;
         else if (m_transcribing) in.state = TALK_TRANSCRIBING;
         else if (ps == 2) in.state = TALK_SPEAKING;
         else if (m_busy) in.state = m_answer.find_first_not_of(L" \r\n") == std::wstring::npos ? TALK_THINKING : TALK_WRITING;
@@ -960,9 +1004,23 @@ struct App : ApplicationT<App> {
                 Windows::Storage::ApplicationData::Current().LocalSettings().Values().Insert(L"reasoning", box_value(m_effort));
                 show_effort();
             }
+            if (pressed(GamepadButtons::X) && vs == 1) {   // X: hands-free on and off
+                m_hands_free = !m_hands_free;
+                Windows::Storage::ApplicationData::Current().LocalSettings().Values().Insert(L"hands_free", box_value(m_hands_free));
+                voice_hands_free(m_hands_free);
+                note(m_hands_free ? L"Hands-free: just speak" : L"Hands-free off: hold RT to talk");
+            }
         }
         m_prev_buttons = buttons;
         const bool talking = m_speaking || voice_play_state() != 0;
+        if (m_talk_on && m_hands_free) {
+            voice_hands_free_playing(talking);
+            if (talking && voice_hands_free_speech()) stop_speaking();   // spoken over: it stops and listens
+            double secs = 0;
+            std::vector<unsigned char> wav = voice_hands_free_take(&secs);
+            // an utterance while the model writes its answer is dropped: one turn at a time
+            if (!wav.empty() && !m_busy && !m_transcribing && !m_listening && m_shown == RUNNING) transcribe(std::move(wav));
+        }
         if (y && !m_prev_y && m_can_speak) {   // Y: read the last answer aloud, or stop reading
             if (talking) stop_speaking();
             else if (!m_busy) speak(last_answer());
@@ -1092,11 +1150,13 @@ struct App : ApplicationT<App> {
         scroll_chat();
 
         Buf b = {};
-        buf_printf(&b, "{\"stream\":true,\"reasoning_effort\":\"%s\",\"messages\":[", k_efforts[m_effort].code);
-        if (m_talk_on)   // the voice mode: answers to be heard, not read
-            buf_add(&b, "{\"role\":\"system\",\"content\":\"You are Pithos, a voice assistant on an Xbox. The user speaks "
-                        "to you and hears your answer: reply briefly, in one to three plain spoken sentences, without "
-                        "lists, markdown or emoji, in the language the user speaks.\"},", -1);
+        buf_printf(&b, "{\"stream\":true,\"reasoning_effort\":\"%s\",", k_efforts[m_effort].code);
+        if (m_talk_on) {   // the voice mode: answers to be heard, not read, and short in any case
+            if (m_effort == 0) buf_add(&b, "\"max_tokens\":160,", -1);   // with reasoning, it would count that too
+            buf_add(&b, "\"messages\":[{\"role\":\"system\",\"content\":", -1);
+            buf_json_str(&b, k_talk_prompt, -1);
+            buf_add(&b, "},", 2);
+        } else buf_add(&b, "\"messages\":[", -1);
         for (size_t i = 0; i < m_history.size(); i++) {
             buf_printf(&b, "%s{\"role\":\"%s\",\"content\":", i ? "," : "", m_history[i].first.c_str());
             buf_json_str(&b, m_history[i].second.data(), (int)m_history[i].second.size());
@@ -1141,7 +1201,8 @@ struct App : ApplicationT<App> {
         // a turn without an answer is dropped, so the history keeps alternating
         if (answer.empty()) m_history.pop_back();
         else m_history.emplace_back("assistant", utf8(answer));
-        if ((m_read_auto || m_talk_on) && !answer.empty() && err.empty() && !m_stop) speak(speakable(answer));
+        if ((m_read_auto || m_talk_on) && !answer.empty() && err.empty() && !m_stop)
+            speak(speakable(answer, m_talk_on ? 350 : 1400));   // in the voice mode a long answer is cut at a sentence end
         m_busy = false;
         m_send.Content(box_value(L"Send"));
         m_new.IsEnabled(true);

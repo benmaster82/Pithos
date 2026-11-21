@@ -396,9 +396,10 @@ void TalkView::update(const TalkInfo &in) {
     m_time += dt;
 
     const uint32_t accent = state_color(in.state);
-    if (in.state != m_state || m_status.Text().empty()) {
+    const std::wstring status = in.state == TALK_READY && in.hands_free ? L"\x25c9  HANDS-FREE" : state_name(in.state);
+    if (status != std::wstring(m_status.Text())) m_status.Text(status);
+    if (in.state != m_state) {
         m_state = in.state;
-        m_status.Text(state_name(in.state));
         m_status.Foreground(solid(accent));
         m_pulse_brush.Color(col(accent));
         m_ring.Stroke(solid(accent, 0x90));
@@ -477,7 +478,8 @@ void TalkView::update(const TalkInfo &in) {
     std::wstring info = L"Voice  " + in.voice + L"     Reasoning  " + in.reasoning;
     if (!in.note.empty()) info = in.note;
     if (std::wstring(m_info.Text()) != info) m_info.Text(info);
-    const wchar_t *hint = in.can_listen ? L"RT  hold to talk     Y  repeat     LB RB  voice     \x2191\x2193  reasoning     B  back"
-                                        : L"Y  repeat     LB RB  voice     \x2191\x2193  reasoning     B  back";
+    const wchar_t *hint = !in.can_listen ? L"Y  repeat     LB RB  voice     \x2191\x2193  reasoning     B  back"
+                        : in.hands_free ? L"just speak     X  hands-free off     Y  repeat     LB RB  voice     \x2191\x2193  reasoning     B  back"
+                                        : L"RT  hold to talk     X  hands-free     Y  repeat     LB RB  voice     \x2191\x2193  reasoning     B  back";
     if (std::wstring(m_hint.Text()) != hint) m_hint.Text(hint);
 }

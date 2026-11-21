@@ -199,6 +199,80 @@ double voice_play_buffered() {
     return g_prate ? (g_queue.size() - g_qpos) / (double)g_prate : 0;
 }
 
+/* ------------------------------------------------------------------ hands-free */
+
+// Without the trigger: a quantum is speech when it is louder than the room (a floor that follows
+// the quietest level quickly downwards and slowly upwards) by 14 dB, and than -55 dBFS; 10 dB more
+// while the console speaks, in case the headset hears the TV. 120 ms of speech start an utterance
+// (with the 400 ms before it, so that its first syllable is there), 800 ms of quiet end it; it
+// is kept if it holds at least 400 ms of speech, and ends anyway after 25 s.
+static std::atomic<bool> g_hf{ false }, g_hf_speech{ false }, g_hf_playing{ false };
+static double g_floor = -60, g_run, g_quiet, g_voiced;
+static std::vector<float> g_pre, g_utt;   // the last 400 ms; the utterance
+static std::vector<unsigned char> g_ready;
+static double g_ready_secs;
+static std::vector<unsigned char> make_wav(const float *x, size_t frames, int stride, int pick);
+
+static void hands_free(const float *x, UINT32 frames, int ch, float db) {
+    const double q = frames / (double)g_rate;   // seconds in this quantum
+    if (db < g_floor) g_floor = db;
+    else g_floor += (db - g_floor) * q / 5;   // up over about 5 s
+    const double thr = fmax(g_floor + 14, -55) + (g_hf_playing ? 10 : 0);
+    const bool loud = db > thr;
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_hf_speech) {
+        for (UINT32 i = 0; i < frames; i++) g_pre.push_back(x[i * g_ch + ch]);
+        const size_t keep = (size_t)(0.4 * g_rate);
+        if (g_pre.size() > keep) g_pre.erase(g_pre.begin(), g_pre.end() - (ptrdiff_t)keep);
+        g_run = loud ? g_run + q : 0;
+        if (g_run >= 0.12) {
+            g_hf_speech = true;
+            g_utt = g_pre;
+            g_quiet = 0;
+            g_voiced = g_run;
+        }
+        return;
+    }
+    for (UINT32 i = 0; i < frames; i++) g_utt.push_back(x[i * g_ch + ch]);
+    if (loud) { g_quiet = 0; g_voiced += q; }
+    else g_quiet += q;
+    if (g_quiet >= 0.8 || g_utt.size() >= (size_t)(25 * g_rate)) {
+        g_hf_speech = false;
+        g_run = 0;
+        g_pre.clear();
+        if (g_voiced >= 0.4) {
+            g_ready = make_wav(g_utt.data(), g_utt.size(), 1, 0);
+            g_ready_secs = g_utt.size() / (double)g_rate;
+        }
+        g_utt.clear();
+    }
+}
+
+void voice_hands_free(bool on) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_hf = on;
+    g_hf_speech = false;
+    g_run = 0;
+    g_pre.clear();
+    g_utt.clear();
+    g_ready.clear();
+}
+
+// the console is speaking: a louder threshold
+void voice_hands_free_playing(bool on) { g_hf_playing = on; }
+
+// someone is speaking now
+bool voice_hands_free_speech() { return g_hf_speech; }
+
+// the last utterance as a WAV, once (empty: none since the last call)
+std::vector<unsigned char> voice_hands_free_take(double *secs) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    std::vector<unsigned char> w;
+    w.swap(g_ready);
+    *secs = w.empty() ? 0 : g_ready_secs;
+    return w;
+}
+
 /* ------------------------------------------------------------------ capture */
 
 static void capture_init();
@@ -256,16 +330,18 @@ static void capture_init() {
             const UINT32 n = buf.Length() / sizeof(float);
             if (!n || !g_ch) return;
             double best = 0;
+            int loud = 0;
             for (int c = 0; c < g_ch; c++) {
                 double s = 0;
                 for (UINT32 i = c; i < n; i += g_ch) s += (double)x[i] * x[i];
-                best = fmax(best, s / (n / g_ch));
+                if (s / (n / g_ch) > best) { best = s / (n / g_ch); loud = c; }
             }
             g_level = (float)(10 * log10(best + 1e-12));
             if (g_rec) {
                 std::lock_guard<std::mutex> lock(g_mu);
                 g_pcm.insert(g_pcm.end(), x, x + n);
             }
+            if (g_hf) hands_free(x, n / g_ch, loud, g_level);
         });
         g_graph.Start();
         char m[160];
@@ -294,6 +370,28 @@ void voice_begin() {
     g_rec = true;
 }
 
+// A mono 16-bit WAV of channel pick of x (frames of stride floats). The headset records quietly,
+// and the engine takes a clip under -44 dBFS for silence: the peak is brought to -3 dBFS (at most
+// +30 dB, so that a silent take stays silent).
+static std::vector<unsigned char> make_wav(const float *x, size_t frames, int stride, int pick) {
+    std::vector<unsigned char> w(44 + frames * 2);
+    auto u32 = [&](size_t at, uint32_t v) { memcpy(&w[at], &v, 4); };
+    auto u16 = [&](size_t at, uint16_t v) { memcpy(&w[at], &v, 2); };
+    memcpy(&w[0], "RIFF", 4); u32(4, (uint32_t)(36 + frames * 2)); memcpy(&w[8], "WAVEfmt ", 8);
+    u32(16, 16); u16(20, 1); u16(22, 1); u32(24, g_rate); u32(28, g_rate * 2); u16(32, 2); u16(34, 16);
+    memcpy(&w[36], "data", 4); u32(40, (uint32_t)(frames * 2));
+    float peak = 0;
+    for (size_t i = 0; i < frames; i++) peak = fmaxf(peak, fabsf(x[i * stride + pick]));
+    const float gain = peak > 0 ? fminf(0.708f / peak, 31.6f) : 1;
+    for (size_t i = 0; i < frames; i++) {
+        float a = x[i * stride + pick] * gain;
+        a = a > 1 ? 1 : a < -1 ? -1 : a;
+        int16_t q = (int16_t)lrintf(a * 32767);
+        memcpy(&w[44 + i * 2], &q, 2);
+    }
+    return w;
+}
+
 // Stops keeping samples: the loudest channel as a mono 16-bit WAV, and its length in seconds.
 std::vector<unsigned char> voice_end(double *secs) {
     std::vector<float> x;
@@ -313,22 +411,5 @@ std::vector<unsigned char> voice_end(double *secs) {
         if (s > best) { best = s; pick = c; }
     }
     *secs = frames / (double)g_rate;
-    std::vector<unsigned char> w(44 + frames * 2);
-    auto u32 = [&](size_t at, uint32_t v) { memcpy(&w[at], &v, 4); };
-    auto u16 = [&](size_t at, uint16_t v) { memcpy(&w[at], &v, 2); };
-    memcpy(&w[0], "RIFF", 4); u32(4, (uint32_t)(36 + frames * 2)); memcpy(&w[8], "WAVEfmt ", 8);
-    u32(16, 16); u16(20, 1); u16(22, 1); u32(24, g_rate); u32(28, g_rate * 2); u16(32, 2); u16(34, 16);
-    memcpy(&w[36], "data", 4); u32(40, (uint32_t)(frames * 2));
-    // the headset records quietly, and the engine takes a clip under -44 dBFS for silence: the
-    // peak is brought to -3 dBFS (at most +30 dB, so that a silent take stays silent)
-    float peak = 0;
-    for (size_t i = 0; i < frames; i++) peak = fmaxf(peak, fabsf(x[i * g_ch + pick]));
-    const float gain = peak > 0 ? fminf(0.708f / peak, 31.6f) : 1;
-    for (size_t i = 0; i < frames; i++) {
-        float a = x[i * g_ch + pick] * gain;
-        a = a > 1 ? 1 : a < -1 ? -1 : a;
-        int16_t q = (int16_t)lrintf(a * 32767);
-        memcpy(&w[44 + i * 2], &q, 2);
-    }
-    return w;
+    return make_wav(x.data(), frames, g_ch, pick);
 }

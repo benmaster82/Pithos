@@ -19,6 +19,7 @@ struct TalkInfo {
     std::wstring voice, reasoning;
     std::wstring note;            // a message for a few seconds, or ""
     bool can_listen = true;       // a microphone is there
+    bool hands_free = false;      // listening without the trigger
 };
 
 class TalkView {
@@ -40,7 +41,7 @@ private:
     std::vector<Pulse> m_pulses;
     double m_spawn = 0, m_time = 0, m_level = 0, m_blink_at = 3, m_blink = 0;
     uint64_t m_rng = 0x9E3779B97F4A7C15ull;
-    TalkState m_state = TALK_READY;
+    TalkState m_state = (TalkState)-1;   // none yet: the first frame sets the colours
     double m_last = -1;
 
     winrt::Windows::UI::Xaml::Media::SolidColorBrush m_pulse_brush{ nullptr }, m_aura_brush{ nullptr };   // the state's colour
