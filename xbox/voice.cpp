@@ -1,4 +1,5 @@
-// voice.cpp - push-to-talk capture from the headset on the controller's 3.5 mm jack.
+// voice.cpp - push-to-talk capture from the headset on the controller's 3.5 mm jack, and playback
+// of the model's speech.
 //
 // voice_init (on its own thread) asks for the microphone, then keeps an AudioGraph running on the
 // default capture device, which on the console is the headset ("Headset Microphone (... Virtual
@@ -48,8 +49,139 @@ static void set_status(int state, const std::string &s) {
     fprintf(stderr, "voice: %s\n", s.c_str());
 }
 
+/* ------------------------------------------------------------------ playback */
+
+// The model's speech (24 kHz mono) goes to the default render device (the TV, or the headset when
+// the console sends app audio there) through a frame input node at the graph's own rate: the
+// samples are resampled on the way in and wait in a queue that the graph drains at its pace.
+static wa::AudioGraph g_pgraph{ nullptr };
+static wa::AudioFrameInputNode g_pin{ nullptr };
+static std::mutex g_pmu;
+static std::vector<float> g_queue;         // samples at g_prate still to play, from g_qpos
+static size_t g_qpos;
+static std::atomic<int> g_pstate{ 0 };     // 0 idle, 1 buffering, 2 playing
+static std::atomic<bool> g_pend{ false };  // no more samples will come
+static int g_prate;
+static double g_rpos;                      // resampling: position in the input of the next output sample
+static float g_rlast;                      // the last input sample of the previous push
+
+static void play_quantum(wa::AudioFrameInputNode const &node, wa::FrameInputNodeQuantumStartedEventArgs const &args) {
+    const int n = args.RequiredSamples();
+    if (n <= 0) return;
+    wm::AudioFrame frame((uint32_t)n * sizeof(float));
+    {
+        auto buf = frame.LockBuffer(wm::AudioBufferAccessMode::Write);
+        auto ref = buf.CreateReference();
+        BYTE *data = nullptr;
+        UINT32 cap = 0;
+        ref.as<::Windows::Foundation::IMemoryBufferByteAccess>()->GetBuffer(&data, &cap);
+        float *out = (float *)data;
+        int got = 0;
+        std::lock_guard<std::mutex> lock(g_pmu);
+        if (g_pstate == 2) {
+            const size_t avail = g_queue.size() - g_qpos;
+            got = (int)(avail < (size_t)n ? avail : (size_t)n);
+            memcpy(out, g_queue.data() + g_qpos, sizeof(float) * got);
+            g_qpos += got;
+            if (g_qpos > (1u << 20)) {   // drop what has been played now and then
+                g_queue.erase(g_queue.begin(), g_queue.begin() + (ptrdiff_t)g_qpos);
+                g_qpos = 0;
+            }
+            if (g_qpos == g_queue.size() && g_pend) g_pstate = 0;   // all played
+        }
+        for (int i = got; i < n; i++) out[i] = 0;   // nothing yet (or an underrun): silence
+    }
+    node.AddFrame(frame);
+}
+
+static void play_init() {
+    try {
+        wa::AudioGraphSettings settings(wm::Render::AudioRenderCategory::Speech);
+        auto gr = wa::AudioGraph::CreateAsync(settings).get();
+        if (gr.Status() != wa::AudioGraphCreationStatus::Success) { fprintf(stderr, "voice: no audio output graph\n"); return; }
+        auto graph = gr.Graph();
+        auto outr = graph.CreateDeviceOutputNodeAsync().get();
+        if (outr.Status() != wa::AudioDeviceNodeCreationStatus::Success) { fprintf(stderr, "voice: no audio output device\n"); return; }
+        auto props = graph.EncodingProperties();
+        props.ChannelCount(1);
+        g_prate = (int)props.SampleRate();
+        g_pin = graph.CreateFrameInputNode(props);
+        g_pin.AddOutgoingConnection(outr.DeviceOutputNode());
+        g_pin.QuantumStarted(play_quantum);
+        g_pgraph = graph;
+        g_pgraph.Start();
+        fprintf(stderr, "voice: speech out to \"%s\", %d Hz\n", winrt::to_string(outr.DeviceOutputNode().Device().Name()).c_str(), g_prate);
+    } catch (winrt::hresult_error const &e) {
+        fprintf(stderr, "voice: audio output error 0x%08x\n", (unsigned)e.code());
+    }
+}
+
+bool voice_play_ready() { return g_pin != nullptr; }
+int voice_play_state() { return g_pstate; }
+
+// A new utterance: what was queued is dropped; playback waits for voice_play_start.
+void voice_play_begin() {
+    std::lock_guard<std::mutex> lock(g_pmu);
+    g_queue.clear();
+    g_qpos = 0;
+    g_rpos = 0;
+    g_rlast = 0;
+    g_pend = false;
+    g_pstate = 1;
+}
+
+// 16-bit samples at 24 kHz, resampled (linearly) to the graph's rate.
+void voice_play_push(const int16_t *s, int n) {
+    if (n <= 0 || !g_prate) return;
+    const double step = 24000.0 / g_prate;
+    std::lock_guard<std::mutex> lock(g_pmu);
+    if (g_pstate == 0) return;   // stopped
+    // input sample i is s[i] for i >= 0 and g_rlast for i == -1
+    for (; g_rpos <= n - 1; g_rpos += step) {
+        const int i = (int)floor(g_rpos);
+        const double f = g_rpos - i;
+        const float a = i < 0 ? g_rlast : s[i] / 32768.f, b = i + 1 < n ? s[i + 1] / 32768.f : a;
+        g_queue.push_back((float)(a + (b - a) * f));
+    }
+    g_rpos -= n;
+    g_rlast = s[n - 1] / 32768.f;
+}
+
+void voice_play_start() { if (g_pstate == 1) g_pstate = 2; }
+
+// no more samples: playback ends when the queue is empty (and starts now if it had not)
+void voice_play_finish() {
+    std::lock_guard<std::mutex> lock(g_pmu);
+    g_pend = true;
+    if (g_pstate == 1) g_pstate = g_qpos < g_queue.size() ? 2 : 0;
+}
+
+void voice_play_stop() {
+    std::lock_guard<std::mutex> lock(g_pmu);
+    g_queue.clear();
+    g_qpos = 0;
+    g_pstate = 0;
+}
+
+// seconds queued and not yet played
+double voice_play_buffered() {
+    std::lock_guard<std::mutex> lock(g_pmu);
+    return g_prate ? (g_queue.size() - g_qpos) / (double)g_prate : 0;
+}
+
+/* ------------------------------------------------------------------ capture */
+
+static void capture_init();
+
 void voice_init() {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    play_init();
+    capture_init();
+    // the graphs live in this thread's apartment: the thread stays for the life of the app
+    for (;;) Sleep(INFINITE);
+}
+
+static void capture_init() {
     try {
         HRESULT hr = mic_request_access();
         if (hr != S_OK) {
@@ -109,8 +241,6 @@ void voice_init() {
         char m[160];
         snprintf(m, sizeof(m), "microphone \"%s\", %d Hz x %d ch", winrt::to_string(device.Name()).c_str(), g_rate, g_ch);
         set_status(1, m);
-        // the graph lives in this thread's apartment: the thread stays for the life of the app
-        for (;;) Sleep(INFINITE);
     } catch (winrt::hresult_error const &e) {
         char m[160];
         snprintf(m, sizeof(m), "microphone error 0x%08x", (unsigned)e.code());

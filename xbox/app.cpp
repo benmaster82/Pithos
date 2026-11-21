@@ -16,6 +16,8 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -48,6 +50,8 @@ void server_local_chat(const char *body, int len, void (*sink)(void *u, const ch
 void server_local_transcribe(const unsigned char *wav, size_t len, const char *lang,
                              void (*sink)(void *u, const char *s, int n), void *u);
 void server_log_local(int on);
+void server_local_speech(const char *body, int len, void (*sink)(void *u, const char *s, int n), void *u,
+                         volatile int *stop);
 }
 
 // voice.cpp: push-to-talk capture from the controller's headset
@@ -57,6 +61,15 @@ std::string voice_status();
 float voice_level();
 void voice_begin();
 std::vector<unsigned char> voice_end(double *secs);
+bool voice_play_ready();
+int voice_play_state();
+void voice_play_begin();
+void voice_play_push(const int16_t *s, int n);
+void voice_play_start();
+void voice_play_finish();
+void voice_play_stop();
+double voice_play_buffered();
+
 
 // the languages the voice can be transcribed in: code for the engine, name for the screen
 static const struct { const char *code; const wchar_t *name; } k_langs[] = {
@@ -371,6 +384,34 @@ static std::string error_message(const std::string &body) {
     return m;
 }
 
+// An answer as the voice should read it: markdown marks, code and links left out, one line.
+static std::string speakable(const std::wstring &w) {
+    std::wstring o;
+    bool code = false;
+    for (size_t i = 0; i < w.size(); i++) {
+        const wchar_t c = w[i];
+        if (!w.compare(i, 3, L"```")) { code = !code; i += 2; continue; }   // code blocks are not read
+        if (code) continue;
+        if (c == L'*' || c == L'#' || c == L'`' || c == L'_' || c == L'|' || c == L'>') continue;
+        if (!w.compare(i, 4, L"http")) {   // a link: its address is not read
+            while (i < w.size() && !iswspace(w[i])) i++;
+            continue;
+        }
+        o += iswspace(c) ? L' ' : c;
+    }
+    std::wstring t;   // collapse spaces
+    for (wchar_t c : o)
+        if (c != L' ' || (!t.empty() && t.back() != L' ')) t += c;
+    while (!t.empty() && t.back() == L' ') t.pop_back();
+    // at most about a minute and a half of speech: cut at a sentence end
+    const size_t cap = 1400;
+    if (t.size() > cap) {
+        size_t e = t.find_last_of(L".!?", cap);
+        t.resize(e != std::wstring::npos && e > cap / 2 ? e + 1 : cap);
+    }
+    return utf8(t);
+}
+
 /* ------------------------------------------------------------------ screen */
 
 struct App : ApplicationT<App> {
@@ -403,6 +444,12 @@ struct App : ApplicationT<App> {
     Button m_lang_button{ nullptr };
     int m_lang = 0;
     bool m_voice_started = false, m_listening = false, m_transcribing = false;
+    // spoken answers: Y reads the last answer (or stops), "Read answers" reads each one
+    Button m_read_button{ nullptr };
+    bool m_can_speak = false, m_read_auto = false, m_prev_y = false;
+    std::atomic<bool> m_speaking{ false };   // a speech request is running on the engine
+    std::shared_ptr<int> m_speech_flag;      // the running request's stop flag
+    std::mutex m_speech_mu;                  // one speech request at a time
     std::wstring m_note;
     std::chrono::steady_clock::time_point m_note_until, m_released;
 
@@ -535,7 +582,7 @@ struct App : ApplicationT<App> {
 
         Grid top;
         top.ColumnSpacing(10);
-        cols(top, { star(), fit(), fit() });
+        cols(top, { star(), fit(), fit(), fit() });
         StackPanel names;
         names.Children().Append(text(L"Chat", 17, TEXT, true));
         names.Children().Append(text(L"Talks to the model on this console. No commands or tools.", 12, MUTED));
@@ -544,7 +591,21 @@ struct App : ApplicationT<App> {
         m_new.Content(box_value(L"New chat"));
         m_new.VerticalAlignment(VerticalAlignment::Center);
         m_new.Click([this](auto &&, auto &&) { new_chat(); });
-        place(top, m_new, 0, 2);
+        place(top, m_new, 0, 3);
+        // spoken answers, also kept in the app's settings
+        auto read = Windows::Storage::ApplicationData::Current().LocalSettings().Values().TryLookup(L"read_answers");
+        m_read_auto = read && unbox_value_or<bool>(read, false);
+        m_read_button = Button();
+        m_read_button.VerticalAlignment(VerticalAlignment::Center);
+        m_read_button.Click([this](auto &&, auto &&) {
+            m_read_auto = !m_read_auto;
+            Windows::Storage::ApplicationData::Current().LocalSettings().Values().Insert(L"read_answers", box_value(m_read_auto));
+            show_read();
+            if (!m_read_auto) stop_speaking();
+        });
+        m_read_button.Visibility(Visibility::Collapsed);   // shown once the model speaks
+        show_read();
+        place(top, m_read_button, 0, 2);
         // the language the voice is transcribed in, kept in the app's settings
         auto saved = Windows::Storage::ApplicationData::Current().LocalSettings().Values().TryLookup(L"voice_lang");
         if (saved) m_lang = unbox_value_or<int32_t>(saved, 0) % (int)std::size(k_langs);
@@ -604,15 +665,112 @@ struct App : ApplicationT<App> {
     }
 
     void show_lang() { m_lang_button.Content(box_value(std::wstring(L"Voice: ") + k_langs[m_lang].name)); }
+    void show_read() { m_read_button.Content(box_value(m_read_auto ? L"Read answers: on" : L"Read answers: off")); }
+
+    /* ---------------------------------------------------------------- spoken answers */
+
+    void stop_speaking() {
+        if (m_speech_flag) *m_speech_flag = 1;
+        voice_play_stop();
+    }
+
+    // The bytes of a pcm speech response: the HTTP head, then 16-bit samples at 24 kHz, which go
+    // to the playback queue. Playback waits until enough is queued to never run dry: generating at
+    // r times real time an utterance of T seconds, the queue must hold T (1 - r) when it starts.
+    struct SpeechRecv {
+        std::string head;
+        bool in_body = false, ok = true, started = false;
+        int carry = -1;                   // the first byte of a sample split between two chunks
+        double secs = 0, est = 0;
+        std::chrono::steady_clock::time_point first;
+        std::vector<int16_t> s;
+
+        void body(const char *p, int n) {
+            s.clear();
+            int i = 0;
+            if (carry >= 0 && n > 0) {
+                s.push_back((int16_t)((uint8_t)carry | ((uint8_t)p[0] << 8)));
+                carry = -1;
+                i = 1;
+            }
+            for (; i + 1 < n; i += 2) s.push_back((int16_t)((uint8_t)p[i] | ((uint8_t)p[i + 1] << 8)));
+            if (i < n) carry = (uint8_t)p[i];
+            if (s.empty()) return;
+            auto now = std::chrono::steady_clock::now();
+            if (secs == 0) first = now - std::chrono::milliseconds(80);   // the first frame took about one
+            voice_play_push(s.data(), (int)s.size());
+            secs += s.size() / 24000.0;
+            if (started) return;
+            const double wall = std::chrono::duration<double>(now - first).count();
+            const double rate = wall > 0 ? secs / wall : 0;
+            const double need = rate >= 1 ? 0.3 : est * (1 - rate) * 1.2 + 0.4;
+            if (secs >= 0.8 && (secs >= need || secs >= est)) {
+                started = true;
+                voice_play_start();
+            }
+        }
+    };
+
+    static void speech_sink(void *u, const char *p, int n) {
+        SpeechRecv *r = (SpeechRecv *)u;
+        if (r->in_body) {
+            if (r->ok) r->body(p, n);
+            return;
+        }
+        r->head.append(p, n);
+        const size_t e = r->head.find("\r\n\r\n");
+        if (e == std::string::npos) return;
+        r->in_body = true;
+        r->ok = r->head.compare(0, 12, "HTTP/1.1 200") == 0;
+        const std::string rest = r->head.substr(e + 4);
+        if (r->ok && !rest.empty()) r->body(rest.data(), (int)rest.size());
+    }
+
+    // The engine speaks text (worker thread, one request at a time: a new one stops the last).
+    void speak(std::string text) {
+        if (text.empty() || !m_can_speak) return;
+        stop_speaking();
+        auto flag = std::make_shared<int>(0);
+        m_speech_flag = flag;
+        Buf b = {};
+        buf_add(&b, "{\"response_format\":\"pcm\",\"voice\":\"female\",\"language\":", -1);
+        buf_json_str(&b, k_langs[m_lang].code, -1);
+        buf_add(&b, ",\"input\":", -1);
+        buf_json_str(&b, text.data(), (int)text.size());
+        buf_add(&b, "}", 1);
+        std::string body(b.s, b.n);
+        buf_free(&b);
+        const double est = text.size() / 14.0;   // seconds of speech, about 14 characters a second
+        std::thread([this, body, est, flag] {
+            std::lock_guard<std::mutex> lock(m_speech_mu);   // the previous request ends at its next check
+            if (*flag) return;
+            m_speaking = true;
+            voice_play_begin();
+            SpeechRecv r;
+            r.est = est;
+            server_local_speech(body.data(), (int)body.size(), speech_sink, &r, (volatile int *)flag.get());
+            if (!*flag) voice_play_finish();
+            m_speaking = false;
+        }).detach();
+    }
+
+    // the last answer of the chat, as the voice reads it
+    std::string last_answer() {
+        for (size_t i = m_history.size(); i-- > 0;)
+            if (m_history[i].first == "assistant") return speakable(wide(m_history[i].second));
+        return "";
+    }
 
     /* ---------------------------------------------------------------- push-to-talk */
 
     // Starts the microphone once the engine says it hears (LFM3-Audio with its projector).
-    void voice_start() {
+    void voice_start(bool speaks) {
         if (m_voice_started) return;
         m_voice_started = true;
-        fprintf(stderr, "voice: the model hears, starting push-to-talk\n");
+        m_can_speak = speaks;
+        fprintf(stderr, "voice: the model hears%s, starting push-to-talk\n", speaks ? " and speaks" : "");
         m_lang_button.Visibility(Visibility::Visible);
+        if (speaks) m_read_button.Visibility(Visibility::Visible);
         m_voice.Visibility(Visibility::Visible);
         m_voice.Text(L"Starting the microphone...");
         std::thread(voice_init).detach();
@@ -626,11 +784,23 @@ struct App : ApplicationT<App> {
     void pad_tick() {
         const int vs = voice_state();
         double rt = 0;
-        for (auto const &g : Windows::Gaming::Input::Gamepad::Gamepads()) rt = (std::max)(rt, g.GetCurrentReading().RightTrigger);
+        bool y = false;
+        for (auto const &g : Windows::Gaming::Input::Gamepad::Gamepads()) {
+            const auto r = g.GetCurrentReading();
+            rt = (std::max)(rt, r.RightTrigger);
+            y = y || (r.Buttons & Windows::Gaming::Input::GamepadButtons::Y) == Windows::Gaming::Input::GamepadButtons::Y;
+        }
+        const bool talking = m_speaking || voice_play_state() != 0;
+        if (y && !m_prev_y && m_can_speak) {   // Y: read the last answer aloud, or stop reading
+            if (talking) stop_speaking();
+            else if (!m_busy) speak(last_answer());
+        }
+        m_prev_y = y;
         const bool held = rt > 0.5, can = vs == 1 && m_shown == RUNNING && !m_busy && !m_transcribing;
         auto now = std::chrono::steady_clock::now();
         if (held) m_released = {};
         if (held && !m_listening && can) {
+            if (talking) stop_speaking();   // speaking over the answer stops it
             voice_begin();
             m_listening = true;
         } else if (!held && m_listening && m_released == std::chrono::steady_clock::time_point{}) {
@@ -650,8 +820,13 @@ struct App : ApplicationT<App> {
             m_voice.Text(L"\x25cf Listening, release RT to send   " + std::wstring(bars, L'\x2588') + std::wstring(15 - bars, L'\x2591'));
             m_voice.Foreground(brush(ICE));
         } else if (!m_transcribing) {
+            const int ps = voice_play_state();
             std::wstring s = std::chrono::steady_clock::now() < m_note_until ? m_note
-                           : vs == 1 ? (m_busy ? L"Answering..." : L"Hold RT on the controller to talk")
+                           : ps == 2 ? L"\x25b6 Speaking   Y: stop   RT: talk over it"
+                           : talking ? L"Preparing the spoken answer...   Y: stop"
+                           : vs == 1 ? (m_busy ? L"Answering..."
+                                               : m_can_speak ? L"Hold RT on the controller to talk   Y: read the last answer aloud"
+                                                             : L"Hold RT on the controller to talk")
                                      : wide(voice_status());
             if (std::wstring(m_voice.Text()) != s) m_voice.Text(s);
             m_voice.Foreground(brush(vs < 0 ? AMBER : MUTED));
@@ -723,6 +898,7 @@ struct App : ApplicationT<App> {
         w.erase(0, w.find_first_not_of(L" \t\r\n"));
         w.erase(w.find_last_not_of(L" \t\r\n") + 1);
         if (w.empty()) return;
+        stop_speaking();   // a new question: the last answer is not read on
         m_input.Text(L"");
         bubble(true).Text(w);
         m_history.emplace_back("user", utf8(w));
@@ -789,6 +965,7 @@ struct App : ApplicationT<App> {
         // a turn without an answer is dropped, so the history keeps alternating
         if (answer.empty()) m_history.pop_back();
         else m_history.emplace_back("assistant", utf8(answer));
+        if (m_read_auto && !answer.empty() && err.empty() && !m_stop) speak(speakable(answer));
         m_busy = false;
         m_send.Content(box_value(L"Send"));
         m_new.IsEnabled(true);
@@ -811,7 +988,8 @@ struct App : ApplicationT<App> {
                 m_since = std::chrono::steady_clock::now();
             }
             // the engine hears (LFM3-Audio and its projector): push-to-talk with the headset
-            if (m_ready && !m_voice_started && raw.find("audio input: on") != std::string::npos) voice_start();
+            if (m_ready && !m_voice_started && raw.find("audio input: on") != std::string::npos)
+                voice_start(raw.find("speech output: on") != std::string::npos);
             if (m_cpu.empty()) m_cpu = log_field(raw, "CPU: ");
             if (m_kernel.empty()) m_kernel = log_field(raw, "kernel: ");
             m_log_follow = m_log_scroll.VerticalOffset() >= m_log_scroll.ScrollableHeight() - 30;

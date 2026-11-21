@@ -2671,6 +2671,21 @@ void server_local_transcribe(const unsigned char *wav, size_t len, const char *l
     else transcribe(&c, wav, len, lang ? lang : "", "text", "", 0);
 }
 
+void server_local_speech(const char *body, int len, void (*sink)(void *u, const char *s, int n), void *u,
+                         volatile int *stop) {
+    Conn c;
+    memset(&c, 0, sizeof(c));
+    c.sink = sink;
+    c.sink_u = u;
+    c.stop = stop;
+    snprintf(c.peer, sizeof(c.peer), "local");
+    char err[160];
+    Json *j = json_parse(body, len, err, sizeof(err));
+    if (!j || j->t != J_OBJ) send_error(&c, 400, "invalid_request_error", "invalid JSON body");
+    else handle_speech(&c, j);
+    json_free(j);
+}
+
 int server_run(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *tk, PCache *pc) {
     server_attach(cfg, m, ctx, tk, pc);
 

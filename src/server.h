@@ -63,6 +63,10 @@ void server_local_chat(const char *body, int len, void (*sink)(void *u, const ch
  * as a /v1/audio/transcriptions response with response_format "text" (head, then the text). */
 void server_local_transcribe(const unsigned char *wav, size_t len, const char *lang,
                              void (*sink)(void *u, const char *s, int n), void *u);
+/* The same for /v1/audio/speech (JSON body): with "response_format": "pcm" the head, then the
+ * 16-bit 24 kHz samples as they are made; it stops early when *stop becomes non-zero. */
+void server_local_speech(const char *body, int len, void (*sink)(void *u, const char *s, int n), void *u,
+                         volatile int *stop);
 /* Log the in-process requests like the network ones (peer "local"); off by default, since the
  * terminal agent shows its own statistics. */
 void server_log_local(int on);
