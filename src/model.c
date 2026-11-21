@@ -1732,6 +1732,7 @@ int ctx_forward_embd(Context *c, const float *x, int n, float *hidden) {
 }
 
 const float *ctx_hidden(const Context *c) { return c->hidden_ok ? c->h : NULL; }
+int ctx_token_on_gpu(const Context *c) { return c->dx_dense || (c->vk_dense && !c->m->n_expert); }
 void ctx_need_hidden(Context *c, int on) { c->need_hidden = on; }
 
 void ctx_matmul(Context *c, const Mat *w, const float *x, int n, float *out) {

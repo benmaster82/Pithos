@@ -793,6 +793,15 @@ static int chat_turn(Engine *e, const char *user, int first) {
 
 /* ------------------------------------------------------------------ speech output */
 
+/* one step of the model on the frame's row, h its hidden state (NULL: context full); a thread
+ * function, so that it can run beside the codec */
+typedef struct { Context *ctx; const float *h; const int *id; } TokenStep;
+
+static void token_step(void *u) {
+    TokenStep *st = (TokenStep *)u;
+    st->h = ctx_forward(st->ctx, st->id, 1) ? ctx_hidden(st->ctx) : NULL;
+}
+
 /* --tts: the model's TTS prompt, then one frame of codes per step from the hidden state (the
  * frame's embedding is the next input) until the end-of-audio code; the codec turns each frame
  * into 80 ms of audio. */
@@ -818,25 +827,31 @@ static int tts_run(Engine *e, Speech *sp, const Args *a) {
     const int id = -1;   /* the frame's row */
     const double tg = time_sec();
     double t_lm = 0, t_depth = 0, t_codec = 0;   /* PITHOS_SPEECH_PROFILE */
+    /* with the token on the GPU, the codec of a frame runs while the model takes the next step */
+    const char *ov = getenv("PITHOS_SPEECH_OVERLAP");
+    const int overlap = ctx_token_on_gpu(e->ctx) && !(ov && ov[0] == '0');
     while (h && frames < max_frames) {
         int codes[SPEECH_CODEBOOKS];
         double t1 = time_sec();
         if (speech_frame(sp, h, &sp_par, &rng, codes)) { ended = 1; break; }
         double t2 = time_sec();
+        speech_embed(sp, codes, row);
+        TokenStep st = { e->ctx, NULL, &id };
+        PithosThread *th = overlap ? thread_create(token_step, &st) : NULL;
         n += speech_decode(sp, codes, pcm + n);
         double t3 = time_sec();
         frames++;
         if (frames % 25 == 0) fprintf(stderr, "\r[speech: %.1f s]", n / (double)SPEECH_RATE);
-        speech_embed(sp, codes, row);
-        if (!ctx_forward(e->ctx, &id, 1)) break;
-        h = ctx_hidden(e->ctx);
+        if (th) thread_join(th);
+        else token_step(&st);
+        h = st.h;
         t_depth += t2 - t1;
         t_codec += t3 - t2;
         t_lm += time_sec() - t3;
     }
     if (getenv("PITHOS_SPEECH_PROFILE") && frames)
-        fprintf(stderr, "\nper frame: language model %.1f ms, depth decoder %.1f ms, codec %.1f ms\n", 1e3 * t_lm / frames,
-                1e3 * t_depth / frames, 1e3 * t_codec / frames);
+        fprintf(stderr, "\nper frame: language model %.1f ms%s, depth decoder %.1f ms, codec %.1f ms\n", 1e3 * t_lm / frames,
+                overlap ? " (beyond the codec)" : "", 1e3 * t_depth / frames, 1e3 * t_codec / frames);
     n += speech_flush(sp, pcm + n);
     ctx_set_embeds(e->ctx, NULL, 0);
     const double dt = time_sec() - tg;

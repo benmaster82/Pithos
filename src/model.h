@@ -147,6 +147,9 @@ int ctx_forward_embd(Context *c, const float *x, int n, float *hidden);
 const float *ctx_hidden(const Context *c);
 /* on: single tokens leave OpenCL's decode path for the CPU one, so that ctx_hidden has them */
 void ctx_need_hidden(Context *c, int on);
+/* Whether a single token runs entirely on a GPU (Direct3D 12 or Vulkan, dense models), without
+ * the thread pool: then the pool is free for other work while it runs on another thread. */
+int ctx_token_on_gpu(const Context *c);
 /* out[n][w->rows] = x[n][w->cols] times w, on the context's threads (w->cols a multiple of 256 if quantized) */
 void ctx_matmul(Context *c, const Mat *w, const float *x, int n, float *out);
 /* How many times the context was lost with a failing GPU (it then goes on on the CPU). */

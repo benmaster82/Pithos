@@ -2310,6 +2310,15 @@ static int sink_pcm(SpeechSink *k, const float *pcm, int n) {
     return 1;
 }
 
+/* one step of the model on the frame's row, h its hidden state (NULL: context full); a thread
+ * function, so that it can run beside the codec */
+typedef struct { const float *h; const int *id; } FrameStep;
+
+static void frame_step(void *u) {
+    FrameStep *st = (FrameStep *)u;
+    st->h = pcache_feed(S.pc, st->id, 1) ? ctx_hidden(S.ctx) : NULL;
+}
+
 /* OpenAI's text-to-speech: {"input", "voice": "female" / "male" (other names: female),
  * "language": ISO code such as "it" (an extension; default en), "response_format": "wav", "pcm"
  * (16-bit 24 kHz mono) or "mp3", "stream_format": "audio" or "sse", "temperature"}. pcm and mp3
@@ -2368,28 +2377,35 @@ static void handle_speech(Conn *c, const Json *body) {
     const int started = h != NULL;
     int ok = started;
     double first = 0, tt[3] = { 0 };   /* PITHOS_SPEECH_PROFILE: depth decoder, codec, language model */
+    /* with the token on the GPU, the codec of a frame runs while the model takes the next step */
+    const char *ov = getenv("PITHOS_SPEECH_OVERLAP");
+    const int overlap = ctx_token_on_gpu(S.ctx) && !(ov && ov[0] == '0');
     while (h && frames < max_frames) {
         int codes[SPEECH_CODEBOOKS];
         const double t1 = time_sec();
         if (speech_frame(S.cfg.speech, h, &sp, &rng, codes)) break;
         const double t2 = time_sec();
+        speech_embed(S.cfg.speech, codes, row);
+        FrameStep st = { NULL, &id };
+        PithosThread *th = overlap ? thread_create(frame_step, &st) : NULL;
         const int k = speech_decode(S.cfg.speech, codes, pcm + n);
         const double t3 = time_sec();
         if (!whole && ok) ok = sink_pcm(&sink, pcm + n, k);
         if (k && !first) first = time_sec() - t0;
         n += k;
         frames++;
-        if ((frames & 15) == 0 && conn_gone(c)) { g.finish = FIN_ABORT; break; }
-        speech_embed(S.cfg.speech, codes, row);
         const double t4 = time_sec();
-        h = pcache_feed(S.pc, &id, 1) ? ctx_hidden(S.ctx) : NULL;
+        if (th) thread_join(th);
+        else frame_step(&st);
+        h = st.h;
         tt[0] += t2 - t1;
         tt[1] += t3 - t2;
         tt[2] += time_sec() - t4;
+        if ((frames & 15) == 0 && conn_gone(c)) { g.finish = FIN_ABORT; break; }
     }
     if (getenv("PITHOS_SPEECH_PROFILE") && frames)
-        fprintf(stderr, "[speech] per frame: depth decoder %.1f ms, codec %.1f ms, language model %.1f ms\n",
-                1e3 * tt[0] / frames, 1e3 * tt[1] / frames, 1e3 * tt[2] / frames);
+        fprintf(stderr, "[speech] per frame: depth decoder %.1f ms, codec %.1f ms, language model %.1f ms%s\n",
+                1e3 * tt[0] / frames, 1e3 * tt[1] / frames, 1e3 * tt[2] / frames, overlap ? " (beyond the codec)" : "");
     const int k = ok ? speech_flush(S.cfg.speech, pcm + n) : 0;
     if (!whole && ok && g.finish != FIN_ABORT) ok = sink_pcm(&sink, pcm + n, k) && (!sink.mp3 || mp3_finish(sink.mp3));
     n += k;
