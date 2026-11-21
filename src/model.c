@@ -1711,10 +1711,34 @@ float *ctx_forward(Context *c, const int *tokens, int n) {
     return c->logits;
 }
 
+/* a bidirectional chunk (the depth decoder) entirely on the Direct3D 12 GPU: its rows after the
+ * final norm in hidden; 0 if the GPU failed (nothing has moved: the CPU can take the chunk) */
+static int forward_dx_rows(Context *c, const float *x, int n, float *hidden) {
+    const Model *m = c->m;
+    const int D = m->dim, hd = m->head_dim, pos0 = c->pos;
+    if (c->kv_gpu_n < pos0) {
+        dx_dense_kv(c->dx, c->kc, c->vc, c->kv_gpu_n, pos0, 1);
+        c->kv_gpu_n = pos0;
+    }
+    float *rope = c->rope, *rope_swa = c->rope + (size_t)n * hd;
+    for (int t = 0; t < n; t++) rope_tables(c, pos0 + t, rope + (size_t)t * hd, rope_swa + (size_t)t * hd);
+    if (!dx_dense_forward(c->dx, x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, NULL, c->tmp)) {
+        c->dx_dense = 0;
+        return 0;
+    }
+    for (int t = 0; t < n; t++) rmsnorm(hidden + (size_t)t * D, c->tmp + (size_t)t * D, m->final_norm, D, m->eps);
+    c->pos += n;
+    c->tok_counter += (uint32_t)n;
+    c->kv_gpu_n = c->pos;
+    if (c->kv_cpu_n > pos0) c->kv_cpu_n = pos0;
+    return 1;
+}
+
 int ctx_forward_embd(Context *c, const float *x, int n, float *hidden) {
     const Model *m = c->m;
     const int D = m->dim;
     if (c->pos + n > c->n_ctx) return 0;
+    if (c->dx_dense && m->bidir && n <= c->n_batch && forward_dx_rows(c, x, n, hidden)) return 1;
     for (int i = 0; i < n; i += c->n_batch) {
         const int nb = n - i < c->n_batch ? n - i : c->n_batch, pos0 = c->pos;
         sync_to_cpu(c, pos0);

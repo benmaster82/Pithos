@@ -655,9 +655,10 @@ int dx_dense_init(Dx *d, const Model *m, int n_ctx, int n_batch, char *info, int
     info[0] = 0;
     if (!d || d->broken) return 0;
     const int D = m->dim, hd = m->head_dim;
-    int F = 0, ok = D % QK_K == 0 && hd % 2 == 0 && hd <= 512 && 256 % (hd / 2) == 0 && m->l_cache >= 2;
-    const DxMat *output = find_mat(d, m->output.data);
-    ok = ok && output;
+    int F = 0, ok = D % QK_K == 0 && hd % 2 == 0 && hd <= 512 && 256 % (hd / 2) == 0 && (m->l_cache >= 2 || !m->n_conv);
+    /* a bidirectional block stack (the LFM3-Audio depth decoder) has no output: its caller reads the rows */
+    const DxMat *output = m->output.data ? find_mat(d, m->output.data) : NULL;
+    ok = ok && (output || m->bidir);
     for (int l = 0; l < m->n_layer && ok; l++) {
         const Layer *L = &m->layers[l];
         if (L->is_moe) ok = 0;
@@ -741,7 +742,8 @@ int dx_dense_init(Dx *d, const Model *m, int n_ctx, int n_batch, char *info, int
     t->cs = buffer(d, D3D12_HEAP_TYPE_DEFAULT, cs_bytes ? cs_bytes : 256, D3D12_RESOURCE_STATE_COMMON, 1);
     t->sw = buffer(d, D3D12_HEAP_TYPE_DEFAULT, len * 4, D3D12_RESOURCE_STATE_COMMON, 0);
     ok = t->scratch && t->kv && t->cs && t->sw && buf_reserve(d, &t->in, D3D12_HEAP_TYPE_UPLOAD, B * (size_t)(D + 2 * hd) * 4) &&
-         buf_reserve(d, &t->lrb, D3D12_HEAP_TYPE_READBACK, (size_t)(m->n_vocab + D) * 4) &&
+         buf_reserve(d, &t->lrb, D3D12_HEAP_TYPE_READBACK,
+                     ((size_t)m->n_vocab + D > B * D ? (size_t)m->n_vocab + D : B * D) * 4) &&
          buf_reserve(d, &d->up, D3D12_HEAP_TYPE_UPLOAD, len * 4);
     if (ok) {
         memcpy(d->up.map, sw, len * 4);
@@ -775,7 +777,9 @@ static void tok_mm(Dx *d, const DxMat *x, size_t xo, size_t oo, int n, int orow)
     const DxDense *t = d->dense;
     const UINT nb = (UINT)(x->K / QK_K);
     const UINT p[6] = {(UINT)x->rows, nb, (UINT)n, (UINT)x->gpu_row, nb * Q8_BYTES, (UINT)orow};
-    const int mv = n < DX_MV_TOKENS;
+    /* the depth decoder's 12 tokens too: the 64 x 64 tiles leave most of the GPU idle there
+     * (laptop GTX 1650: 8.9 -> 6.1 ms a pass) */
+    const int mv = n < DX_MV_TOKENS || t->m->bidir;
     ID3D12GraphicsCommandList *cl = d->cl;
     ID3D12GraphicsCommandList_SetPipelineState(cl, mv ? d->pso_mv[x->kernel] : d->pso[x->kernel]);
     ID3D12GraphicsCommandList_SetComputeRoot32BitConstants(cl, ROOT_CONST, 6, p, 0);
@@ -851,7 +855,7 @@ int dx_dense_forward(Dx *d, const float *x, int n, const float *rope_cs, const f
                 tok_run(d, T_ATTN, ca, (UINT)t->nh, 1);
             } else {
                 const UINT ca[16] = {(UINT)hd, (UINT)t->o_big, gate, (UINT)t->o_tmp,
-                                     (UINT)kbase, (UINT)(t->kv_half + kbase), (UINT)kvd, 0,
+                                     (UINT)kbase, (UINT)(t->kv_half + kbase), (UINT)kvd, m->bidir ? (UINT)(pos0 + n) : 0,
                                      (UINT)pos0, (UINT)(L->is_swa && m->swa_window > 0 ? m->swa_window : 0),
                                      (UINT)(t->nh / t->nkv), (UINT)t->nh, scale, (UINT)D};
                 tok_run(d, T_ATTN_CHUNK, ca, (UINT)t->nh, un);
@@ -892,6 +896,9 @@ int dx_dense_forward(Dx *d, const float *x, int n, const float *rope_cs, const f
         if (x_last)
             ID3D12GraphicsCommandList_CopyBufferRegion(cl, t->lrb.res, (UINT64)m->n_vocab * 4, t->scratch,
                                                        t->o_x + (size_t)(n - 1) * D * 4, (UINT64)D * 4);
+    } else if (x_last) {   /* no logits: the residual rows of all n tokens */
+        barrier(d, t->scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        ID3D12GraphicsCommandList_CopyBufferRegion(cl, t->lrb.res, 0, t->scratch, t->o_x, (UINT64)n * D * 4);
     }
     if (!submit(d)) {
         d->broken = 1;
@@ -900,6 +907,7 @@ int dx_dense_forward(Dx *d, const float *x, int n, const float *rope_cs, const f
     }
     if (logits) memcpy(logits, t->lrb.map, sizeof(float) * (size_t)m->n_vocab);
     if (logits && x_last) memcpy(x_last, t->lrb.map + 4 * (size_t)m->n_vocab, sizeof(float) * (size_t)D);
+    else if (x_last) memcpy(x_last, t->lrb.map, sizeof(float) * (size_t)n * D);
     return 1;
 }
 

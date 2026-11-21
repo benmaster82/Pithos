@@ -30,10 +30,9 @@ Speech *speech_load(const char *mmproj, ThreadPool *pool, int lm_dim, const char
                     char *err, int errlen);
 void speech_free(Speech *s);
 
-/* The matmuls of the depth decoder and of the codec on a Direct3D 12 device of their own (device:
- * an adapter index, -1 the default), the rest on the CPU. Only with PITHOS_SPEECH_DX=1: the small
- * matmuls (12 rows) gain only where the CPU is slow. Returns 1 if either moved; info says what
- * runs where. */
+/* The depth decoder on a Direct3D 12 device of its own (device: an adapter index, -1 the default),
+ * each MaskGIT pass in one command list; the codec stays on the CPU. Only with PITHOS_SPEECH_DX=1.
+ * Returns 1 if it moved; info says how. */
 int speech_use_dx(Speech *s, int device, char *info, int infolen);
 
 /* A new utterance: the codec state, the inverse STFT and the repetition history start over. */

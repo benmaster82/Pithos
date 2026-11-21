@@ -41,7 +41,9 @@ int dx_matmul(Dx *d, const DxJob *jobs, int n);
 int  dx_dense_init(Dx *d, const Model *m, int n_ctx, int n_batch, char *info, int infolen);
 /* n (<= n_batch) tokens at positions pos0.. : x their embeddings [n][dim]; rope_cs / rope_swa
  * cos[hd/2] | sin[hd/2] per position [n][hd] (rope_swa NULL: none). logits (NULL: not needed)
- * receives the n_vocab floats of the last token. Returns 0 if the GPU failed. */
+ * receives the n_vocab floats of the last token, x_last (if not NULL) its residual row; without
+ * logits, x_last receives the residual rows of all n tokens [n][dim] (a bidirectional model, which
+ * has no output: its attention sees the whole chunk). Returns 0 if the GPU failed. */
 int  dx_dense_forward(Dx *d, const float *x, int n, const float *rope_cs, const float *rope_swa, int pos0, float *logits,
                       float *x_last);   /* as vk_dense_forward */
 /* copy KV rows [r0, r1) / the convolution state between the host arrays and the GPU copy */

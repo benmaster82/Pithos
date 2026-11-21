@@ -280,7 +280,8 @@ void conv_state(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
 [numthreads(256, 1, 1)]
 void attn_chunk(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     const uint hd = C0.x, half = hd / 2, h = gid.x, t = gid.y, kh = h / C2.z, kvd = C1.z, nh = C2.w, D = C3.y;
-    const uint npos = C2.x + t + 1, j0 = C2.y && npos > C2.y ? npos - C2.y : 0;
+    // C1.w > 0: bidirectional, every token sees the C1.w positions of the chunk (the LFM3-Audio depth decoder)
+    const uint npos = C1.w ? C1.w : C2.x + t + 1, j0 = C2.y && npos > C2.y ? npos - C2.y : 0;
     const uint kb = C1.x + 2 * kh * hd, vb = C1.y + 2 * kh * hd;
     const float scale = asfloat(C3.x);
     for (uint i = li; i < hd; i += 256) hs[i] = ldu(C0.y + 4 * (t * (D + 2 * kvd) + h * hd + i));
