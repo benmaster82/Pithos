@@ -10,6 +10,8 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <winrt/Windows.ApplicationModel.Core.h>
+#include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Devices.Enumeration.h>
@@ -51,8 +53,24 @@ static bool write_wav(const std::wstring &path, const std::vector<float> &x, int
 
 // The headset of the first controller that has one: its capture endpoint id, or "".
 static winrt::hstring headset_capture() {
-    // the controller list fills in shortly after the app starts
-    for (int i = 0; i < 30 && wg::Gamepad::Gamepads().Size() == 0; i++) Sleep(100);
+    // controllers reach the app only once its window is active: wait up to 30 s for one with a headset
+    auto added = wg::Gamepad::GamepadAdded([](auto &&, wg::Gamepad const &g) {
+        fprintf(stderr, "mic-probe: event: gamepad added, headset %s\n", g.Headset() ? "yes" : "no");
+        g.HeadsetConnected([](auto &&, wg::Headset const &h) {
+            fprintf(stderr, "mic-probe: event: headset connected, capture=%s\n", u8(h.CaptureDeviceId()).c_str());
+        });
+        g.HeadsetDisconnected([](auto &&, auto &&) { fprintf(stderr, "mic-probe: event: headset disconnected\n"); });
+    });
+    fprintf(stderr, "mic-probe: waiting up to 30 s for a controller with a headset (press a button)\n");
+    for (int i = 0; i < 300; i++) {
+        auto pads = wg::Gamepad::Gamepads();
+        bool headset = false;
+        for (uint32_t k = 0; k < pads.Size(); k++) headset = headset || pads.GetAt(k).Headset() != nullptr;
+        if (headset) break;
+        Sleep(100);
+    }
+    wg::Gamepad::GamepadAdded(added);
+    fprintf(stderr, "mic-probe: %u raw game controller(s)\n", wg::RawGameController::RawGameControllers().Size());
     winrt::hstring found;
     auto pads = wg::Gamepad::Gamepads();
     fprintf(stderr, "mic-probe: %u gamepad(s)\n", pads.Size());
@@ -98,6 +116,37 @@ static wd::DeviceInformation pick_device(winrt::hstring const &headset) {
         if (id.find(want) != std::wstring::npos || want.find(id) != std::wstring::npos) return d;
     }
     return nullptr;
+}
+
+// Asks for the microphone the way that shows the consent dialog: MediaCapture initialized for audio
+// on the UI thread (an AudioGraph alone only gets access denied). Returns its result.
+static HRESULT request_access() {
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    HRESULT hr = E_PENDING;
+    wm::Capture::MediaCapture mc{ nullptr };
+    extern winrt::Windows::UI::Core::CoreDispatcher g_ui_dispatcher;   // app.cpp
+    auto ui = g_ui_dispatcher;
+    if (!ui) return E_POINTER;
+    ui.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, [&] {
+        try {
+            mc = wm::Capture::MediaCapture();
+            wm::Capture::MediaCaptureInitializationSettings s;
+            s.StreamingCaptureMode(wm::Capture::StreamingCaptureMode::Audio);
+            s.MediaCategory(wm::Capture::MediaCategory::Speech);
+            mc.InitializeAsync(s).Completed([&](wf::IAsyncAction const &a, wf::AsyncStatus st) {
+                hr = st == wf::AsyncStatus::Completed ? S_OK : (HRESULT)a.ErrorCode();
+                SetEvent(done);
+            });
+        } catch (winrt::hresult_error const &e) {
+            hr = e.code();
+            SetEvent(done);
+        }
+    });
+    if (WaitForSingleObject(done, 120000) != WAIT_OBJECT_0) hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    CloseHandle(done);
+    // closed where it was made: from this thread the call crashes
+    if (mc) ui.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, [mc] { mc.Close(); });
+    return hr;
 }
 
 // Records `seconds` from `device` (null: the default) into `path`. Logs the format, the latency,
@@ -178,7 +227,19 @@ void mic_probe(const std::wstring &local) {
         winrt::hstring headset = headset_capture();
         list_devices();
         auto device = pick_device(headset);
-        if (!device) fprintf(stderr, "mic-probe: recording from the default capture device\n");
+        // no device yet: the list may still fill in, look again for a few seconds
+        for (int i = 0; i < 4 && !device; i++) {
+            auto all = wd::DeviceInformation::FindAllAsync(wm::Devices::MediaDevice::GetAudioCaptureSelector()).get();
+            if (all.Size()) { device = all.GetAt(0); break; }
+            Sleep(2500);
+        }
+        if (!device) {
+            fprintf(stderr, "mic-probe: no capture device found; trying the default anyway\n");
+            list_devices();
+        }
+        fprintf(stderr, "mic-probe: asking for the microphone (accept the dialog on the TV)\n");
+        HRESULT access = request_access();
+        fprintf(stderr, "mic-probe: microphone access 0x%08x%s\n", (unsigned)access, access == S_OK ? " (granted)" : "");
         record(local + L"\\mic-raw.wav", device, wm::Capture::MediaCategory::Other, "raw", 5);
         Sleep(1000);
         record(local + L"\\mic-speech.wav", device, wm::Capture::MediaCategory::Speech, "speech", 5);

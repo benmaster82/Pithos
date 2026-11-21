@@ -85,6 +85,9 @@ static std::wstring find_model(const std::wstring &dir, unsigned long long *size
 static std::string read_tail(const std::wstring &path, size_t max);
 void gpu_probe(void);   // gpu_probe.cpp
 void mic_probe(const std::wstring &local);   // mic_probe.cpp
+// the UI thread's dispatcher, set before the server thread starts (the probe asks for the
+// microphone there: other threads see no CoreWindow and no view dispatcher)
+Windows::UI::Core::CoreDispatcher g_ui_dispatcher{ nullptr };
 
 static void server_thread(std::wstring local) {
     // stdout and stderr both go to pithos.log, opened shared so the Device Portal and the screen
@@ -371,6 +374,7 @@ struct App : ApplicationT<App> {
                                       L"SystemControlRevealFocusVisualBrush" })
                 res.Insert(box_value(k), brush(ICE));
             m_dispatcher = window.Dispatcher();
+            g_ui_dispatcher = m_dispatcher;
             m_local = Windows::Storage::ApplicationData::Current().LocalFolder().Path();
             m_ip = lan_address();
             window.Content(build());
