@@ -41,6 +41,7 @@
 #include <winrt/Windows.UI.Xaml.Markup.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.Shapes.h>
+#include "talk.h"
 
 extern "C" {
 #include "../src/json.h"
@@ -59,6 +60,7 @@ void voice_init();
 int voice_state();
 std::string voice_status();
 float voice_level();
+float voice_play_level();
 void voice_begin();
 std::vector<unsigned char> voice_end(double *secs);
 bool voice_play_ready();
@@ -451,6 +453,13 @@ struct App : ApplicationT<App> {
     bool m_voice_started = false, m_listening = false, m_transcribing = false;
     Button m_effort_button{ nullptr };
     int m_effort = 0;   // k_efforts
+    // the full-screen voice mode (talk.cpp), over the server screen m_main
+    TalkView m_talk;
+    UIElement m_main{ nullptr }, m_talk_ui{ nullptr };
+    Button m_talk_button{ nullptr };
+    DispatcherTimer m_talk_timer{ nullptr };
+    bool m_talk_on = false;
+    Windows::Gaming::Input::GamepadButtons m_prev_buttons{};
     // spoken answers: Y reads the last answer (or stops), "Read answers" reads each one
     Button m_read_button{ nullptr };
     bool m_can_speak = false, m_read_auto = false, m_prev_y = false;
@@ -492,7 +501,28 @@ struct App : ApplicationT<App> {
         window.Activate();
     }
 
+    // the window: the server screen, and over it the full-screen voice mode (talk.cpp), hidden
     UIElement build() {
+        Grid frame;
+        m_main = build_main();
+        frame.Children().Append(m_main);
+        if (auto mark = logo(210)) {
+            m_talk_ui = m_talk.build(mark);
+            m_talk_ui.Visibility(Visibility::Collapsed);
+            frame.Children().Append(m_talk_ui);
+        }
+        // B on the controller is the system's back: it leaves the voice mode
+        Windows::UI::Core::SystemNavigationManager::GetForCurrentView().BackRequested(
+            [this](auto &&, Windows::UI::Core::BackRequestedEventArgs const &e) {
+                if (m_talk_on) {
+                    e.Handled(true);
+                    leave_talk();
+                }
+            });
+        return frame;
+    }
+
+    UIElement build_main() {
         Grid root;
         root.Background(brush(BG));
         root.Padding(Thickness{ 12, 8, 12, 8 });
@@ -589,7 +619,7 @@ struct App : ApplicationT<App> {
 
         Grid top;
         top.ColumnSpacing(10);
-        cols(top, { star(), fit(), fit(), fit(), fit() });
+        cols(top, { star(), fit(), fit(), fit(), fit(), fit() });
         StackPanel names;
         names.Children().Append(text(L"Chat", 17, TEXT, true));
         names.Children().Append(text(L"Talks to the model on this console. No commands or tools.", 12, MUTED));
@@ -598,7 +628,13 @@ struct App : ApplicationT<App> {
         m_new.Content(box_value(L"New chat"));
         m_new.VerticalAlignment(VerticalAlignment::Center);
         m_new.Click([this](auto &&, auto &&) { new_chat(); });
-        place(top, m_new, 0, 4);
+        place(top, m_new, 0, 5);
+        m_talk_button = Button();
+        m_talk_button.Content(box_value(L"Talk mode"));
+        m_talk_button.VerticalAlignment(VerticalAlignment::Center);
+        m_talk_button.Click([this](auto &&, auto &&) { enter_talk(); });
+        m_talk_button.Visibility(Visibility::Collapsed);   // shown once the model hears and speaks
+        place(top, m_talk_button, 0, 4);
         // how much the model reasons before it answers (reasoning_effort), kept in the settings
         auto effort = Windows::Storage::ApplicationData::Current().LocalSettings().Values().TryLookup(L"reasoning");
         m_effort = effort ? unbox_value_or<int32_t>(effort, 0) % (int)std::size(k_efforts) : 0;
@@ -774,6 +810,82 @@ struct App : ApplicationT<App> {
         }).detach();
     }
 
+    /* ---------------------------------------------------------------- the voice mode */
+
+    void enter_talk() {
+        if (m_talk_on || !m_talk_ui || !m_can_speak) return;
+        m_talk_on = true;
+        m_main.Visibility(Visibility::Collapsed);   // and with it every control the pad could focus
+        m_talk_ui.Visibility(Visibility::Visible);
+        if (!m_talk_timer) {
+            m_talk_timer = DispatcherTimer();
+            m_talk_timer.Interval(std::chrono::milliseconds(33));
+            m_talk_timer.Tick([this](auto &&, auto &&) { talk_tick(); });
+        }
+        talk_tick();
+        m_talk_timer.Start();
+    }
+
+    void leave_talk() {
+        if (!m_talk_on) return;
+        m_talk_on = false;
+        m_talk_timer.Stop();
+        m_talk_ui.Visibility(Visibility::Collapsed);
+        m_main.Visibility(Visibility::Visible);
+        m_send.Focus(FocusState::Programmatic);
+    }
+
+    // the text of the last message of a role, as written
+    std::wstring last_of(const char *role) {
+        for (size_t i = m_history.size(); i-- > 0;)
+            if (m_history[i].first == role) return wide(m_history[i].second);
+        return L"";
+    }
+
+    // the model's speed in the last answer, from the log ("answer N tok, X tok/s")
+    std::wstring last_speed() {
+        size_t p = m_log_raw.rfind("] chat |");
+        if (p == std::string::npos) return L"";
+        size_t a = m_log_raw.find("answer ", p), s = a == std::string::npos ? a : m_log_raw.find(", ", a);
+        size_t e = s == std::string::npos ? s : m_log_raw.find(" tok/s", s);
+        if (e == std::string::npos) return L"";
+        return wide(m_log_raw.substr(s + 2, e - s - 2)) + L" tok/s";
+    }
+
+    void talk_tick() {
+        TalkInfo in;
+        const int ps = voice_play_state();
+        if (m_listening) in.state = TALK_LISTENING;
+        else if (m_transcribing) in.state = TALK_TRANSCRIBING;
+        else if (ps == 2) in.state = TALK_SPEAKING;
+        else if (m_busy) in.state = m_answer.find_first_not_of(L" \r\n") == std::wstring::npos ? TALK_THINKING : TALK_WRITING;
+        else if (m_speaking || ps == 1) in.state = TALK_WRITING;   // the voice is being prepared
+        if (in.state == TALK_LISTENING) {
+            const float l = (voice_level() + 60) / 50;
+            in.level = l < 0 ? 0 : l > 1 ? 1 : l;
+        } else if (in.state == TALK_SPEAKING) {
+            const float l = voice_play_level() * 6;
+            in.level = l > 1 ? 1 : l;
+        }
+        // the subtitles: the question and the answer being written, then the last turn
+        if (m_busy) {
+            in.user = m_history.empty() ? L"" : wide(m_history.back().second);
+            in.answer = m_answer.substr(m_answer.find_first_not_of(L" \r\n") == std::wstring::npos ? m_answer.size()
+                                                                                                  : m_answer.find_first_not_of(L" \r\n"));
+        } else {
+            in.user = last_of("user");
+            in.answer = last_of("assistant");
+        }
+        for (auto &c : in.answer)
+            if (c == L'\n' || c == L'\r') c = L' ';
+        in.speed = last_speed();
+        in.voice = k_langs[m_lang].name;
+        in.reasoning = k_efforts[m_effort].name;
+        if (std::chrono::steady_clock::now() < m_note_until) in.note = m_note;
+        in.can_listen = voice_state() == 1;
+        m_talk.update(in);
+    }
+
     // the last answer of the chat, as the voice reads it
     std::string last_answer() {
         for (size_t i = m_history.size(); i-- > 0;)
@@ -791,6 +903,7 @@ struct App : ApplicationT<App> {
         fprintf(stderr, "voice: the model hears%s, starting push-to-talk\n", speaks ? " and speaks" : "");
         m_lang_button.Visibility(Visibility::Visible);
         if (speaks) m_read_button.Visibility(Visibility::Visible);
+        if (speaks && m_talk_ui) m_talk_button.Visibility(Visibility::Visible);
         m_voice.Visibility(Visibility::Visible);
         m_voice.Text(L"Starting the microphone...");
         std::thread(voice_init).detach();
@@ -803,13 +916,36 @@ struct App : ApplicationT<App> {
     // Every 50 ms: the right trigger of any controller, and the line under the message box.
     void pad_tick() {
         const int vs = voice_state();
+        using Windows::Gaming::Input::GamepadButtons;
         double rt = 0;
-        bool y = false;
+        GamepadButtons buttons{};
         for (auto const &g : Windows::Gaming::Input::Gamepad::Gamepads()) {
             const auto r = g.GetCurrentReading();
             rt = (std::max)(rt, r.RightTrigger);
-            y = y || (r.Buttons & Windows::Gaming::Input::GamepadButtons::Y) == Windows::Gaming::Input::GamepadButtons::Y;
+            buttons = buttons | r.Buttons;
         }
+        auto pressed = [&](GamepadButtons b) {   // down now, up on the last tick
+            return (buttons & b) == b && (m_prev_buttons & b) != b;
+        };
+        const bool y = (buttons & GamepadButtons::Y) == GamepadButtons::Y;
+        if (pressed(GamepadButtons::View) && m_can_speak) {   // View: the voice mode in and out
+            if (m_talk_on) leave_talk();
+            else enter_talk();
+        }
+        if (m_talk_on) {   // in the voice mode the pad changes the voice and the reasoning
+            const int nl = (int)std::size(k_langs), ne = (int)std::size(k_efforts);
+            if (pressed(GamepadButtons::RightShoulder) || pressed(GamepadButtons::LeftShoulder)) {
+                m_lang = (m_lang + (pressed(GamepadButtons::RightShoulder) ? 1 : nl - 1)) % nl;
+                Windows::Storage::ApplicationData::Current().LocalSettings().Values().Insert(L"voice_lang", box_value(m_lang));
+                show_lang();
+            }
+            if (pressed(GamepadButtons::DPadUp) || pressed(GamepadButtons::DPadDown)) {
+                m_effort = (m_effort + (pressed(GamepadButtons::DPadUp) ? 1 : ne - 1)) % ne;
+                Windows::Storage::ApplicationData::Current().LocalSettings().Values().Insert(L"reasoning", box_value(m_effort));
+                show_effort();
+            }
+        }
+        m_prev_buttons = buttons;
         const bool talking = m_speaking || voice_play_state() != 0;
         if (y && !m_prev_y && m_can_speak) {   // Y: read the last answer aloud, or stop reading
             if (talking) stop_speaking();
@@ -941,6 +1077,10 @@ struct App : ApplicationT<App> {
 
         Buf b = {};
         buf_printf(&b, "{\"stream\":true,\"reasoning_effort\":\"%s\",\"messages\":[", k_efforts[m_effort].code);
+        if (m_talk_on)   // the voice mode: answers to be heard, not read
+            buf_add(&b, "{\"role\":\"system\",\"content\":\"You are Pithos, a voice assistant on an Xbox. The user speaks "
+                        "to you and hears your answer: reply briefly, in one to three plain spoken sentences, without "
+                        "lists, markdown or emoji, in the language the user speaks.\"},", -1);
         for (size_t i = 0; i < m_history.size(); i++) {
             buf_printf(&b, "%s{\"role\":\"%s\",\"content\":", i ? "," : "", m_history[i].first.c_str());
             buf_json_str(&b, m_history[i].second.data(), (int)m_history[i].second.size());
@@ -985,7 +1125,7 @@ struct App : ApplicationT<App> {
         // a turn without an answer is dropped, so the history keeps alternating
         if (answer.empty()) m_history.pop_back();
         else m_history.emplace_back("assistant", utf8(answer));
-        if (m_read_auto && !answer.empty() && err.empty() && !m_stop) speak(speakable(answer));
+        if ((m_read_auto || m_talk_on) && !answer.empty() && err.empty() && !m_stop) speak(speakable(answer));
         m_busy = false;
         m_send.Content(box_value(L"Send"));
         m_new.IsEnabled(true);

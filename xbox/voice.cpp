@@ -61,6 +61,7 @@ static std::vector<float> g_queue;         // samples at g_prate still to play, 
 static size_t g_qpos;
 static std::atomic<int> g_pstate{ 0 };     // 0 idle, 1 buffering, 2 playing
 static std::atomic<bool> g_pend{ false };  // no more samples will come
+static std::atomic<float> g_plevel{ 0 };   // RMS of the last quantum played
 static int g_prate;
 static double g_rpos;                      // resampling: position in the input of the next output sample
 static float g_rlast;                      // the last input sample of the previous push
@@ -90,6 +91,9 @@ static void play_quantum(wa::AudioFrameInputNode const &node, wa::FrameInputNode
             if (g_qpos == g_queue.size() && g_pend) g_pstate = 0;   // all played
         }
         for (int i = got; i < n; i++) out[i] = 0;   // nothing yet (or an underrun): silence
+        double e = 0;
+        for (int i = 0; i < n; i++) e += (double)out[i] * out[i];
+        g_plevel = (float)sqrt(e / n);
     }
     node.AddFrame(frame);
 }
@@ -142,6 +146,7 @@ static void play_init() {
 }
 
 bool voice_play_ready() { return g_pin != nullptr; }
+float voice_play_level() { return g_plevel; }
 int voice_play_state() { return g_pstate; }
 
 // A new utterance: what was queued is dropped; playback waits for voice_play_start.
