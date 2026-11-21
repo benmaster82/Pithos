@@ -59,5 +59,9 @@ int server_run(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *tk, P
 void server_attach(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *tk, PCache *pc);
 void server_local_chat(const char *body, int len, void (*sink)(void *u, const char *s, int n), void *u,
                        volatile int *stop);
+/* The same for a WAV file: its transcription in lang (a code such as "it", or "" when unknown),
+ * as a /v1/audio/transcriptions response with response_format "text" (head, then the text). */
+void server_local_transcribe(const unsigned char *wav, size_t len, const char *lang,
+                             void (*sink)(void *u, const char *s, int n), void *u);
 
 #endif

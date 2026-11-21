@@ -2416,6 +2416,9 @@ static void handle_speech(Conn *c, const Json *body) {
  * verbose_json), temperature; model and prompt are accepted and ignored. translate: the
  * /v1/audio/translations variant, the speech in English text; there "language" (an extension) names
  * the language spoken, which the model otherwise recognizes itself. */
+static void transcribe(Conn *c, const unsigned char *wav, size_t wav_len, const char *lang, const char *fmt,
+                       const char *temp, int translate);
+
 static void handle_transcription(Conn *c, const Req *r, int translate) {
     if (!S.cfg.audio) { send_error(c, 400, "invalid_request_error", "this model takes no audio (it needs LFM3-Audio and its mmproj file)"); return; }
     Part parts[16];
@@ -2432,6 +2435,12 @@ static void handle_transcription(Conn *c, const Req *r, int translate) {
         send_error(c, 400, "invalid_request_error", "response_format must be json, text or verbose_json");
         return;
     }
+    transcribe(c, (const unsigned char *)file->data, file->len, lang, fmt, temp, translate);
+}
+
+/* the transcription of a WAV file in lang (a code or a name, "" = unspecified), as fmt */
+static void transcribe(Conn *c, const unsigned char *wav, size_t wav_len, const char *lang, const char *fmt,
+                       const char *temp, int translate) {
     Gen g;
     begin_gen(&g, c, 1);
     g.sp = S.cfg.sp;
@@ -2442,7 +2451,7 @@ static void handle_transcription(Conn *c, const Req *r, int translate) {
     lock_acquire(S.lock);
     S.busy = 1;
     audio_begin();
-    add_clip((const unsigned char *)file->data, file->len);
+    add_clip(wav, wav_len);
     char err[200] = "";
     Toks t = { 0 };
     float *lg = NULL;
@@ -2604,6 +2613,17 @@ void server_local_chat(const char *body, int len, void (*sink)(void *u, const ch
         handle_chat(&c, j);
     }
     json_free(j);
+}
+
+void server_local_transcribe(const unsigned char *wav, size_t len, const char *lang,
+                             void (*sink)(void *u, const char *s, int n), void *u) {
+    Conn c;
+    memset(&c, 0, sizeof(c));
+    c.sink = sink;
+    c.sink_u = u;
+    snprintf(c.peer, sizeof(c.peer), "local");
+    if (!S.cfg.audio) send_error(&c, 400, "invalid_request_error", "this model takes no audio (it needs LFM3-Audio and its mmproj file)");
+    else transcribe(&c, wav, len, lang ? lang : "", "text", "", 0);
 }
 
 int server_run(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *tk, PCache *pc) {

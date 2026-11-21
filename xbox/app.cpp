@@ -7,6 +7,8 @@
 // chat with the model, the addresses to connect to, the tail of the log, and a button that stops
 // the server by closing the app. The chat talks to the engine in process (server_local_chat, the
 // same /v1/chat/completions handler the network uses) and sends no tools: it cannot run anything.
+// With a model that hears (LFM3-Audio), holding RT records the headset on the controller
+// (voice.cpp) and the transcription (server_local_transcribe) is sent as the next message.
 #include <windows.h>
 #include <io.h>
 #include <share.h>
@@ -21,6 +23,7 @@
 #include <winrt/Windows.ApplicationModel.Activation.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Gaming.Input.h>
 #include <winrt/Windows.Networking.h>
 #include <winrt/Windows.Networking.Connectivity.h>
 #include <winrt/Windows.Storage.h>
@@ -42,7 +45,23 @@ extern "C" {
 int pithos_main(int argc, char **argv);
 void server_local_chat(const char *body, int len, void (*sink)(void *u, const char *s, int n), void *u,
                        volatile int *stop);
+void server_local_transcribe(const unsigned char *wav, size_t len, const char *lang,
+                             void (*sink)(void *u, const char *s, int n), void *u);
 }
+
+// voice.cpp: push-to-talk capture from the controller's headset
+void voice_init();
+int voice_state();
+std::string voice_status();
+float voice_level();
+void voice_begin();
+std::vector<unsigned char> voice_end(double *secs);
+
+// the languages the voice can be transcribed in: code for the engine, name for the screen
+static const struct { const char *code; const wchar_t *name; } k_langs[] = {
+    { "it", L"Italiano" }, { "en", L"English" }, { "fr", L"Fran\x00e7" L"ais" }, { "de", L"Deutsch" },
+    { "es", L"Espa\x00f1ol" }, { "pt", L"Portugu\x00ea" L"s" },
+};
 
 using namespace winrt;
 using namespace Windows::Foundation;
@@ -362,6 +381,15 @@ struct App : ApplicationT<App> {
     bool m_busy = false;
     volatile int m_stop = 0;
 
+    // push-to-talk: hold RT, speak, release; the transcription is sent as the next message
+    DispatcherTimer m_pad_timer{ nullptr };
+    TextBlock m_voice{ nullptr };
+    Button m_lang_button{ nullptr };
+    int m_lang = 0;
+    bool m_voice_started = false, m_listening = false, m_transcribing = false;
+    std::wstring m_note;
+    std::chrono::steady_clock::time_point m_note_until;
+
     App() {
         RequestedTheme(ApplicationTheme::Dark);
         // the gamepad moves the focus between controls instead of driving a mouse pointer
@@ -487,10 +515,11 @@ struct App : ApplicationT<App> {
     Grid build_chat() {
         Grid chat;
         chat.RowSpacing(10);
-        rows(chat, { fit(), star(), fit() });
+        rows(chat, { fit(), star(), fit(), fit() });
 
         Grid top;
-        cols(top, { star(), fit() });
+        top.ColumnSpacing(10);
+        cols(top, { star(), fit(), fit() });
         StackPanel names;
         names.Children().Append(text(L"Chat", 17, TEXT, true));
         names.Children().Append(text(L"Talks to the model on this console. No commands or tools.", 12, MUTED));
@@ -499,7 +528,20 @@ struct App : ApplicationT<App> {
         m_new.Content(box_value(L"New chat"));
         m_new.VerticalAlignment(VerticalAlignment::Center);
         m_new.Click([this](auto &&, auto &&) { new_chat(); });
-        place(top, m_new, 0, 1);
+        place(top, m_new, 0, 2);
+        // the language the voice is transcribed in, kept in the app's settings
+        auto saved = Windows::Storage::ApplicationData::Current().LocalSettings().Values().TryLookup(L"voice_lang");
+        if (saved) m_lang = unbox_value_or<int32_t>(saved, 0) % (int)std::size(k_langs);
+        m_lang_button = Button();
+        m_lang_button.VerticalAlignment(VerticalAlignment::Center);
+        m_lang_button.Click([this](auto &&, auto &&) {
+            m_lang = (m_lang + 1) % (int)std::size(k_langs);
+            Windows::Storage::ApplicationData::Current().LocalSettings().Values().Insert(L"voice_lang", box_value(m_lang));
+            show_lang();
+        });
+        m_lang_button.Visibility(Visibility::Collapsed);   // shown once the model hears
+        show_lang();
+        place(top, m_lang_button, 0, 1);
         place(chat, top, 0);
 
         m_chat_list = StackPanel();
@@ -537,9 +579,96 @@ struct App : ApplicationT<App> {
         });
         place(bottom, m_send, 0, 1);
         place(chat, bottom, 2);
+        m_voice = text(L"", 14, MUTED);
+        m_voice.Visibility(Visibility::Collapsed);
+        place(chat, m_voice, 3);
         // start next to the box: focusing the box itself would open the on-screen keyboard at launch
         m_send.Loaded([this](auto &&, auto &&) { m_send.Focus(FocusState::Programmatic); });
         return chat;
+    }
+
+    void show_lang() { m_lang_button.Content(box_value(std::wstring(L"Voice: ") + k_langs[m_lang].name)); }
+
+    /* ---------------------------------------------------------------- push-to-talk */
+
+    // Starts the microphone once the engine says it hears (LFM3-Audio with its projector).
+    void voice_start() {
+        if (m_voice_started) return;
+        m_voice_started = true;
+        m_lang_button.Visibility(Visibility::Visible);
+        m_voice.Visibility(Visibility::Visible);
+        m_voice.Text(L"Starting the microphone...");
+        std::thread(voice_init).detach();
+        m_pad_timer = DispatcherTimer();
+        m_pad_timer.Interval(std::chrono::milliseconds(50));
+        m_pad_timer.Tick([this](auto &&, auto &&) { pad_tick(); });
+        m_pad_timer.Start();
+    }
+
+    // Every 50 ms: the right trigger of any controller, and the line under the message box.
+    void pad_tick() {
+        const int vs = voice_state();
+        double rt = 0;
+        for (auto const &g : Windows::Gaming::Input::Gamepad::Gamepads()) rt = (std::max)(rt, g.GetCurrentReading().RightTrigger);
+        const bool held = rt > 0.5, can = vs == 1 && m_shown == RUNNING && !m_busy && !m_transcribing;
+        if (held && !m_listening && can) {
+            voice_begin();
+            m_listening = true;
+        } else if (!held && m_listening) {
+            m_listening = false;
+            double secs = 0;
+            std::vector<unsigned char> wav = voice_end(&secs);
+            if (secs < 0.4) note(L"Too short: hold RT while you speak.");
+            else transcribe(std::move(wav));
+        }
+        if (m_listening) {
+            // a level meter: one bar per 4 dB above -60 dBFS
+            int bars = (int)((voice_level() + 60) / 4);
+            bars = bars < 0 ? 0 : bars > 15 ? 15 : bars;
+            m_voice.Text(L"\x25cf Listening, release RT to send   " + std::wstring(bars, L'\x2588') + std::wstring(15 - bars, L'\x2591'));
+            m_voice.Foreground(brush(ICE));
+        } else if (!m_transcribing) {
+            std::wstring s = std::chrono::steady_clock::now() < m_note_until ? m_note
+                           : vs == 1 ? (m_busy ? L"Answering..." : L"Hold RT on the controller to talk")
+                                     : wide(voice_status());
+            if (std::wstring(m_voice.Text()) != s) m_voice.Text(s);
+            m_voice.Foreground(brush(vs < 0 ? AMBER : MUTED));
+        }
+    }
+
+    // a message on the voice line for a few seconds
+    void note(std::wstring const &s) {
+        m_note = s;
+        m_note_until = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    }
+
+    // Worker thread: the engine transcribes the recording; the text becomes the next message.
+    void transcribe(std::vector<unsigned char> wav) {
+        m_transcribing = true;
+        m_voice.Text(L"Transcribing...");
+        m_voice.Foreground(brush(MUTED));
+        std::string lang = k_langs[m_lang].code;
+        std::thread([this, wav = std::move(wav), lang] {
+            std::string resp;
+            server_local_transcribe(wav.data(), wav.size(), lang.c_str(),
+                                    [](void *u, const char *s, int n) { ((std::string *)u)->append(s, n); }, &resp);
+            size_t e = resp.find("\r\n\r\n");
+            bool ok = resp.compare(0, 12, "HTTP/1.1 200") == 0;
+            std::string body = e == std::string::npos ? "" : resp.substr(e + 4);
+            std::wstring text = ok ? wide(body) : L"", err = ok ? L"" : wide(error_message(body));
+            m_dispatcher.RunAsync(Windows::UI::Core::CoreDispatcherPriority::Normal, [this, text, err] {
+                m_transcribing = false;
+                std::wstring t = text;
+                t.erase(0, t.find_first_not_of(L" \t\r\n"));
+                t.erase(t.find_last_not_of(L" \t\r\n") + 1);
+                if (!err.empty()) note(L"[" + err + L"]");
+                else if (t.empty()) note(L"No speech heard: hold RT and speak closer to the microphone.");
+                else {
+                    m_input.Text(t);
+                    send();
+                }
+            });
+        }).detach();
     }
 
     // A message bubble; the caller fills the returned text block.
@@ -659,6 +788,8 @@ struct App : ApplicationT<App> {
                 m_ready = true;
                 m_since = std::chrono::steady_clock::now();
             }
+            // the engine hears (LFM3-Audio and its projector): push-to-talk with the headset
+            if (m_ready && !m_voice_started && raw.find("audio input: on") != std::string::npos) voice_start();
             if (m_cpu.empty()) m_cpu = log_field(raw, "CPU: ");
             if (m_kernel.empty()) m_kernel = log_field(raw, "kernel: ");
             m_log_follow = m_log_scroll.VerticalOffset() >= m_log_scroll.ScrollableHeight() - 30;

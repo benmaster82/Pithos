@@ -120,7 +120,7 @@ static wd::DeviceInformation pick_device(winrt::hstring const &headset) {
 
 // Asks for the microphone the way that shows the consent dialog: MediaCapture initialized for audio
 // on the UI thread (an AudioGraph alone only gets access denied). Returns its result.
-static HRESULT request_access() {
+HRESULT mic_request_access() {
     HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     HRESULT hr = E_PENDING;
     wm::Capture::MediaCapture mc{ nullptr };
@@ -238,7 +238,7 @@ void mic_probe(const std::wstring &local) {
             list_devices();
         }
         fprintf(stderr, "mic-probe: asking for the microphone (accept the dialog on the TV)\n");
-        HRESULT access = request_access();
+        HRESULT access = mic_request_access();
         fprintf(stderr, "mic-probe: microphone access 0x%08x%s\n", (unsigned)access, access == S_OK ? " (granted)" : "");
         record(local + L"\\mic-raw.wav", device, wm::Capture::MediaCategory::Other, "raw", 5);
         Sleep(1000);
