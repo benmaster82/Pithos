@@ -617,9 +617,21 @@ struct App : ApplicationT<App> {
         chat.RowSpacing(10);
         rows(chat, { fit(), star(), fit(), fit() });
 
+        // the title and New chat, then a row of the chat's settings (compact: the panel is narrow)
         Grid top;
         top.ColumnSpacing(10);
-        cols(top, { star(), fit(), fit(), fit(), fit(), fit() });
+        top.RowSpacing(8);
+        cols(top, { star(), fit() });
+        rows(top, { fit(), fit() });
+        StackPanel bar;
+        bar.Orientation(Orientation::Horizontal);
+        bar.Spacing(8);
+        place(top, bar, 1, 0);
+        Grid::SetColumnSpan(bar, 2);
+        auto compact = [](Button const &b) {
+            b.FontSize(13);
+            b.Padding(Thickness{ 10, 4, 10, 5 });
+        };
         StackPanel names;
         names.Children().Append(text(L"Chat", 17, TEXT, true));
         names.Children().Append(text(L"Talks to the model on this console. No commands or tools.", 12, MUTED));
@@ -628,13 +640,12 @@ struct App : ApplicationT<App> {
         m_new.Content(box_value(L"New chat"));
         m_new.VerticalAlignment(VerticalAlignment::Center);
         m_new.Click([this](auto &&, auto &&) { new_chat(); });
-        place(top, m_new, 0, 5);
+        place(top, m_new, 0, 1);
         m_talk_button = Button();
         m_talk_button.Content(box_value(L"Talk mode"));
         m_talk_button.VerticalAlignment(VerticalAlignment::Center);
         m_talk_button.Click([this](auto &&, auto &&) { enter_talk(); });
         m_talk_button.Visibility(Visibility::Collapsed);   // shown once the model hears and speaks
-        place(top, m_talk_button, 0, 4);
         // how much the model reasons before it answers (reasoning_effort), kept in the settings
         auto effort = Windows::Storage::ApplicationData::Current().LocalSettings().Values().TryLookup(L"reasoning");
         m_effort = effort ? unbox_value_or<int32_t>(effort, 0) % (int)std::size(k_efforts) : 0;
@@ -646,7 +657,8 @@ struct App : ApplicationT<App> {
             show_effort();
         });
         show_effort();
-        place(top, m_effort_button, 0, 3);
+        compact(m_effort_button);
+        bar.Children().Append(m_effort_button);
         // spoken answers, also kept in the app's settings
         auto read = Windows::Storage::ApplicationData::Current().LocalSettings().Values().TryLookup(L"read_answers");
         m_read_auto = read && unbox_value_or<bool>(read, false);
@@ -660,7 +672,6 @@ struct App : ApplicationT<App> {
         });
         m_read_button.Visibility(Visibility::Collapsed);   // shown once the model speaks
         show_read();
-        place(top, m_read_button, 0, 2);
         // the language the voice is transcribed in, kept in the app's settings
         auto saved = Windows::Storage::ApplicationData::Current().LocalSettings().Values().TryLookup(L"voice_lang");
         if (saved) m_lang = unbox_value_or<int32_t>(saved, 0) % (int)std::size(k_langs);
@@ -673,7 +684,10 @@ struct App : ApplicationT<App> {
         });
         m_lang_button.Visibility(Visibility::Collapsed);   // shown once the model hears
         show_lang();
-        place(top, m_lang_button, 0, 1);
+        for (Button const &b : { m_lang_button, m_read_button, m_talk_button }) {
+            compact(b);
+            bar.Children().Append(b);
+        }
         place(chat, top, 0);
 
         m_chat_list = StackPanel();
@@ -721,7 +735,7 @@ struct App : ApplicationT<App> {
 
     void show_lang() { m_lang_button.Content(box_value(std::wstring(L"Voice: ") + k_langs[m_lang].name)); }
     void show_effort() { m_effort_button.Content(box_value(std::wstring(L"Reasoning: ") + k_efforts[m_effort].name)); }
-    void show_read() { m_read_button.Content(box_value(m_read_auto ? L"Read answers: on" : L"Read answers: off")); }
+    void show_read() { m_read_button.Content(box_value(m_read_auto ? L"Read aloud: on" : L"Read aloud: off")); }
 
     /* ---------------------------------------------------------------- spoken answers */
 
