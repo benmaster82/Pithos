@@ -25,7 +25,7 @@ using namespace Windows::UI::Xaml::Media;
 
 namespace {
 
-const double W = 1600, H = 900, CX = 800, CY = 400;   // the design canvas and the centre of the HUD
+const double W = 1600, H = 900, CX = 800, CY = 385;   // the design canvas and the centre of the HUD
 const uint32_t DEEP = 0x020305, ICE = 0xa9cfe0, ICE_DIM = 0x5f8496, ICE_HI = 0xdff3fb, AMBER = 0xe8ad4f,
                TEXT = 0xe6f2f8, MUTED = 0x7d8e9c, MARK = 0xeef6fa;
 
@@ -361,29 +361,29 @@ UIElement TalkView::build(Shapes::Path mark) {
     m_user.TextWrapping(TextWrapping::Wrap);
     m_user.MaxLines(1);
     m_user.TextTrimming(TextTrimming::CharacterEllipsis);
-    at(m_user, CX - 650, 676);
+    at(m_user, CX - 650, 648);
     c.Children().Append(m_user);
     m_answer = label(30, TEXT);
     m_answer.Width(1300);
     m_answer.TextAlignment(TextAlignment::Center);
     m_answer.TextWrapping(TextWrapping::Wrap);
     m_answer.MaxLines(3);
-    m_answer.LineHeight(40);
-    at(m_answer, CX - 650, 712);
+    m_answer.LineHeight(38);
+    at(m_answer, CX - 650, 684);
     c.Children().Append(m_answer);
 
     // bottom: the state, the voice and reasoning, the controls
     m_status = label(18, ICE_DIM, true);
     m_status.CharacterSpacing(120);
-    at(m_status, 60, 838);
+    at(m_status, 60, 846);
     c.Children().Append(m_status);
     m_info = label(15, MUTED);
-    at(m_info, 60, 812);
+    at(m_info, 370, 849);
     c.Children().Append(m_info);
     m_hint = label(15, MUTED);
     m_hint.Width(900);
     m_hint.TextAlignment(TextAlignment::Right);
-    at(m_hint, W - 60 - 900, 840);
+    at(m_hint, W - 60 - 900, 849);
     c.Children().Append(m_hint);
     return root;
 }
