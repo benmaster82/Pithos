@@ -12,6 +12,7 @@
  * (Hann window, overlap-add divided by the window's squared sum, 480 samples trimmed at each end). */
 #include "speech.h"
 #include "model.h"
+#include "gpu_dx.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,6 +36,7 @@
 struct Speech {
     Model depth, codec;
     Context *dc, *cc;
+    Dx *ddx, *cdx;                  /* speech_use_dx: their matmuls on Direct3D 12 */
     ThreadPool *pool;
     int lm_dim, D, CD, max_pos;   /* D: depth decoder width, CD: codec width */
     Mat proj_in, embd, out_embd, in_proj, out_proj;
@@ -55,6 +57,8 @@ void speech_free(Speech *s) {
     if (!s) return;
     ctx_free(s->dc);
     ctx_free(s->cc);
+    dx_destroy(s->ddx);
+    dx_destroy(s->cdx);
     model_free(&s->depth);
     model_free(&s->codec);
     free(s->hist);
@@ -126,6 +130,18 @@ Speech *speech_load(const char *mmproj, ThreadPool *pool, int lm_dim, const char
     }
     speech_reset(s);
     return s;
+}
+
+int speech_use_dx(Speech *s, int device, char *info, int infolen) {
+    info[0] = 0;
+    /* opt-in: on a laptop GTX 1650 the many small submits made both slower (depth 22 -> 32 ms) */
+    const char *env = getenv("PITHOS_SPEECH_DX");
+    if (!env || env[0] != '1') return 0;
+    char di[256] = "", ci[256] = "", more[256];
+    if ((s->ddx = dx_create(&s->depth, device, di, sizeof(di))) != NULL) ctx_set_dx(s->dc, s->ddx, more, sizeof(more));
+    if ((s->cdx = dx_create(&s->codec, device, ci, sizeof(ci))) != NULL) ctx_set_dx(s->cc, s->cdx, more, sizeof(more));
+    snprintf(info, (size_t)infolen, "depth decoder %s, codec %s", s->ddx ? "on Direct3D 12" : di, s->cdx ? "on Direct3D 12" : ci);
+    return s->ddx || s->cdx;
 }
 
 void speech_reset(Speech *s) {

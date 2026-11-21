@@ -1084,6 +1084,7 @@ static int real_main(int argc, char **argv) {
         if (srv_audio) {   /* and speaks */
             srv_speech = speech_load(mp, pool, m.dim, base, 1500, err, sizeof(err));
             if (!srv_speech) fprintf(stderr, "note: no speech output: %s\n", err);
+            else if (dx && speech_use_dx(srv_speech, a.gpu_device, err, sizeof(err))) fprintf(stderr, "speech output: %s\n", err);
         }
     }
     if (au && !a.audio) fprintf(stderr, "audio input: on%s (%s)\n", srv_speech ? ", speech output: on" : "", mp);
@@ -1098,6 +1099,7 @@ static int real_main(int argc, char **argv) {
         if (bn && bl < sizeof(base)) { memcpy(base, bn, bl); base[bl] = 0; }
         Speech *sp = speech_load(mp, pool, m.dim, base, a.n_ctx, err, sizeof(err));
         if (!sp) { fprintf(stderr, "error: %s\n", err); return 1; }
+        if (dx && speech_use_dx(sp, a.gpu_device, err, sizeof(err))) fprintf(stderr, "speech output: %s\n", err);
         status = tts_run(&e, sp, &a);
         speech_free(sp);
         audio_free(au);
