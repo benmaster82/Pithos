@@ -159,8 +159,13 @@ std::vector<unsigned char> voice_end(double *secs) {
     memcpy(&w[0], "RIFF", 4); u32(4, (uint32_t)(36 + frames * 2)); memcpy(&w[8], "WAVEfmt ", 8);
     u32(16, 16); u16(20, 1); u16(22, 1); u32(24, g_rate); u32(28, g_rate * 2); u16(32, 2); u16(34, 16);
     memcpy(&w[36], "data", 4); u32(40, (uint32_t)(frames * 2));
+    // the headset records quietly, and the engine takes a clip under -44 dBFS for silence: the
+    // peak is brought to -3 dBFS (at most +30 dB, so that a silent take stays silent)
+    float peak = 0;
+    for (size_t i = 0; i < frames; i++) peak = fmaxf(peak, fabsf(x[i * g_ch + pick]));
+    const float gain = peak > 0 ? fminf(0.708f / peak, 31.6f) : 1;
     for (size_t i = 0; i < frames; i++) {
-        float a = x[i * g_ch + pick];
+        float a = x[i * g_ch + pick] * gain;
         a = a > 1 ? 1 : a < -1 ? -1 : a;
         int16_t q = (int16_t)lrintf(a * 32767);
         memcpy(&w[44 + i * 2], &q, 2);

@@ -2367,19 +2367,29 @@ static void handle_speech(Conn *c, const Json *body) {
     else if (!whole) send_head(c, 200, sink.mp3 ? "audio/mpeg" : "audio/pcm", -1);
     const int started = h != NULL;
     int ok = started;
-    double first = 0;
+    double first = 0, tt[3] = { 0 };   /* PITHOS_SPEECH_PROFILE: depth decoder, codec, language model */
     while (h && frames < max_frames) {
         int codes[SPEECH_CODEBOOKS];
+        const double t1 = time_sec();
         if (speech_frame(S.cfg.speech, h, &sp, &rng, codes)) break;
+        const double t2 = time_sec();
         const int k = speech_decode(S.cfg.speech, codes, pcm + n);
+        const double t3 = time_sec();
         if (!whole && ok) ok = sink_pcm(&sink, pcm + n, k);
         if (k && !first) first = time_sec() - t0;
         n += k;
         frames++;
         if ((frames & 15) == 0 && conn_gone(c)) { g.finish = FIN_ABORT; break; }
         speech_embed(S.cfg.speech, codes, row);
+        const double t4 = time_sec();
         h = pcache_feed(S.pc, &id, 1) ? ctx_hidden(S.ctx) : NULL;
+        tt[0] += t2 - t1;
+        tt[1] += t3 - t2;
+        tt[2] += time_sec() - t4;
     }
+    if (getenv("PITHOS_SPEECH_PROFILE") && frames)
+        fprintf(stderr, "[speech] per frame: depth decoder %.1f ms, codec %.1f ms, language model %.1f ms\n",
+                1e3 * tt[0] / frames, 1e3 * tt[1] / frames, 1e3 * tt[2] / frames);
     const int k = ok ? speech_flush(S.cfg.speech, pcm + n) : 0;
     if (!whole && ok && g.finish != FIN_ABORT) ok = sink_pcm(&sink, pcm + n, k) && (!sink.mp3 || mp3_finish(sink.mp3));
     n += k;

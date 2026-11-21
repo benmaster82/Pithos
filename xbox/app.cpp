@@ -156,6 +156,19 @@ static void server_thread(std::wstring local) {
     // the TV chat and push-to-talk requests appear in the log like the network ones
     server_log_local(1);
 
+    // LocalState\pithos.env: environment variables for the engine, one NAME=VALUE per line
+    // (an app gets no environment from outside; for example PITHOS_SPEECH_PROFILE=1)
+    std::string env = read_tail(local + L"\\pithos.env", 4096);
+    for (size_t p = 0; p < env.size();) {
+        size_t e = env.find_first_of("\r\n", p);
+        std::string line = env.substr(p, e == std::string::npos ? std::string::npos : e - p);
+        p = e == std::string::npos ? env.size() : e + 1;
+        size_t eq = line.find('=');
+        if (eq == std::string::npos || eq == 0) continue;
+        _putenv_s(line.substr(0, eq).c_str(), line.substr(eq + 1).c_str());
+        fprintf(stderr, "pithos: environment %s\n", line.c_str());
+    }
+
     // CPU by default: the GPU (Direct3D 12) needs the app type Game, and is asked for in pithos.args
     std::vector<std::string> args = { "pithos", "--server", "--host", "0.0.0.0", "--port", "8080",
                                       "--gpu", "off", "-m", utf8(model) };
