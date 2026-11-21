@@ -71,13 +71,19 @@ static std::wstring wide(const std::string &s) {
     return w;
 }
 
-// First *.gguf in dir and its size, or an empty string.
+// First *.gguf in dir that is not a projector (mmproj-*), and its size, or an empty string.
 static std::wstring find_model(const std::wstring &dir, unsigned long long *size) {
     WIN32_FIND_DATAW fd;
     HANDLE h = FindFirstFileExW((dir + L"\\*.gguf").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr, 0);
     if (h == INVALID_HANDLE_VALUE) return L"";
-    std::wstring found = dir + L"\\" + fd.cFileName;
-    *size = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+    std::wstring found;
+    do {
+        if (_wcsnicmp(fd.cFileName, L"mmproj", 6)) {
+            found = dir + L"\\" + fd.cFileName;
+            *size = ((unsigned long long)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            break;
+        }
+    } while (FindNextFileW(h, &fd));
     FindClose(h);
     return found;
 }

@@ -7,6 +7,7 @@
     python xbox/deploy.py --xbox CONSOLE-IP files             # list LocalState
     python xbox/deploy.py --xbox CONSOLE-IP get mic-raw.wav   # download a file from LocalState
     python xbox/deploy.py --xbox CONSOLE-IP touch mic-probe   # an empty file there (a probe switch)
+    python xbox/deploy.py --xbox CONSOLE-IP rm mic-probe      # delete a file from LocalState
     python xbox/deploy.py --xbox CONSOLE-IP stop
 
 More engine options go in a pithos.args file in LocalState (for example "-t 6" or "-c 8192"),
@@ -183,6 +184,12 @@ def cmd_touch(px, a):
     print("created", a.name)
 
 
+def cmd_rm(px, a):
+    p = need_package(px)
+    px.request("DELETE", "/api/filesystem/apps/file?" + local_state(p, {"filename": a.name}))
+    print("removed", a.name)
+
+
 def cmd_launch(px, a):
     p = need_package(px)
     px.request("POST", f"/api/taskmanager/app?appid={b64(p['PackageRelativeId'])}&package={b64(p['PackageFullName'])}")
@@ -208,12 +215,13 @@ def main():
     l = sub.add_parser("log"); l.add_argument("name", nargs="?", default="pithos.log")
     g = sub.add_parser("get"); g.add_argument("name"); g.add_argument("-o", "--out")
     t = sub.add_parser("touch"); t.add_argument("name")
+    r = sub.add_parser("rm"); r.add_argument("name")
     sub.add_parser("launch")
     sub.add_parser("stop")
     a = ap.parse_args()
     px = Portal(a.xbox, a.port, a.user, a.password)
     {"install": cmd_install, "upload": cmd_upload, "files": cmd_files, "log": cmd_log, "get": cmd_get,
-     "touch": cmd_touch, "launch": cmd_launch, "stop": cmd_stop}[a.cmd](px, a)
+     "touch": cmd_touch, "rm": cmd_rm, "launch": cmd_launch, "stop": cmd_stop}[a.cmd](px, a)
 
 
 if __name__ == "__main__":
