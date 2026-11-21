@@ -595,6 +595,7 @@ struct App : ApplicationT<App> {
     void voice_start() {
         if (m_voice_started) return;
         m_voice_started = true;
+        fprintf(stderr, "voice: the model hears, starting push-to-talk\n");
         m_lang_button.Visibility(Visibility::Visible);
         m_voice.Visibility(Visibility::Visible);
         m_voice.Text(L"Starting the microphone...");
@@ -608,6 +609,9 @@ struct App : ApplicationT<App> {
     // Every 50 ms: the right trigger of any controller, and the line under the message box.
     void pad_tick() {
         const int vs = voice_state();
+        static int ticks, last_vs = 2;
+        if (ticks++ < 2 || vs != last_vs) fprintf(stderr, "voice: pad tick %d, state %d\n", ticks, vs);
+        last_vs = vs;
         double rt = 0;
         for (auto const &g : Windows::Gaming::Input::Gamepad::Gamepads()) rt = (std::max)(rt, g.GetCurrentReading().RightTrigger);
         const bool held = rt > 0.5, can = vs == 1 && m_shown == RUNNING && !m_busy && !m_transcribing;

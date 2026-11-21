@@ -21,6 +21,7 @@
 #include <winrt/Windows.Media.h>
 #include <winrt/Windows.Media.Audio.h>
 #include <winrt/Windows.Media.Capture.h>
+#include <winrt/Windows.Media.Devices.h>
 #include <winrt/Windows.Media.MediaProperties.h>
 #include <winrt/Windows.Media.Render.h>
 
@@ -50,7 +51,9 @@ static void set_status(int state, const std::string &s) {
 void voice_init() {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
     try {
+        fprintf(stderr, "voice: asking for the microphone\n");
         HRESULT hr = mic_request_access();
+        fprintf(stderr, "voice: microphone access 0x%08x\n", (unsigned)hr);
         if (hr != S_OK) {
             char m[160];
             snprintf(m, sizeof(m), hr == E_ACCESSDENIED
@@ -63,18 +66,33 @@ void voice_init() {
         auto gr = wa::AudioGraph::CreateAsync(settings).get();
         if (gr.Status() != wa::AudioGraphCreationStatus::Success) { set_status(-1, "no audio graph"); return; }
         g_graph = gr.Graph();
-        auto ir = g_graph.CreateDeviceInputNodeAsync(wm::Capture::MediaCategory::Speech).get();
+        fprintf(stderr, "voice: audio graph created\n");
+        // the default capture device, named: a node made without one has a null Device()
+        winrt::hstring id = wm::Devices::MediaDevice::GetDefaultAudioCaptureId(wm::Devices::AudioDeviceRole::Communications);
+        if (id.empty()) id = wm::Devices::MediaDevice::GetDefaultAudioCaptureId(wm::Devices::AudioDeviceRole::Default);
+        if (id.empty()) {
+            set_status(-1, "no headset microphone: plug a headset into the controller and restart");
+            return;
+        }
+        auto device = winrt::Windows::Devices::Enumeration::DeviceInformation::CreateFromIdAsync(id).get();
+        auto ir = g_graph.CreateDeviceInputNodeAsync(wm::Capture::MediaCategory::Speech, g_graph.EncodingProperties(), device).get();
         if (ir.Status() != wa::AudioDeviceNodeCreationStatus::Success) {
             set_status(-1, "no headset microphone: plug a headset into the controller and restart");
             return;
         }
         auto in = ir.DeviceInputNode();
+        fprintf(stderr, "voice: input node created\n");
         g_out = g_graph.CreateFrameOutputNode();
+        fprintf(stderr, "voice: frame output node created\n");
         in.AddOutgoingConnection(g_out);
+        fprintf(stderr, "voice: connected\n");
         auto ep = g_graph.EncodingProperties();
         g_rate = (int)ep.SampleRate();
         g_ch = (int)ep.ChannelCount();
+        fprintf(stderr, "voice: %d Hz x %d ch\n", g_rate, g_ch);
         g_graph.QuantumStarted([](wa::AudioGraph const &, wf::IInspectable const &) {
+            static int calls;
+            if (calls++ < 2) fprintf(stderr, "voice: quantum %d\n", calls);
             auto frame = g_out.GetFrame();
             auto buf = frame.LockBuffer(wm::AudioBufferAccessMode::Read);
             auto ref = buf.CreateReference();
@@ -96,9 +114,11 @@ void voice_init() {
                 g_pcm.insert(g_pcm.end(), x, x + n);
             }
         });
+        fprintf(stderr, "voice: handler registered\n");
         g_graph.Start();
+        fprintf(stderr, "voice: graph started\n");
         char m[160];
-        snprintf(m, sizeof(m), "microphone \"%s\", %d Hz x %d ch", winrt::to_string(in.Device().Name()).c_str(), g_rate, g_ch);
+        snprintf(m, sizeof(m), "microphone \"%s\", %d Hz x %d ch", winrt::to_string(device.Name()).c_str(), g_rate, g_ch);
         set_status(1, m);
         // the graph lives in this thread's apartment: the thread stays for the life of the app
         for (;;) Sleep(INFINITE);
