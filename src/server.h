@@ -63,5 +63,8 @@ void server_local_chat(const char *body, int len, void (*sink)(void *u, const ch
  * as a /v1/audio/transcriptions response with response_format "text" (head, then the text). */
 void server_local_transcribe(const unsigned char *wav, size_t len, const char *lang,
                              void (*sink)(void *u, const char *s, int n), void *u);
+/* Log the in-process requests like the network ones (peer "local"); off by default, since the
+ * terminal agent shows its own statistics. */
+void server_log_local(int on);
 
 #endif

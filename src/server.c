@@ -1842,8 +1842,12 @@ static void gen_free(Gen *g) {
     buf_free(&g->calls);
 }
 
+static int local_log;   /* server_log_local: log the in-process requests too */
+
+void server_log_local(int on) { local_log = on; }
+
 static void log_request(const char *what, Gen *g) {
-    if (g->c->sink) return; /* the in-process client shows its own statistics */
+    if (g->c->sink && !local_log) return; /* the in-process client shows its own statistics */
     int pn = g->n_prompt - g->n_reused;
     fprintf(stderr, "[%s] %s | prompt %d tok (%d cached, %d processed, %.1f tok/s) | answer %d tok, %.2f tok/s | %s\n",
             g->c->peer, what, g->n_prompt, g->n_reused, pn, pn / (g->t_prompt > 0 ? g->t_prompt : 1e-9), g->n_gen,

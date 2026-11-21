@@ -47,6 +47,7 @@ void server_local_chat(const char *body, int len, void (*sink)(void *u, const ch
                        volatile int *stop);
 void server_local_transcribe(const unsigned char *wav, size_t len, const char *lang,
                              void (*sink)(void *u, const char *s, int n), void *u);
+void server_log_local(int on);
 }
 
 // voice.cpp: push-to-talk capture from the controller's headset
@@ -152,6 +153,8 @@ static void server_thread(std::wstring local) {
 
     // the agent keeps its workspace next to the process; LocalState is the writable folder
     SetCurrentDirectoryW(local.c_str());
+    // the TV chat and push-to-talk requests appear in the log like the network ones
+    server_log_local(1);
 
     // CPU by default: the GPU (Direct3D 12) needs the app type Game, and is asked for in pithos.args
     std::vector<std::string> args = { "pithos", "--server", "--host", "0.0.0.0", "--port", "8080",
@@ -388,7 +391,7 @@ struct App : ApplicationT<App> {
     int m_lang = 0;
     bool m_voice_started = false, m_listening = false, m_transcribing = false;
     std::wstring m_note;
-    std::chrono::steady_clock::time_point m_note_until;
+    std::chrono::steady_clock::time_point m_note_until, m_released;
 
     App() {
         RequestedTheme(ApplicationTheme::Dark);
@@ -609,17 +612,19 @@ struct App : ApplicationT<App> {
     // Every 50 ms: the right trigger of any controller, and the line under the message box.
     void pad_tick() {
         const int vs = voice_state();
-        static int ticks, last_vs = 2;
-        if (ticks++ < 2 || vs != last_vs) fprintf(stderr, "voice: pad tick %d, state %d\n", ticks, vs);
-        last_vs = vs;
         double rt = 0;
         for (auto const &g : Windows::Gaming::Input::Gamepad::Gamepads()) rt = (std::max)(rt, g.GetCurrentReading().RightTrigger);
         const bool held = rt > 0.5, can = vs == 1 && m_shown == RUNNING && !m_busy && !m_transcribing;
+        auto now = std::chrono::steady_clock::now();
+        if (held) m_released = {};
         if (held && !m_listening && can) {
             voice_begin();
             m_listening = true;
-        } else if (!held && m_listening) {
+        } else if (!held && m_listening && m_released == std::chrono::steady_clock::time_point{}) {
+            m_released = now;   // the last syllable often ends after the trigger is let go
+        } else if (!held && m_listening && now - m_released >= std::chrono::milliseconds(250)) {
             m_listening = false;
+            m_released = {};
             double secs = 0;
             std::vector<unsigned char> wav = voice_end(&secs);
             if (secs < 0.4) note(L"Too short: hold RT while you speak.");
