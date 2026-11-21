@@ -241,9 +241,23 @@ static void depth_pass(Speech *s, const int *codes, const int *want, int nw) {
     s->prof[3] += time_sec() - t2;
 }
 
-static int cmp_desc(const void *a, const void *b) {
-    const float x = *(const float *)a, y = *(const float *)b;
-    return (x < y) - (x > y);
+/* the k-th largest of a[0..n) (k >= 1), by selection: a is reordered */
+static float kth_largest(float *a, int n, int k) {
+    int lo = 0, hi = n - 1;
+    const int want = k - 1;   /* its index once a is in descending order */
+    while (lo < hi) {
+        const float p = a[lo + (hi - lo) / 2];
+        int i = lo, j = hi;
+        while (i <= j) {
+            while (a[i] > p) i++;
+            while (a[j] < p) j--;
+            if (i <= j) { const float t = a[i]; a[i] = a[j]; a[j] = t; i++; j--; }
+        }
+        if (want <= j) hi = j;
+        else if (want >= i) lo = i;
+        else break;
+    }
+    return a[want];
 }
 
 /* a code of codebook cb from its logits: repetition penalty over its recent codes, then
@@ -268,8 +282,7 @@ static int sample_code(Speech *s, float *l, int cb, const SpeechParams *p, uint6
     if (p->top_k > 0 && p->top_k < NCODE) {
         float tmp[NCODE];
         memcpy(tmp, l, sizeof(tmp));
-        qsort(tmp, NCODE, sizeof(float), cmp_desc);
-        lmin = tmp[p->top_k - 1];
+        lmin = kth_largest(tmp, NCODE, p->top_k);
     }
     double prob[NCODE], sum = 0;
     for (int v = 0; v < NCODE; v++) {
