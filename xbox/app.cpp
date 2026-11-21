@@ -491,6 +491,8 @@ struct App : ApplicationT<App> {
             m_local = Windows::Storage::ApplicationData::Current().LocalFolder().Path();
             m_ip = lan_address();
             window.Content(build());
+            // the last session's log goes now, before the first look at it: it would say "ready" early
+            if (FILE *f = _wfopen((m_local + L"\\pithos.log").c_str(), L"w")) fclose(f);
             std::thread(server_thread, m_local).detach();
             m_timer = DispatcherTimer();
             m_timer.Interval(std::chrono::milliseconds(500));
