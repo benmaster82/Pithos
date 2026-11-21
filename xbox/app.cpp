@@ -71,6 +71,11 @@ void voice_play_stop();
 double voice_play_buffered();
 
 
+// the reasoning levels of the chat (the server's reasoning_effort: off, up to 512 or 2048 tokens, as long as it wants)
+static const struct { const char *code; const wchar_t *name; } k_efforts[] = {
+    { "off", L"off" }, { "low", L"low" }, { "medium", L"medium" }, { "high", L"high" },
+};
+
 // the languages the voice can be transcribed in: code for the engine, name for the screen
 static const struct { const char *code; const wchar_t *name; } k_langs[] = {
     { "it", L"Italiano" }, { "en", L"English" }, { "fr", L"Fran\x00e7" L"ais" }, { "de", L"Deutsch" },
@@ -444,6 +449,8 @@ struct App : ApplicationT<App> {
     Button m_lang_button{ nullptr };
     int m_lang = 0;
     bool m_voice_started = false, m_listening = false, m_transcribing = false;
+    Button m_effort_button{ nullptr };
+    int m_effort = 0;   // k_efforts
     // spoken answers: Y reads the last answer (or stops), "Read answers" reads each one
     Button m_read_button{ nullptr };
     bool m_can_speak = false, m_read_auto = false, m_prev_y = false;
@@ -582,7 +589,7 @@ struct App : ApplicationT<App> {
 
         Grid top;
         top.ColumnSpacing(10);
-        cols(top, { star(), fit(), fit(), fit() });
+        cols(top, { star(), fit(), fit(), fit(), fit() });
         StackPanel names;
         names.Children().Append(text(L"Chat", 17, TEXT, true));
         names.Children().Append(text(L"Talks to the model on this console. No commands or tools.", 12, MUTED));
@@ -591,7 +598,19 @@ struct App : ApplicationT<App> {
         m_new.Content(box_value(L"New chat"));
         m_new.VerticalAlignment(VerticalAlignment::Center);
         m_new.Click([this](auto &&, auto &&) { new_chat(); });
-        place(top, m_new, 0, 3);
+        place(top, m_new, 0, 4);
+        // how much the model reasons before it answers (reasoning_effort), kept in the settings
+        auto effort = Windows::Storage::ApplicationData::Current().LocalSettings().Values().TryLookup(L"reasoning");
+        m_effort = effort ? unbox_value_or<int32_t>(effort, 0) % (int)std::size(k_efforts) : 0;
+        m_effort_button = Button();
+        m_effort_button.VerticalAlignment(VerticalAlignment::Center);
+        m_effort_button.Click([this](auto &&, auto &&) {
+            m_effort = (m_effort + 1) % (int)std::size(k_efforts);
+            Windows::Storage::ApplicationData::Current().LocalSettings().Values().Insert(L"reasoning", box_value(m_effort));
+            show_effort();
+        });
+        show_effort();
+        place(top, m_effort_button, 0, 3);
         // spoken answers, also kept in the app's settings
         auto read = Windows::Storage::ApplicationData::Current().LocalSettings().Values().TryLookup(L"read_answers");
         m_read_auto = read && unbox_value_or<bool>(read, false);
@@ -665,6 +684,7 @@ struct App : ApplicationT<App> {
     }
 
     void show_lang() { m_lang_button.Content(box_value(std::wstring(L"Voice: ") + k_langs[m_lang].name)); }
+    void show_effort() { m_effort_button.Content(box_value(std::wstring(L"Reasoning: ") + k_efforts[m_effort].name)); }
     void show_read() { m_read_button.Content(box_value(m_read_auto ? L"Read answers: on" : L"Read answers: off")); }
 
     /* ---------------------------------------------------------------- spoken answers */
@@ -920,7 +940,7 @@ struct App : ApplicationT<App> {
         scroll_chat();
 
         Buf b = {};
-        buf_add(&b, "{\"stream\":true,\"messages\":[", -1);
+        buf_printf(&b, "{\"stream\":true,\"reasoning_effort\":\"%s\",\"messages\":[", k_efforts[m_effort].code);
         for (size_t i = 0; i < m_history.size(); i++) {
             buf_printf(&b, "%s{\"role\":\"%s\",\"content\":", i ? "," : "", m_history[i].first.c_str());
             buf_json_str(&b, m_history[i].second.data(), (int)m_history[i].second.size());
