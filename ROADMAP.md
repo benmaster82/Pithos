@@ -115,6 +115,27 @@ prompt 328 tok/s, generation 82 (Direct3D 12: 336 / 70).
   answers from a larger model on another Pithos server (a setting of the page).
 - [ ] **Live ASR** (`Perform live ASR.`, English, ~1 s chunks): captions while the user speaks.
 
+## 9. Tools for the Xbox app
+The app cannot start processes and sees only its LocalState folder, so the terminal agent's tools
+(files, commands, web through `curl`) do not apply there; it can use the network. Tools written
+for it, few and simple, since LFM3-Audio is a ~2B model:
+
+- [ ] **Measure first**: from the PC, send the Xbox server 3-4 mock tools (calculator, time, weather,
+  notes) and ~20 typical spoken requests; count the right tool with the right arguments. This says
+  whether the model is up to it and how much prompt work it needs.
+- [ ] **Offline tools**, in keeping with "what you say stays here": a calculator (the model gets
+  arithmetic wrong: 17 x 23 came out as 0.74), the date and time (or just put them in the prompt),
+  timers and reminders spoken and shown on the TV, notes and memory kept in LocalState. Where a
+  deterministic shortcut is sure (an arithmetic expression), the program answers without a tool call.
+- [ ] **Online tools behind a switch** ("Online tools: on/off", the prompt changing with it): weather
+  (Open-Meteo, no key), Wikipedia summaries; web search later. HTTP from the app or the engine,
+  not `curl`.
+- [ ] **Home automation** for those who have it: Home Assistant's REST API on the local network.
+- [ ] **On screen**: a tool call adds a model turn (1-3 s); Talk mode shows it ("checking the
+  weather...").
+- Not possible or not advised: system settings, other apps and their files; launching apps (the
+  app would go to the background, and in Game mode be suspended with the engine).
+
 ## Done
 - v0.7.5: Qwen3.6-35B-A3B (experimental), on the CPU and with Vulkan (every layer on the GPU, the
   routed experts on the CPU, the most used ones in VRAM; prompt halves overlapped with the CPU);
