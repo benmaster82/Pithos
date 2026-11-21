@@ -96,21 +96,46 @@ static void play_quantum(wa::AudioFrameInputNode const &node, wa::FrameInputNode
 
 static void play_init() {
     try {
-        wa::AudioGraphSettings settings(wm::Render::AudioRenderCategory::Speech);
-        auto gr = wa::AudioGraph::CreateAsync(settings).get();
-        if (gr.Status() != wa::AudioGraphCreationStatus::Success) { fprintf(stderr, "voice: no audio output graph\n"); return; }
-        auto graph = gr.Graph();
-        auto outr = graph.CreateDeviceOutputNodeAsync().get();
-        if (outr.Status() != wa::AudioDeviceNodeCreationStatus::Success) { fprintf(stderr, "voice: no audio output device\n"); return; }
+        // the first render category the console accepts, on the default render device
+        using wm::Render::AudioRenderCategory;
+        const AudioRenderCategory cats[] = { AudioRenderCategory::GameMedia, AudioRenderCategory::Media,
+                                             AudioRenderCategory::Other, AudioRenderCategory::Speech };
+        const char *names[] = { "GameMedia", "Media", "Other", "Speech" };
+        winrt::hstring id = wm::Devices::MediaDevice::GetDefaultAudioRenderId(wm::Devices::AudioDeviceRole::Default);
+        winrt::Windows::Devices::Enumeration::DeviceInformation dev{ nullptr };
+        if (!id.empty()) dev = winrt::Windows::Devices::Enumeration::DeviceInformation::CreateFromIdAsync(id).get();
+        wa::AudioGraph graph{ nullptr };
+        wa::AudioDeviceOutputNode out{ nullptr };
+        for (int k = 0; k < 4 && !out; k++) {
+            wa::AudioGraphSettings settings(cats[k]);
+            if (dev) settings.PrimaryRenderDevice(dev);
+            auto gr = wa::AudioGraph::CreateAsync(settings).get();
+            if (gr.Status() != wa::AudioGraphCreationStatus::Success) {
+                fprintf(stderr, "voice: audio output graph (%s): status %d, 0x%08x\n", names[k], (int)gr.Status(),
+                        (unsigned)gr.ExtendedError().value);
+                continue;
+            }
+            auto outr = gr.Graph().CreateDeviceOutputNodeAsync().get();
+            if (outr.Status() != wa::AudioDeviceNodeCreationStatus::Success) {
+                fprintf(stderr, "voice: audio output node (%s): status %d, 0x%08x\n", names[k], (int)outr.Status(),
+                        (unsigned)outr.ExtendedError().value);
+                gr.Graph().Close();
+                continue;
+            }
+            graph = gr.Graph();
+            out = outr.DeviceOutputNode();
+        }
+        if (!out) { fprintf(stderr, "voice: no audio output device\n"); return; }
         auto props = graph.EncodingProperties();
         props.ChannelCount(1);
         g_prate = (int)props.SampleRate();
         g_pin = graph.CreateFrameInputNode(props);
-        g_pin.AddOutgoingConnection(outr.DeviceOutputNode());
+        g_pin.AddOutgoingConnection(out);
         g_pin.QuantumStarted(play_quantum);
         g_pgraph = graph;
         g_pgraph.Start();
-        fprintf(stderr, "voice: speech out to \"%s\", %d Hz\n", winrt::to_string(outr.DeviceOutputNode().Device().Name()).c_str(), g_prate);
+        fprintf(stderr, "voice: speech out to \"%s\", %d Hz\n", dev ? winrt::to_string(dev.Name()).c_str() : "the default device",
+                g_prate);
     } catch (winrt::hresult_error const &e) {
         fprintf(stderr, "voice: audio output error 0x%08x\n", (unsigned)e.code());
     }
