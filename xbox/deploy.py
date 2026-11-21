@@ -5,6 +5,8 @@
     python xbox/deploy.py --xbox CONSOLE-IP launch
     python xbox/deploy.py --xbox CONSOLE-IP log               # LocalState\\pithos.log
     python xbox/deploy.py --xbox CONSOLE-IP files             # list LocalState
+    python xbox/deploy.py --xbox CONSOLE-IP get mic-raw.wav   # download a file from LocalState
+    python xbox/deploy.py --xbox CONSOLE-IP touch mic-probe   # an empty file there (a probe switch)
     python xbox/deploy.py --xbox CONSOLE-IP stop
 
 More engine options go in a pithos.args file in LocalState (for example "-t 6" or "-c 8192"),
@@ -159,6 +161,28 @@ def cmd_log(px, a):
         sys.exit(f"{a.name} not found ({e.code}): has the app been started?")
 
 
+def cmd_get(px, a):
+    p = need_package(px)
+    try:
+        status, data = px.request("GET", "/api/filesystem/apps/file?" + local_state(p, {"filename": a.name}))
+    except urllib.error.HTTPError as e:
+        sys.exit(f"{a.name} not found ({e.code})")
+    out = a.out or a.name
+    with open(out, "wb") as f:
+        f.write(data)
+    print(f"{a.name} -> {out} ({len(data):,} bytes)")
+
+
+def cmd_touch(px, a):
+    """an empty file in LocalState, e.g. the mic-probe or gpu-probe switch"""
+    p = need_package(px)
+    tmp = os.path.join(os.environ.get("TEMP", "."), a.name)
+    open(tmp, "wb").close()
+    px.upload("/api/filesystem/apps/file?" + local_state(p), [tmp], progress=False)
+    os.remove(tmp)
+    print("created", a.name)
+
+
 def cmd_launch(px, a):
     p = need_package(px)
     px.request("POST", f"/api/taskmanager/app?appid={b64(p['PackageRelativeId'])}&package={b64(p['PackageFullName'])}")
@@ -182,12 +206,14 @@ def main():
     u = sub.add_parser("upload"); u.add_argument("file")
     sub.add_parser("files")
     l = sub.add_parser("log"); l.add_argument("name", nargs="?", default="pithos.log")
+    g = sub.add_parser("get"); g.add_argument("name"); g.add_argument("-o", "--out")
+    t = sub.add_parser("touch"); t.add_argument("name")
     sub.add_parser("launch")
     sub.add_parser("stop")
     a = ap.parse_args()
     px = Portal(a.xbox, a.port, a.user, a.password)
-    {"install": cmd_install, "upload": cmd_upload, "files": cmd_files, "log": cmd_log,
-     "launch": cmd_launch, "stop": cmd_stop}[a.cmd](px, a)
+    {"install": cmd_install, "upload": cmd_upload, "files": cmd_files, "log": cmd_log, "get": cmd_get,
+     "touch": cmd_touch, "launch": cmd_launch, "stop": cmd_stop}[a.cmd](px, a)
 
 
 if __name__ == "__main__":

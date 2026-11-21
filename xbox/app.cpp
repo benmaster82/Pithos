@@ -84,6 +84,7 @@ static std::wstring find_model(const std::wstring &dir, unsigned long long *size
 
 static std::string read_tail(const std::wstring &path, size_t max);
 void gpu_probe(void);   // gpu_probe.cpp
+void mic_probe(const std::wstring &local);   // mic_probe.cpp
 
 static void server_thread(std::wstring local) {
     // stdout and stderr both go to pithos.log, opened shared so the Device Portal and the screen
@@ -102,6 +103,7 @@ static void server_thread(std::wstring local) {
     }
 
     if (GetFileAttributesW((local + L"\\gpu-probe").c_str()) != INVALID_FILE_ATTRIBUTES) gpu_probe();
+    if (GetFileAttributesW((local + L"\\mic-probe").c_str()) != INVALID_FILE_ATTRIBUTES) mic_probe(local);
 
     // wait for the model: it can be uploaded while the app is running, so it is only used
     // once its size stops changing between two checks

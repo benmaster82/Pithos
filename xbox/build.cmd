@@ -27,7 +27,7 @@ fxc /nologo /O3 /T cs_4_0 /E flops /Vn g_flops40 /Fh %OBJ%\cs_flops40.h xbox\gpu
 fxc /nologo /O3 /T cs_4_0 /E copy /Vn g_copy40 /Fh %OBJ%\cs_copy40.h xbox\gpu_probe.hlsl >nul || goto fail
 (echo #include "cs_flops50.h"& echo #include "cs_copy50.h"& echo #include "cs_flops40.h"& echo #include "cs_copy40.h") > %OBJ%\gpu_probe_cs.h
 echo [xbox] compiling the app shell
-cl /nologo /c /O2 /MD /std:c++20 /EHsc /bigobj /DWINAPI_FAMILY=WINAPI_FAMILY_APP /I "%WindowsSdkDir%Include\%WindowsSDKVersion%cppwinrt" /I %OBJ% xbox\app.cpp xbox\gpu_probe.cpp /Fo%OBJ%\ || goto fail
+cl /nologo /c /O2 /MD /std:c++20 /EHsc /bigobj /DWINAPI_FAMILY=WINAPI_FAMILY_APP /I "%WindowsSdkDir%Include\%WindowsSDKVersion%cppwinrt" /I %OBJ% xbox\app.cpp xbox\gpu_probe.cpp xbox\mic_probe.cpp /Fo%OBJ%\ || goto fail
 link /nologo /APPCONTAINER /SUBSYSTEM:WINDOWS /OUT:%LAYOUT%\pithos_xbox.exe %OBJ%\*.obj WindowsApp.lib || goto fail
 
 copy /y xbox\Package.appxmanifest %LAYOUT%\AppxManifest.xml >nul
