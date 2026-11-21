@@ -37,7 +37,12 @@ struct Speech {
     Model depth, codec;
     Context *dc, *cc;
     Dx *ddx;                        /* speech_use_dx: the depth decoder on Direct3D 12 */
-    ThreadPool *pool;
+    ThreadPool *pool, *cpool;       /* cpool: the codec's own threads (speech_codec_threads), else pool */
+    float *cx, *cy;                 /* the codec's rows, apart from the depth decoder's x and y */
+    int acodes[NCB], an;            /* speech_decode_async: the frame, then its sample count */
+    float *apcm;
+    PithosThread *ath;
+    double prof[5]; int prof_frames;   /* PITHOS_SPEECH_PROFILE=2: proj_in, inputs, forward, logits, sampling */
     int lm_dim, D, CD, max_pos;   /* D: depth decoder width, CD: codec width */
     Mat proj_in, embd, out_embd, in_proj, out_proj;
     const float *proj_in_b, *mask, *head_norm, *fsq, *po_w, *po_b, *in_proj_b, *out_proj_b;
@@ -55,8 +60,11 @@ SpeechParams speech_defaults(void) {
 
 void speech_free(Speech *s) {
     if (!s) return;
+    speech_decode_wait(s);
     ctx_free(s->dc);
     ctx_free(s->cc);
+    if (s->cpool) pool_destroy(s->cpool);
+    free(s->cx); free(s->cy);
     dx_destroy(s->ddx);
     model_free(&s->depth);
     model_free(&s->codec);
@@ -120,6 +128,8 @@ Speech *speech_load(const char *mmproj, ThreadPool *pool, int lm_dim, const char
     s->pos = (float *)malloc(sizeof(float) * FSTACK * 2 * NBIN);
     s->spec = (float *)malloc(sizeof(float) * 2 * NBIN);
     s->frames = (float *)malloc(sizeof(float) * FSTACK * NFFT);
+    s->cx = (float *)malloc(sizeof(float) * FSTACK * s->CD);
+    s->cy = (float *)malloc(sizeof(float) * FSTACK * s->CD);
     s->pool = pool;
     if (!s->dc || !s->cc) { snprintf(err, errlen, "out of memory for the speech decoder"); speech_free(s); return NULL; }
     for (int i = 0; i < NFFT; i++) {
@@ -129,6 +139,20 @@ Speech *speech_load(const char *mmproj, ThreadPool *pool, int lm_dim, const char
     }
     speech_reset(s);
     return s;
+}
+
+int speech_codec_threads(Speech *s, int n) {
+    if (s->cpool || n < 1) return 0;
+    ThreadPool *p = pool_create(n);
+    Context *cc = p ? ctx_create(&s->codec, p, s->max_pos, FSTACK) : NULL;
+    if (!cc) {
+        if (p) pool_destroy(p);
+        return 0;
+    }
+    ctx_free(s->cc);
+    s->cc = cc;
+    s->cpool = p;
+    return 1;
 }
 
 int speech_use_dx(Speech *s, int device, char *info, int infolen) {
@@ -147,6 +171,7 @@ int speech_use_dx(Speech *s, int device, char *info, int infolen) {
 }
 
 void speech_reset(Speech *s) {
+    speech_decode_wait(s);
     ctx_reset(s->cc);
     s->n_hist = 0;
     memset(s->ola, 0, sizeof(s->ola));
@@ -186,6 +211,7 @@ static void rms(float *o, const float *x, const float *w, int n) {
 /* one pass: logits[i][NCODE] of the codebooks in want[0..nw), given the codes known so far (-1: masked) */
 static void depth_pass(Speech *s, const int *codes, const int *want, int nw) {
     const int D = s->D;
+    const double t0 = time_sec();
     for (int i = 0; i < NCB; i++) {
         float *xi = s->x + (size_t)i * D;
         const float *hi = s->hp + (size_t)i * D;
@@ -196,8 +222,12 @@ static void depth_pass(Speech *s, const int *codes, const int *want, int nw) {
             for (int k = 0; k < D; k++) xi[k] = hi[k] + s->mask[k];
         }
     }
+    const double t1 = time_sec();
     ctx_reset(s->dc);
     ctx_forward_embd(s->dc, s->x, NCB, s->y);
+    const double t2 = time_sec();
+    s->prof[1] += t1 - t0;
+    s->prof[2] += t2 - t1;
     for (int j = 0; j < nw; j++) {
         const int i = want[j];
         float v[1024];
@@ -208,6 +238,7 @@ static void depth_pass(Speech *s, const int *codes, const int *want, int nw) {
         ctx_matmul(s->dc, &sub, v, 1, s->logits + (size_t)i * NCODE);
         dump("logits", s->logits + (size_t)i * NCODE, sizeof(float) * NCODE);
     }
+    s->prof[3] += time_sec() - t2;
 }
 
 static int cmp_desc(const void *a, const void *b) {
@@ -255,8 +286,10 @@ static int sample_code(Speech *s, float *l, int cb, const SpeechParams *p, uint6
 
 int speech_frame(Speech *s, const float *hidden, const SpeechParams *p, uint64_t *rng, int codes[NCB]) {
     dump("hid", hidden, sizeof(float) * (size_t)s->lm_dim);
+    double t0 = time_sec();
     ctx_matmul(s->dc, &s->proj_in, hidden, 1, s->hp);
     for (int i = 0; i < NCB * s->D; i++) s->hp[i] += s->proj_in_b[i];
+    s->prof[0] += time_sec() - t0;
     int order[NCB];
     for (int i = 0; i < NCB; i++) order[i] = i;
     const char *fixed = getenv("PITHOS_SPEECH_ORDER");
@@ -269,10 +302,21 @@ int speech_frame(Speech *s, const float *hidden, const SpeechParams *p, uint64_t
     static const int schedule[3] = { 4, 4, 4 };
     for (int pass = 0, k = 0; pass < 3; pass++) {
         depth_pass(s, codes, order + k, schedule[pass]);
+        t0 = time_sec();
         for (int j = 0; j < schedule[pass]; j++, k++) {
             const int i = order[k];
             codes[i] = sample_code(s, s->logits + (size_t)i * NCODE, i, p, rng);
         }
+        s->prof[4] += time_sec() - t0;
+    }
+    static int profile = -1;
+    if (profile < 0) profile = getenv("PITHOS_SPEECH_PROFILE") && atoi(getenv("PITHOS_SPEECH_PROFILE")) >= 2;
+    if (profile && ++s->prof_frames == 50) {
+        const double k = 1e3 / s->prof_frames;
+        fprintf(stderr, "[speech] depth decoder per frame: proj_in %.1f ms, inputs %.1f, forward %.1f, logits %.1f, sampling %.1f\n",
+                k * s->prof[0], k * s->prof[1], k * s->prof[2], k * s->prof[3], k * s->prof[4]);
+        memset(s->prof, 0, sizeof(s->prof));
+        s->prof_frames = 0;
     }
     dump("codes", codes, sizeof(int) * NCB);
     int eos = 0;
@@ -355,20 +399,46 @@ int speech_decode(Speech *s, const int codes[NCB], float *pcm) {
     }
     ctx_matmul(s->cc, &s->in_proj, e, 1, e2);
     for (int i = 0; i < s->CD; i++) e2[i] += s->in_proj_b[i];
-    for (int t = 0; t < FSTACK; t++) memcpy(s->x + (size_t)t * s->CD, e2, sizeof(float) * (size_t)s->CD);
-    ctx_forward_embd(s->cc, s->x, FSTACK, s->y);
-    ctx_matmul(s->cc, &s->out_proj, s->y, FSTACK, s->pos);
+    for (int t = 0; t < FSTACK; t++) memcpy(s->cx + (size_t)t * s->CD, e2, sizeof(float) * (size_t)s->CD);
+    ctx_forward_embd(s->cc, s->cx, FSTACK, s->cy);
+    ctx_matmul(s->cc, &s->out_proj, s->cy, FSTACK, s->pos);
     for (int t = 0; t < FSTACK; t++) {
         float *lp = s->pos + (size_t)t * 2 * NBIN;
         for (int k = 0; k < 2 * NBIN; k++) lp[k] += s->out_proj_b[k];
         dump("polar", lp, sizeof(float) * 2 * NBIN);
     }
-    pool_run(s->pool, irfft_task, s, FSTACK);
+    pool_run(s->cpool ? s->cpool : s->pool, irfft_task, s, FSTACK);
     int n = 0;
     for (int t = 0; t < FSTACK; t++) n += istft_frame(s, s->frames + (size_t)t * NFFT, pcm + n);
     dump("pcm", pcm, sizeof(float) * (size_t)n);
     return n;
 }
+
+static void decode_thread(void *u) {
+    Speech *s = (Speech *)u;
+    s->an = speech_decode(s, s->acodes, s->apcm);
+}
+
+void speech_decode_async(Speech *s, const int codes[NCB], float *pcm) {
+    speech_decode_wait(s);
+    memcpy(s->acodes, codes, sizeof(s->acodes));
+    s->apcm = pcm;
+    s->an = 0;
+    s->ath = s->cpool ? thread_create(decode_thread, s) : NULL;
+    if (!s->ath) decode_thread(s);   /* without threads of its own the codec would share the pool: now */
+}
+
+int speech_decode_wait(Speech *s) {
+    if (s->ath) {
+        thread_join(s->ath);
+        s->ath = NULL;
+    }
+    const int n = s->an;
+    s->an = 0;
+    return n;
+}
+
+int speech_decode_overlaps(const Speech *s) { return s->cpool != NULL; }
 
 int speech_flush(Speech *s, float *pcm) {
     /* the samples the last frame reached, without the trimmed end */

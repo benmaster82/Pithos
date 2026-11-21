@@ -2377,9 +2377,13 @@ static void handle_speech(Conn *c, const Json *body) {
     const int started = h != NULL;
     int ok = started;
     double first = 0, tt[3] = { 0 };   /* PITHOS_SPEECH_PROFILE: depth decoder, codec, language model */
-    /* with the token on the GPU, the codec of a frame runs while the model takes the next step */
+    /* pipe: the codec has threads of its own and decodes a frame while the model takes the next
+     * step and the depth decoder the next frame; overlap: with the token on the GPU, the codec of a
+     * frame runs while the model takes the next step */
     const char *ov = getenv("PITHOS_SPEECH_OVERLAP");
-    const int overlap = ctx_token_on_gpu(S.ctx) && !(ov && ov[0] == '0');
+    const int pipe = speech_decode_overlaps(S.cfg.speech);
+    const int overlap = !pipe && ctx_token_on_gpu(S.ctx) && !(ov && ov[0] == '0');
+    int pending = 0;
     while (h && frames < max_frames) {
         int codes[SPEECH_CODEBOOKS];
         const double t1 = time_sec();
@@ -2388,7 +2392,12 @@ static void handle_speech(Conn *c, const Json *body) {
         speech_embed(S.cfg.speech, codes, row);
         FrameStep st = { NULL, &id };
         PithosThread *th = overlap ? thread_create(frame_step, &st) : NULL;
-        const int k = speech_decode(S.cfg.speech, codes, pcm + n);
+        int k;
+        if (pipe) {   /* the previous frame's audio, then this frame to the codec's thread */
+            k = pending ? speech_decode_wait(S.cfg.speech) : 0;
+            speech_decode_async(S.cfg.speech, codes, pcm + n + k);
+            pending = 1;
+        } else k = speech_decode(S.cfg.speech, codes, pcm + n);
         const double t3 = time_sec();
         if (!whole && ok) ok = sink_pcm(&sink, pcm + n, k);
         if (k && !first) first = time_sec() - t0;
@@ -2403,9 +2412,15 @@ static void handle_speech(Conn *c, const Json *body) {
         tt[2] += time_sec() - t4;
         if ((frames & 15) == 0 && conn_gone(c)) { g.finish = FIN_ABORT; break; }
     }
+    if (pending) {
+        const int k = speech_decode_wait(S.cfg.speech);
+        if (!whole && ok) ok = sink_pcm(&sink, pcm + n, k);
+        n += k;
+    }
     if (getenv("PITHOS_SPEECH_PROFILE") && frames)
-        fprintf(stderr, "[speech] per frame: depth decoder %.1f ms, codec %.1f ms, language model %.1f ms%s\n",
-                1e3 * tt[0] / frames, 1e3 * tt[1] / frames, 1e3 * tt[2] / frames, overlap ? " (beyond the codec)" : "");
+        fprintf(stderr, "[speech] per frame: depth decoder %.1f ms, codec %.1f ms%s, language model %.1f ms%s\n",
+                1e3 * tt[0] / frames, 1e3 * tt[1] / frames, pipe ? " (waited for, on its own threads)" : "",
+                1e3 * tt[2] / frames, overlap ? " (beyond the codec)" : "");
     const int k = ok ? speech_flush(S.cfg.speech, pcm + n) : 0;
     if (!whole && ok && g.finish != FIN_ABORT) ok = sink_pcm(&sink, pcm + n, k) && (!sink.mp3 || mp3_finish(sink.mp3));
     n += k;

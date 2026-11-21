@@ -793,6 +793,21 @@ static int chat_turn(Engine *e, const char *user, int first) {
 
 /* ------------------------------------------------------------------ speech output */
 
+/* With Direct3D 12 the depth decoder goes to the GPU (PITHOS_SPEECH_DX=1), and the codec then gets
+ * threads of its own (PITHOS_SPEECH_CODEC_THREADS, default 2; 0: none), to decode one frame while
+ * the next is made. */
+static void speech_gpu(Speech *sp, Dx *dx, int device) {
+    char info[400];
+    if (!dx || !speech_use_dx(sp, device, info, sizeof(info))) return;
+    const char *env = getenv("PITHOS_SPEECH_CODEC_THREADS");
+    const int n = env ? atoi(env) : 2;
+    if (n > 0 && speech_codec_threads(sp, n)) {
+        const size_t l = strlen(info);
+        snprintf(info + l, sizeof(info) - l, ", the codec on %d threads of its own beside it", n);
+    }
+    fprintf(stderr, "speech output: %s\n", info);
+}
+
 /* one step of the model on the frame's row, h its hidden state (NULL: context full); a thread
  * function, so that it can run beside the codec */
 typedef struct { Context *ctx; const float *h; const int *id; } TokenStep;
@@ -827,9 +842,11 @@ static int tts_run(Engine *e, Speech *sp, const Args *a) {
     const int id = -1;   /* the frame's row */
     const double tg = time_sec();
     double t_lm = 0, t_depth = 0, t_codec = 0;   /* PITHOS_SPEECH_PROFILE */
-    /* with the token on the GPU, the codec of a frame runs while the model takes the next step */
+    /* as in the server (handle_speech): the codec on its own threads, or beside the model's step */
     const char *ov = getenv("PITHOS_SPEECH_OVERLAP");
-    const int overlap = ctx_token_on_gpu(e->ctx) && !(ov && ov[0] == '0');
+    const int pipe = speech_decode_overlaps(sp);
+    const int overlap = !pipe && ctx_token_on_gpu(e->ctx) && !(ov && ov[0] == '0');
+    int pending = 0;
     while (h && frames < max_frames) {
         int codes[SPEECH_CODEBOOKS];
         double t1 = time_sec();
@@ -838,7 +855,11 @@ static int tts_run(Engine *e, Speech *sp, const Args *a) {
         speech_embed(sp, codes, row);
         TokenStep st = { e->ctx, NULL, &id };
         PithosThread *th = overlap ? thread_create(token_step, &st) : NULL;
-        n += speech_decode(sp, codes, pcm + n);
+        if (pipe) {
+            if (pending) n += speech_decode_wait(sp);
+            speech_decode_async(sp, codes, pcm + n);
+            pending = 1;
+        } else n += speech_decode(sp, codes, pcm + n);
         double t3 = time_sec();
         frames++;
         if (frames % 25 == 0) fprintf(stderr, "\r[speech: %.1f s]", n / (double)SPEECH_RATE);
@@ -849,9 +870,11 @@ static int tts_run(Engine *e, Speech *sp, const Args *a) {
         t_codec += t3 - t2;
         t_lm += time_sec() - t3;
     }
+    if (pending) n += speech_decode_wait(sp);
     if (getenv("PITHOS_SPEECH_PROFILE") && frames)
-        fprintf(stderr, "\nper frame: language model %.1f ms%s, depth decoder %.1f ms, codec %.1f ms\n", 1e3 * t_lm / frames,
-                overlap ? " (beyond the codec)" : "", 1e3 * t_depth / frames, 1e3 * t_codec / frames);
+        fprintf(stderr, "\nper frame: language model %.1f ms%s, depth decoder %.1f ms, codec %.1f ms%s\n", 1e3 * t_lm / frames,
+                overlap ? " (beyond the codec)" : "", 1e3 * t_depth / frames, 1e3 * t_codec / frames,
+                pipe ? " (waited for, on its own threads)" : "");
     n += speech_flush(sp, pcm + n);
     ctx_set_embeds(e->ctx, NULL, 0);
     const double dt = time_sec() - tg;
@@ -1099,7 +1122,7 @@ static int real_main(int argc, char **argv) {
         if (srv_audio) {   /* and speaks */
             srv_speech = speech_load(mp, pool, m.dim, base, 1500, err, sizeof(err));
             if (!srv_speech) fprintf(stderr, "note: no speech output: %s\n", err);
-            else if (dx && speech_use_dx(srv_speech, a.gpu_device, err, sizeof(err))) fprintf(stderr, "speech output: %s\n", err);
+            else speech_gpu(srv_speech, dx, a.gpu_device);
         }
     }
     if (au && !a.audio) fprintf(stderr, "audio input: on%s (%s)\n", srv_speech ? ", speech output: on" : "", mp);
@@ -1114,7 +1137,7 @@ static int real_main(int argc, char **argv) {
         if (bn && bl < sizeof(base)) { memcpy(base, bn, bl); base[bl] = 0; }
         Speech *sp = speech_load(mp, pool, m.dim, base, a.n_ctx, err, sizeof(err));
         if (!sp) { fprintf(stderr, "error: %s\n", err); return 1; }
-        if (dx && speech_use_dx(sp, a.gpu_device, err, sizeof(err))) fprintf(stderr, "speech output: %s\n", err);
+        speech_gpu(sp, dx, a.gpu_device);
         status = tts_run(&e, sp, &a);
         speech_free(sp);
         audio_free(au);

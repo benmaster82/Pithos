@@ -51,6 +51,17 @@ void speech_embed(Speech *s, const int codes[SPEECH_CODEBOOKS], float *row);
 int speech_decode(Speech *s, const int codes[SPEECH_CODEBOOKS], float *pcm);
 int speech_flush(Speech *s, float *pcm);
 
+/* The codec on n threads of its own: then speech_decode_async runs a frame on another thread
+ * while the caller goes on with the next one (the model's step and the depth decoder, which keep
+ * the shared pool). Returns 1 if set up. */
+int speech_codec_threads(Speech *s, int n);
+/* speech_decode of a frame on the codec's thread (the previous one is waited for first): pcm must
+ * stay valid until speech_decode_wait, which returns the frame's sample count (0: none pending).
+ * Without speech_codec_threads it decodes at once. */
+void speech_decode_async(Speech *s, const int codes[SPEECH_CODEBOOKS], float *pcm);
+int  speech_decode_wait(Speech *s);
+int  speech_decode_overlaps(const Speech *s);
+
 /* 16-bit mono WAV; 0 if the file cannot be written. speech_wav_bytes writes the same into
  * out (44 + 2 n bytes) and returns its size. */
 int speech_write_wav(const char *path, const float *pcm, int n, int rate);
