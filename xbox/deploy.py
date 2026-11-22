@@ -1,6 +1,7 @@
 """Deploy Pithos to an Xbox in Developer Mode through the Device Portal REST API (stdlib only).
 
     python xbox/deploy.py --xbox CONSOLE-IP install           # Pithos.appx + VCLibs dependency
+    python xbox/deploy.py --xbox CONSOLE-IP use MODEL.gguf    # switch model: see below
     python xbox/deploy.py --xbox CONSOLE-IP upload MODEL.gguf # into the app's LocalState
     python xbox/deploy.py --xbox CONSOLE-IP launch
     python xbox/deploy.py --xbox CONSOLE-IP log               # LocalState\\pithos.log
@@ -12,6 +13,15 @@
 
 More engine options go in a pithos.args file in LocalState (for example "-t 6" or "-c 8192"),
 read when the app starts: upload it, then stop and launch the app.
+
+"use" puts one model on the console in a single step: it stops the app, deletes the other .gguf
+files from LocalState (the app's storage holds one model at a time), uploads the model's audio
+projector (mmproj-..., found next to the model) before the model itself, since the app starts
+as soon as a model is complete, writes the recommended pithos.args (and for a speech model the
+speech lines of pithos.env, keeping its other lines), and starts the app. Files already there
+with the same size are not uploaded again. --dry-run only prints the steps, --keep-args leaves
+pithos.args and pithos.env alone, --args "..." chooses pithos.args, --no-launch does not start
+the app.
 
 The portal uses a self-signed certificate, so TLS verification is off. --user/--password are
 only needed when Device Portal authentication is enabled in Dev Home.
@@ -202,6 +212,93 @@ def cmd_stop(px, a):
     print("stopped")
 
 
+# pithos.args for Game mode: the GPU does the work; with a speech model one more core stays free
+# for the audio codec. pithos.env: the speech depth decoder on the GPU, the codec on the engine's threads.
+ARGS_TEXT, ARGS_SPEECH = "-t 6 --gpu d3d12", "-t 5 --gpu d3d12"
+ENV_SPEECH = {"PITHOS_SPEECH_DX": "1", "PITHOS_SPEECH_CODEC_THREADS": "0"}
+
+
+def find_projector(model):
+    """the model's audio projector next to it: mmproj-<model file name>, or mmproj-<name without
+    the quantization>-*.gguf, or None"""
+    folder, name = os.path.split(os.path.abspath(model))
+    exact = os.path.join(folder, "mmproj-" + name)
+    if os.path.exists(exact): return exact
+    stem = name[:-5].rsplit("-", 1)[0] if "-" in name else name[:-5]
+    found = sorted(f for f in os.listdir(folder) if f.startswith("mmproj-" + stem + "-") and f.endswith(".gguf"))
+    return os.path.join(folder, found[0]) if found else None
+
+
+def put_text(px, p, name, text):
+    tmp = os.path.join(os.environ.get("TEMP", "."), name)
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    px.upload("/api/filesystem/apps/file?" + local_state(p), [tmp], progress=False)
+    os.remove(tmp)
+
+
+def get_text(px, p, name):
+    try:
+        return px.request("GET", "/api/filesystem/apps/file?" + local_state(p, {"filename": name}))[1].decode("utf-8", "replace")
+    except urllib.error.HTTPError:
+        return ""
+
+
+def cmd_use(px, a):
+    if not os.path.isfile(a.model) or not a.model.lower().endswith(".gguf"): sys.exit(f"{a.model}: not a .gguf file")
+    if os.path.basename(a.model).lower().startswith("mmproj"): sys.exit(f"{a.model} is a projector: give the model")
+    proj = find_projector(a.model)
+    wanted = ([proj] if proj else []) + [a.model]   # the projector first: the app starts once the model is complete
+    names = {os.path.basename(f): os.path.getsize(f) for f in wanted}
+    p = need_package(px)
+    there = {it["Name"]: it.get("FileSize", 0)
+             for it in px.json("GET", "/api/filesystem/apps/files?" + local_state(p)).get("Items", []) if "Name" in it}
+    drop = [n for n in there if n.lower().endswith(".gguf") and names.get(n) != there[n]]
+    send = [f for f in wanted if there.get(os.path.basename(f)) != names[os.path.basename(f)]]
+    args = a.args or (ARGS_SPEECH if proj else ARGS_TEXT)
+    env = None
+    if proj and not a.keep_args:
+        keep = [l for l in get_text(px, p, "pithos.env").splitlines() if l.strip() and l.split("=", 1)[0].strip() not in ENV_SPEECH]
+        env = "\n".join(keep + [f"{k}={v}" for k, v in ENV_SPEECH.items()]) + "\n"
+
+    print(f"model: {os.path.basename(a.model)}" + (f" with its projector {os.path.basename(proj)} (text and voice)" if proj
+                                                    else " (text; no projector next to it, so no voice)"))
+    print("steps:")
+    print("  stop the app")
+    for n in drop: print(f"  delete {n} ({there[n] / 1e9:.2f} GB)")
+    for f in wanted:
+        n = os.path.basename(f)
+        print(f"  upload {n} ({names[n] / 1e9:.2f} GB)" if f in send else f"  keep {n} (already there)")
+    if not a.keep_args:
+        print(f"  pithos.args: {args}")
+        if env: print("  pithos.env: " + " ".join(env.split()))
+    if not a.no_launch: print("  start the app")
+    if a.dry_run:
+        print("dry run: nothing changed")
+        return
+
+    try:
+        cmd_stop(px, a)
+    except urllib.error.HTTPError:
+        print("(the app was not running)")
+    for n in drop:
+        px.request("DELETE", "/api/filesystem/apps/file?" + local_state(p, {"filename": n}))
+        print("removed", n)
+    for f in send:
+        print(f"uploading {os.path.basename(f)}")
+        px.upload("/api/filesystem/apps/file?" + local_state(p), [f])
+    if not a.keep_args:
+        put_text(px, p, "pithos.args", args + "\n")
+        if env: put_text(px, p, "pithos.env", env)
+        print("wrote pithos.args" + (" and pithos.env" if env else ""))
+    if not a.no_launch:
+        try:
+            cmd_launch(px, a)
+        except urllib.error.HTTPError as e:
+            print(f"could not start the app ({e.code}): start it from Dev Home (a user must be signed in)")
+    print("Game mode (Dev Home > Pithos.X Server > View details > App type: Game) is needed for --gpu d3d12.")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--xbox", required=True, help="console address (Device Portal)")
@@ -210,6 +307,12 @@ def main():
     ap.add_argument("--password", default=os.environ.get("XBOX_PASSWORD"))
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("install")
+    m = sub.add_parser("use", help="switch the console to this model")
+    m.add_argument("model")
+    m.add_argument("--args", help='pithos.args to write (default: "%s", or "%s" with a speech model)' % (ARGS_TEXT, ARGS_SPEECH))
+    m.add_argument("--keep-args", action="store_true", help="leave pithos.args and pithos.env as they are")
+    m.add_argument("--no-launch", action="store_true", help="do not start the app afterwards")
+    m.add_argument("--dry-run", action="store_true", help="print the steps without changing anything")
     u = sub.add_parser("upload"); u.add_argument("file")
     sub.add_parser("files")
     l = sub.add_parser("log"); l.add_argument("name", nargs="?", default="pithos.log")
@@ -220,7 +323,7 @@ def main():
     sub.add_parser("stop")
     a = ap.parse_args()
     px = Portal(a.xbox, a.port, a.user, a.password)
-    {"install": cmd_install, "upload": cmd_upload, "files": cmd_files, "log": cmd_log, "get": cmd_get,
+    {"install": cmd_install, "use": cmd_use, "upload": cmd_upload, "files": cmd_files, "log": cmd_log, "get": cmd_get,
      "touch": cmd_touch, "rm": cmd_rm, "launch": cmd_launch, "stop": cmd_stop}[a.cmd](px, a)
 
 

@@ -84,8 +84,21 @@
 .x-try-steps li:before{content:counter(s);position:absolute;left:0;top:16px;width:34px;height:34px;border-radius:50%;border:1px solid var(--ice);color:var(--ice);display:grid;place-items:center;font:600 14px 'IBM Plex Mono',ui-monospace,monospace}
 .x-try-steps a{color:var(--ink);text-decoration:underline;text-underline-offset:3px}
 .x-try pre{margin:12px 0 0;padding:14px 16px;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow-x:auto}
-.x-try pre code{background:none;border:0;padding:0;font-size:13px;line-height:1.7}
+.x-try pre code{background:none;border:0;padding:0;font-size:13px;line-height:1.7;white-space:pre}
 .x-page .closing-cta h2 em{color:var(--ice)}
+.x-models{max-width:1000px;margin:0 0 36px}
+.x-models h3{font-size:clamp(24px,2.4vw,32px);letter-spacing:-.8px;margin-bottom:12px}
+.x-models>p{color:var(--muted);line-height:1.7;max-width:820px}
+.x-models code{font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:.88em;color:var(--ink);background:#edf6ff10;border:1px solid #edf6ff1a;border-radius:5px;padding:1px 6px}
+.x-model-cards{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin:24px 0 18px}
+.x-model-cards article{border:1px solid var(--line);border-radius:14px;padding:22px 24px;background:var(--card);display:flex;flex-direction:column;min-width:0}
+.x-model-cards article.is-voice{border-color:#a9cfe055;box-shadow:0 0 40px #a9cfe012}
+.x-model-tag{font:600 11px/1 'IBM Plex Mono',ui-monospace,monospace;letter-spacing:1.5px;text-transform:uppercase;color:var(--ice)}
+.x-model-cards h4{font-size:22px;margin:10px 0 8px}
+.x-model-cards .x-list{margin-bottom:14px;flex:1}
+.x-model-cards a{color:var(--ink);text-decoration:underline;text-underline-offset:3px;overflow-wrap:anywhere}
+.x-model-cards pre{margin-top:auto}
+.x-model-cards pre code{white-space:pre-wrap;overflow-wrap:anywhere}
 
 /* the hero capture: a ring breathes around the mark, as on the TV */
 .x-live{position:relative;line-height:0}
@@ -140,6 +153,7 @@
   .x-chapter-num:after{display:none}
   .x-charts,.x-two{grid-template-columns:1fr}
   .x-pipe{grid-template-columns:1fr 1fr}
+  .x-model-cards{grid-template-columns:1fr}
   .x-pipe:before{display:none}
   .x-voice-grid{grid-template-columns:1fr}
 }

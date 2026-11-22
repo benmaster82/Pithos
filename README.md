@@ -605,7 +605,8 @@ build. The web interface and the GPU kernels are embedded in the executable as g
 Pithos runs on an **Xbox One in Developer Mode** as a UWP app, **Pithos.X Server**. The console becomes an
 OpenAI-compatible server for your home network, with Pandora in the browser of any PC or phone, and
 the TV shows the server state and a chat with the model. Tested on an Xbox One S with
-**LFM3-1.7B** and **LFM3-Audio-2B** (the 24B model does not fit in the console's memory). With
+**LFM3-1.7B** and **LFM3-Audio-2B**, one at a time, switched with one command
+([Models for the Xbox](#models-for-the-xbox); the 24B model does not fit in the console's memory). With
 LFM3-Audio-2B the console also **hears and speaks**: you talk into the headset plugged into the
 controller, and the answer is shown and read aloud, all on the console
 ([Voice and Talk mode](#voice-and-talk-mode)).
@@ -671,11 +672,41 @@ again in **Settings → Privacy → App privacy → Microphone**.
   - Visual Studio 2022 with the *MSVC v143* and *C++ Universal Windows Platform tools* components;
   - the Windows SDK 10.0.26100 (it provides `makeappx`, `signtool` and `fxc`);
   - Python 3, for the deployment script (standard library only).
-- **The model**, one of the two (the app's storage holds one at a time):
-  - `LFM3-1.7B-Q4_K_M.gguf` ([download](#lfm3-17b-small-and-fast)): text, the fastest;
-  - `LFM3-Audio-2B-Q4_K_M.gguf` and its projector `mmproj-LFM3-Audio-2B-Q4_K_M.gguf`
-    ([download](#lfm3-audio-2b-speech-input-and-output-experimental)): text and voice.
+- **One of the two models**, downloaded on the PC (see [Models for the Xbox](#models-for-the-xbox)).
 - **For voice**: a headset with a 3.5 mm jack, plugged into the controller.
+
+### Models for the Xbox
+Two models run on the console. The app's storage holds one at a time (with both, the upload fails
+with "not enough space on the disk"), and `deploy.py use` switches between them in one command.
+
+| Model | Files to download | What you get on the Xbox | Speed (Game mode) | `pithos.args` |
+|---|---|---|---|---|
+| [LFM3-1.7B](#lfm3-17b-small-and-fast) | `LFM3-1.7B-Q4_K_M.gguf` (1.1 GB) | text: the TV chat, Pandora and the API for the house | 146 tok/s prompt, 29.5 tok/s generation | `-t 6 --gpu d3d12` |
+| [LFM3-Audio-2B](#lfm3-audio-2b-speech-input-and-output-experimental) | `LFM3-Audio-2B-Q4_K_M.gguf` (1.1 GB) and its projector `mmproj-LFM3-Audio-2B-Q4_K_M.gguf` (0.17 GB) | the same text features, plus push-to-talk, spoken answers, Talk mode and hands-free | ~28 tok/s generation, speech at 0.87× real time | `-t 5 --gpu d3d12` and a `pithos.env` ([below](#options-and-best-use)) |
+
+Download them on the PC into the `models` folder ([LFM3-1.7B](#lfm3-17b-small-and-fast),
+[LFM3-Audio-2B](#lfm3-audio-2b-speech-input-and-output-experimental)), keeping the projector next to
+its model with its original name: that is how `use` finds it. Then, with the app installed:
+
+```
+python xbox\deploy.py --xbox CONSOLE-IP use models\LFM3-1.7B-Q4_K_M.gguf       text
+python xbox\deploy.py --xbox CONSOLE-IP use models\LFM3-Audio-2B-Q4_K_M.gguf   text and voice
+```
+
+`use` stops the app, deletes the other model (and its projector) from the console, uploads the
+projector **before** the model, writes the recommended `pithos.args` (and for LFM3-Audio-2B the
+speech lines of `pithos.env`, keeping any other line there), and starts the app again. The order
+matters: the app starts as soon as a model has finished uploading, and a projector that arrives
+later is not seen until the next restart, so the console would run without voice. Files already on
+the console with the same size are not uploaded again, so `use` with the model that is already
+there just rewrites the options and restarts. The upload takes a few minutes over the network.
+
+- `--dry-run` prints the steps without changing anything;
+- `--args "..."` writes your own `pithos.args` (for example `--args "-t 8"` in App mode);
+- `--keep-args` leaves `pithos.args` and `pithos.env` as they are;
+- `--no-launch` does not start the app at the end.
+
+The models are not deleted from the PC: switching back means uploading again.
 
 ### Building the app
 From the Pithos folder, on the PC:
@@ -697,31 +728,24 @@ authentication):
 
 ```
 python xbox\deploy.py --xbox CONSOLE-IP install                        the app and its VCLibs dependency
-python xbox\deploy.py --xbox CONSOLE-IP upload models\LFM3-1.7B-Q4_K_M.gguf
-python xbox\deploy.py --xbox CONSOLE-IP launch
+python xbox\deploy.py --xbox CONSOLE-IP use models\LFM3-1.7B-Q4_K_M.gguf   a model, its options, start
 python xbox\deploy.py --xbox CONSOLE-IP log                            the server log
 python xbox\deploy.py --xbox CONSOLE-IP files                          the app's LocalState folder
+python xbox\deploy.py --xbox CONSOLE-IP launch                         start the app
+python xbox\deploy.py --xbox CONSOLE-IP stop                           stop it
+python xbox\deploy.py --xbox CONSOLE-IP upload FILE                    put a file into LocalState
 python xbox\deploy.py --xbox CONSOLE-IP get NAME                       download a file from LocalState
 python xbox\deploy.py --xbox CONSOLE-IP rm NAME                        delete a file from LocalState
-python xbox\deploy.py --xbox CONSOLE-IP stop
 ```
 
-For voice, upload LFM3-Audio-2B and its projector instead of LFM3-1.7B (if LFM3-1.7B is already
-there, `rm` it first: the two do not fit together):
-
-```
-python xbox\deploy.py --xbox CONSOLE-IP upload models\mmproj-LFM3-Audio-2B-Q4_K_M.gguf
-python xbox\deploy.py --xbox CONSOLE-IP upload models\LFM3-Audio-2B-Q4_K_M.gguf
-```
-
-1. **Install** the package, then **upload** the model. It goes into the app's `LocalState` folder.
-   The app waits for a `.gguf` there and starts as soon as the upload is complete.
+1. **Install** the package.
 2. **Switch the app to Game mode** for Direct3D 12 and 5 GB of RAM. On the console: **Dev Home** →
    select **Pithos.X Server** → **View details** → **App type: Game**. This has to be done again after
    every reinstall, because installing resets the type to *App*.
-3. **Choose the options** in a `pithos.args` file uploaded to `LocalState` (see below), then start
-   Pithos from Dev Home or with `launch`. Launching from the portal works only while a user is
-   signed in on the console.
+3. **Put a model on the console** with `use` ([Models for the Xbox](#models-for-the-xbox)): it
+   uploads the model into the app's `LocalState` folder with the recommended options, and starts
+   the app. Launching from the portal works only while a user is signed in on the console; otherwise
+   start Pithos from Dev Home. With `--gpu d3d12` the server answers about a minute after the start.
 4. **Connect** from any device on the network: Pandora at **`http://CONSOLE-IP:8080`**, the API at
    `http://CONSOLE-IP:8080/v1` (model name: the file name without `.gguf`). The TV shows the same
    addresses.
@@ -733,7 +757,9 @@ conversations) is kept across updates.
 ### Options and best use
 The app starts the server as `pithos --server --host 0.0.0.0 --port 8080 --gpu off -m MODEL`: the
 CPU, since the GPU is reachable only in Game mode. The options in `LocalState\pithos.args` are
-added after these, so they can also override them. Upload the file, then restart the app:
+added after these, so they can also override them. `use` writes the recommended file for the
+model; to change it, upload your own `pithos.args` (or `use MODEL --args "..."`), then restart the
+app:
 
 | Mode | Recommended `pithos.args` | Why |
 |---|---|---|
@@ -743,8 +769,8 @@ added after these, so they can also override them. Upload the file, then restart
 
 The older `-t 6 --d3d12` still works the same.
 
-For voice, also upload a `pithos.env` file to `LocalState` (an app gets no environment variables
-from outside; the app reads `NAME=VALUE` lines from this file):
+For voice, `use` also writes a `pithos.env` file in `LocalState` (an app gets no environment
+variables from outside; the app reads `NAME=VALUE` lines from this file) with:
 
 ```
 PITHOS_SPEECH_DX=1

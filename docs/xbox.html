@@ -28,7 +28,7 @@
   <link rel="stylesheet" href="theme-hack.css">
   <link rel="stylesheet" href="engine.css">
   <link rel="stylesheet" href="simple.css">
-  <link rel="stylesheet" href="xbox.css?v=2">
+  <link rel="stylesheet" href="xbox.css?v=4">
   <script>document.documentElement.classList.add('js')</script>
   <script src="xbox.js?v=2" defer></script>
 </head>
@@ -226,7 +226,7 @@
             </ul></div>
             <div><h3>Honest limits</h3><ul class="x-list is-limits">
               <li>Tested on an Xbox One S with LFM3-1.7B and LFM3-Audio-2B; the 24B model does not fit</li>
-              <li>The app's storage holds one model at a time</li>
+              <li>The app's storage holds one model at a time; switching re-uploads it (a few minutes)</li>
               <li>Speech runs at 0.87× real time, so a long answer starts after a longer wait</li>
               <li>Game mode must be set again after every reinstall</li>
               <li>No shell commands, MCP servers or web search inside the sandbox</li>
@@ -270,12 +270,38 @@
         <li><strong>Developer Mode.</strong> Activate it with the Xbox Dev Mode app (<a href="https://learn.microsoft.com/windows/uwp/xbox-apps/devkit-activation" target="_blank" rel="noopener noreferrer">Microsoft's guide ↗</a>) and turn on the Device Portal in Dev Home.</li>
         <li><strong>Build on a Windows PC.</strong> Visual Studio 2022 with the C++ UWP tools and the Windows SDK. Create the certificate once, then build:<pre><code>powershell -ExecutionPolicy Bypass -File xbox\make_cert.ps1
 xbox\build.cmd</code></pre></li>
-        <li><strong>Install and upload the model.</strong><pre><code>python xbox\deploy.py --xbox CONSOLE-IP install
-python xbox\deploy.py --xbox CONSOLE-IP upload models\LFM3-1.7B-Q4_K_M.gguf</code></pre></li>
-        <li><strong>Game mode.</strong> Dev Home → Pithos.X Server → View details → App type: Game. Put <code>-t 6 --gpu d3d12</code> in <code>pithos.args</code>, then start the app.</li>
-        <li><strong>Connect.</strong> Open <code>http://CONSOLE-IP:8080</code> from any device on the network.</li>
-        <li><strong>Want it to talk?</strong> Upload LFM3-Audio-2B and its projector instead of LFM3-1.7B, use <code>-t 5 --gpu d3d12</code> and the two lines of <code>pithos.env</code> from the README, plug a headset into the controller, and hold RT.</li>
+        <li><strong>Install the app, then switch it to Game mode.</strong> Dev Home → Pithos.X Server → View details → App type: Game.<pre><code>python xbox\deploy.py --xbox CONSOLE-IP install</code></pre></li>
+        <li><strong>Choose a model and send it.</strong> One command uploads it with the right options and starts the app (below).</li>
+        <li><strong>Connect.</strong> Open <code>http://CONSOLE-IP:8080</code> from any device on the network, or pick up the controller.</li>
       </ol>
+
+      <div class="x-models" aria-labelledby="models-title">
+        <h3 id="models-title">Two models, one console.</h3>
+        <p>The app's storage holds one model at a time. Download them on the PC from Hugging Face into a <code>models</code> folder, keeping the audio projector next to its model, and switch whenever you like: <code>use</code> stops the app, removes the other model, uploads the new one (the projector first, so the voice is there from the start), writes the recommended options and starts the app again.</p>
+        <div class="x-model-cards">
+          <article>
+            <span class="x-model-tag">Text · the fastest</span>
+            <h4>LFM3-1.7B</h4>
+            <ul class="x-list">
+              <li>The TV chat, Pandora and the API for every device in the house</li>
+              <li>146 tok/s reading, 29.5 tok/s writing</li>
+              <li><a href="https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF" target="_blank" rel="noopener noreferrer">LFM3-1.7B-Q4_K_M.gguf ↗</a> 1.1 GB</li>
+            </ul>
+            <pre><code>python xbox\deploy.py --xbox CONSOLE-IP use models\LFM3-1.7B-Q4_K_M.gguf</code></pre>
+          </article>
+          <article class="is-voice">
+            <span class="x-model-tag">Text and voice</span>
+            <h4>LFM3-Audio-2B</h4>
+            <ul class="x-list">
+              <li>Everything above, plus push-to-talk, spoken answers, Talk mode and hands-free</li>
+              <li>~28 tok/s writing, speech at 0.87× real time</li>
+              <li><a href="https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF" target="_blank" rel="noopener noreferrer">LFM3-Audio-2B-Q4_K_M.gguf and mmproj-LFM3-Audio-2B-Q4_K_M.gguf ↗</a> 1.1 GB + 0.17 GB</li>
+            </ul>
+            <pre><code>python xbox\deploy.py --xbox CONSOLE-IP use models\LFM3-Audio-2B-Q4_K_M.gguf</code></pre>
+          </article>
+        </div>
+        <p class="x-small">Add <code>--dry-run</code> to see the steps first. The upload takes a few minutes over the network; with the GPU the server answers about a minute after the start. For voice, plug a headset into the controller's 3.5 mm jack and hold RT.</p>
+      </div>
       <a class="button button-dark" href="https://github.com/benmaster82/Pithos#xbox-one" target="_blank" rel="noopener noreferrer">Full instructions in the README <svg aria-hidden="true" class="icon"><use href="#i-external"/></svg></a>
     </section>
 
