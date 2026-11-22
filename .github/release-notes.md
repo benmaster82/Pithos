@@ -1,14 +1,15 @@
 Pithos is a dependency-free C engine that runs Liquid AI's LFM2.5-24B-A2B, LFM2.5-8B-A1B, LFM3-1.7B
-and LFM3-Audio-2B locally, with a terminal chat, the Pandora web chat, an OpenAI-compatible server
-and a terminal agent. This release adds the largest model so far: Qwen3.6-35B-A3B (experimental).
+and LFM3-Audio-2B, and Qwen3.6-35B-A3B (experimental), locally, with a terminal chat, the Pandora web
+chat, an OpenAI-compatible server and a terminal agent. This release gives the Xbox One app a voice:
+you talk to the console through the controller's headset, and it answers out loud.
 
 ## Downloads
 
 | File | For |
 |---|---|
-| `pithos-0.7.5-windows-x64.zip` | Windows 10 / 11, 64-bit (AVX2, AVX or scalar kernels chosen at run time) |
-| `pithos-0.7.5-linux-x64.tar.gz` | Linux x86-64 with glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, RHEL / Rocky 9+, Fedora 35+...) |
-| `pithos-0.7.5-linux-arm64.tar.gz` | Linux ARM64 (**experimental**): `pithos` for ARMv8.2 with dot product (Raspberry Pi 5, RK3566 / RK3588, Graviton 2+), `pithos-armv8` for older cores (Raspberry Pi 3 / 4) |
+| `pithos-0.8.0-windows-x64.zip` | Windows 10 / 11, 64-bit (AVX2, AVX or scalar kernels chosen at run time) |
+| `pithos-0.8.0-linux-x64.tar.gz` | Linux x86-64 with glibc 2.34 or newer (Ubuntu 22.04+, Debian 12+, RHEL / Rocky 9+, Fedora 35+...) |
+| `pithos-0.8.0-linux-arm64.tar.gz` | Linux ARM64 (**experimental**): `pithos` for ARMv8.2 with dot product (Raspberry Pi 5, RK3566 / RK3588, Graviton 2+), `pithos-armv8` for older cores (Raspberry Pi 3 / 4) |
 | `SHA256SUMS` | checksums of the archives |
 
 The model is not included: download it as described in the README (LFM3-1.7B is 1.1 GB, the 8B
@@ -16,56 +17,59 @@ model 5.2 GB, the 24B model 14.5 GB, LFM3-Audio-2B 1.3 GB with its audio project
 20.5 GB), put it in a `models` folder next to the program, then run for example
 `pithos --server --open`.
 
+The Xbox app is not part of the downloads: it is signed with your own certificate and installed
+from a Windows PC through the console's Device Portal, as the README's
+[Xbox One](https://github.com/benmaster82/Pithos#xbox-one) section explains.
+
 The Windows binary is not signed, so SmartScreen may warn about an unknown publisher. The ARM64
 binaries passed the kernel tests and a short generation on GitHub's ARM64 runners (Neoverse); they
 have not been tried on single-board computers yet. Reports are welcome.
 
-## What's new since v0.7.0
+## What's new since v0.7.5
 
-**Qwen3.6-35B-A3B (experimental).** A 35-billion-parameter MoE: 256 experts of which 8, plus a
-shared one, work on each token (about 3 billion active), with 30 Gated DeltaNet layers and 10 of
-gated attention. It reasons before it answers and calls tools in XML, with the same chat, server,
-Pandora and terminal agent as the LFM models. The file is
-`Qwen3.6-35B-A3B-Q4_K_M.gguf` from
-[ggml-org/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF) (Apache 2.0);
-on Linux, `bash build.sh --download-model=qwen3.6-35b` downloads and verifies it.
+**Voice on the Xbox One.** With LFM3-Audio-2B loaded, Pithos.X Server hears and speaks, entirely
+on the console ([the story](https://benmaster82.github.io/Pithos/xbox.html)):
 
-- **On the CPU** it runs on any computer with 16 GB of RAM: the 19.1 GiB file does not fit, so the
-  experts stream from disk at first and the ones in use stay in RAM. Tokenizer and chat template
-  match the model's own; perplexity 1.451 against llama.cpp's 1.467.
-- **With Vulkan** (the default for it on a discrete NVIDIA GPU) every layer runs on the GPU and the
-  routed experts on the CPU; the most used experts also live in the VRAM that is left
-  (`PITHOS_VK_EXPERT_MB` sets how much), and the GPU computes them while the CPU computes the
-  others. Prompts are cut in two halves, so the GPU works on one while the CPU computes the experts
-  of the other.
-- **Speed** on a laptop with a 6-core CPU, 16 GB and a 4 GB GPU (`--bench 512,128`, warm):
+- **Push-to-talk** with a headset plugged into the controller's 3.5 mm jack: hold RT, speak,
+  release. The question is transcribed in under a second and sent to the chat.
+- **Spoken answers**: Y reads the last one or stops it, *Read aloud* speaks every answer, and RT
+  talks over the console. The first words play after 0.5–0.8 seconds; playback waits until enough
+  audio is queued to play the answer to the end without a gap.
+- **Talk mode**: a full-screen assistant on a deep black background, with the Pithos mark, an aura
+  and rings that follow the voice, neural-network layers with travelling pulses, the clock and
+  subtitles. Answers are short and always spoken; LB / RB change the language (English, Italian,
+  French, German, Spanish, Portuguese), ↑ / ↓ the reasoning level.
+- **Hands-free** (X in Talk mode): the console listens for speech above the noise of the room,
+  sends the question after a short pause, and raises its threshold while it speaks, so its own
+  voice does not trigger it.
+- **Reasoning off / low / medium / high** in the TV chat, off by default.
+- Speech runs at about **0.87× real time** on the console in Game mode, up from 0.48×: the depth
+  decoder runs on the GPU in one Direct3D 12 command list per pass (`PITHOS_SPEECH_DX=1`), and the
+  audio codec decodes each frame on the CPU while the GPU makes the next one.
 
-  | | Prompt | Generation |
-  |---|---:|---:|
-  | llama.cpp b12179, CPU only | 8.1 tok/s | 4.4 tok/s |
-  | Pithos, CPU only | 13.6 tok/s | 7.3 tok/s |
-  | llama.cpp, Vulkan, best of `-ncmoe 40` / `38` | 28.9 tok/s | 12.5 tok/s |
-  | **Pithos, Vulkan** | **82 tok/s** | **22 tok/s** |
+**Faster speech on the PC too.** The codec now overlaps the next step of the model whenever the
+whole model runs on the GPU (Vulkan or Direct3D 12), and the depth decoder picks its top codes by
+selection instead of sorting. LFM3-Audio-2B reading a sentence aloud on a laptop with a 6-core CPU
+and a 4 GB GPU:
 
-  Real conversations are slower on 16 GB, because varied text needs experts that are not in RAM:
-  about 10–13 tok/s with the GPU.
-- **Sampling** follows the model card when no option is given: temperature 1.0, top-k 20, top-p
-  0.95, presence penalty 1.5 while it reasons; temperature 0.7 and top-p 0.8 with the reasoning off.
+| | v0.7.5 | v0.8.0 |
+|---|---:|---:|
+| Vulkan | 2.8× real time | **3.4×** |
+| Direct3D 12 | 2.3× real time | **3.1×** |
+| CPU only | 1.3× real time | 1.4× |
+
+The audio is byte-identical to v0.7.5's.
 
 **Other changes**
 
-- **Prompt reuse for agents.** The tool definitions (about 4,000 tokens for the agent and the web
-  UI) are reused from the prompt cache even when the system text changes (the date, the folder), and
-  even after a restart: a new session starts in seconds. Stored sessions of models with a large
-  recurrent state are written with fewer checkpoints (350 MB instead of 1 GB and growing).
-- **Tool calls in XML** (LFM3 and Qwen) keep a parameter as a string when the tool declares it so:
-  `"0042"` or `"570"` no longer arrive as numbers.
-- **`--presence-penalty`**, and the `presence_penalty` field in requests (OpenAI's meaning).
-- **`PITHOS_VK_PROF=1`** prints the Vulkan GPU time of each step per token, at exit.
+- `PITHOS_SPEECH_PROFILE=1` also times `/v1/audio/speech` requests, and `=2` splits the depth
+  decoder's time; `PITHOS_SPEECH_CODEC_THREADS` gives the codec threads of its own.
+- `xbox/deploy.py` gained `get`, `touch` and `rm` for files in the app's folder; the app reads
+  engine environment variables from `LocalState\pithos.env`.
 
-The LFM models are unchanged: greedy answers are identical to v0.7.0 on the CPU, Vulkan, Direct3D
-12 and OpenCL for LFM3-1.7B, on the CPU, Vulkan and OpenCL for LFM2.5-8B, on the CPU for
-LFM3-Audio-2B (transcription and speech included) and LFM2.5-24B; with OpenCL, whose expert cache
-fills in the background, the 24B model's perplexity stays in v0.7.0's range.
+The other models are unchanged: greedy answers are identical to v0.7.5 for LFM3-1.7B (CPU, Vulkan,
+Direct3D 12, OpenCL), LFM2.5-8B (CPU, Vulkan), LFM2.5-24B (CPU), LFM3-Audio-2B (transcription and
+speech) and Qwen3.6-35B-A3B (CPU and Vulkan, server and tool calls included), and their speed is the
+same.
 
 See the README for the full documentation and the measured results.

@@ -137,6 +137,11 @@ for it, few and simple, since LFM3-Audio is a ~2B model:
   app would go to the background, and in Game mode be suspended with the engine).
 
 ## Done
+- v0.8.0: voice on the Xbox One with LFM3-Audio-2B: push-to-talk through the controller's headset,
+  spoken answers with an adaptive playback buffer, Talk mode (full screen) and hands-free listening,
+  a reasoning level in the TV chat; speech at 0.87× real time on the console (depth decoder on
+  Direct3D 12, codec overlapped with the next step), and 20–35% faster speech on the PC with Vulkan
+  and Direct3D 12.
 - v0.7.5: Qwen3.6-35B-A3B (experimental), on the CPU and with Vulkan (every layer on the GPU, the
   routed experts on the CPU, the most used ones in VRAM; prompt halves overlapped with the CPU);
   its model card's sampling, `--presence-penalty`; tool definitions reused from the prompt cache
