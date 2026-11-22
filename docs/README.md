@@ -16,7 +16,7 @@ The English landing page is published automatically by GitHub Pages from
 - `mascot.js`: Pandora presents the hero figures once (a click replays it); with reduced motion or without JavaScript the figures are simply shown.
 - `app.js`: model picker (it drives the guide and every command on the page), installation guide, CPU/GPU diagram, tabs, clipboard, and local progress storage.
 - `assets/`: original project graphics and self-hosted fonts with license files.
-- `xbox.html`, `xbox.css`, `xbox.js`: the Pithos.X Server story page (linked as "Xbox" in the top navigation); it reuses the shared stylesheets and the screenshots `xbox-tv.png` and `xbox-pandora-dark.png` from this folder.
+- `xbox.html`, `xbox.css`, `xbox.js`: the Pithos.X Server story page (linked as "Xbox" in the top navigation): the console as a server and as a voice assistant (Talk mode), with the voice pipeline lighting its stages in turn (still with reduced motion); it reuses the shared stylesheets and the screenshots `xbox-talk.png`, `xbox-tv.png` and `xbox-pandora-dark.png` from this folder.
 
 Keep asset URLs relative so the site works at `/Pithos/`. When changing the public
 hostname, also update the canonical URL and Open Graph URLs in `index.html`.

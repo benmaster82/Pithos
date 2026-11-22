@@ -5,12 +5,12 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="theme-color" content="#000000">
   <title>Pithos.X Server — a recent LLM on an Xbox One</title>
-  <meta name="description" content="How an Xbox One S from a living room became a local LLM server: AVX kernels for the Jaguar CPU, a UWP app, and a Direct3D 12 backend that runs LFM3-1.7B at 29.5 tokens per second.">
+  <meta name="description" content="An Xbox One S from a living room became a private AI: LFM3 on the console's GPU at 29.5 tokens per second, served to the whole house, and a voice assistant you talk to through the controller's headset, fully offline.">
   <link rel="canonical" href="https://benmaster82.github.io/Pithos/xbox.html">
   <meta property="og:type" content="article">
   <meta property="og:locale" content="en_US">
   <meta property="og:title" content="Pithos.X Server — a recent LLM on an Xbox One">
-  <meta property="og:description" content="Old hardware, new intelligence: LFM3-1.7B served from an Xbox One S at 29.5 tokens per second.">
+  <meta property="og:description" content="Old hardware, new intelligence: a language model on an Xbox One S at 29.5 tokens per second, and a voice assistant through the controller's headset. No cloud.">
   <meta property="og:url" content="https://benmaster82.github.io/Pithos/xbox.html">
   <meta property="og:site_name" content="Pithos">
   <meta property="og:image" content="https://benmaster82.github.io/Pithos/assets/social-xbox.png">
@@ -19,7 +19,7 @@
   <meta property="og:image:alt" content="Old hardware. New intelligence. Pithos.X Server on an Xbox One S: 29.5 tokens per second.">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Pithos.X Server — a recent LLM on an Xbox One">
-  <meta name="twitter:description" content="Old hardware, new intelligence: LFM3-1.7B served from an Xbox One S at 29.5 tokens per second, to every device in the house.">
+  <meta name="twitter:description" content="Old hardware, new intelligence: a language model on an Xbox One S at 29.5 tokens per second, served to every device in the house, and a voice assistant through the controller's headset.">
   <meta name="twitter:image" content="https://benmaster82.github.io/Pithos/assets/social-xbox.png">
   <meta name="twitter:image:alt" content="Old hardware. New intelligence. Pithos.X Server on an Xbox One S: 29.5 tokens per second.">
   <link rel="icon" href="assets/pandora-mark.svg" type="image/svg+xml">
@@ -28,9 +28,9 @@
   <link rel="stylesheet" href="theme-hack.css">
   <link rel="stylesheet" href="engine.css">
   <link rel="stylesheet" href="simple.css">
-  <link rel="stylesheet" href="xbox.css?v=1">
+  <link rel="stylesheet" href="xbox.css?v=2">
   <script>document.documentElement.classList.add('js')</script>
-  <script src="xbox.js?v=1" defer></script>
+  <script src="xbox.js?v=2" defer></script>
 </head>
 <body class="x-page">
   <svg class="svg-library" aria-hidden="true" xmlns="http://www.w3.org/2000/svg"><defs>
@@ -54,23 +54,58 @@
   <main id="main">
     <section class="x-hero wrap" aria-labelledby="x-title">
       <div class="x-hero-copy">
-        <div class="eyebrow"><span class="status-dot"></span> PITHOS.X SERVER / XBOX ONE S / LFM3-1.7B</div>
+        <div class="eyebrow"><span class="status-dot"></span> PITHOS.X SERVER / XBOX ONE S / LFM3</div>
         <h1 id="x-title">Old hardware.<br><em>New intelligence.</em></h1>
-        <p class="x-lead">The game console under the TV was designed in 2013. Today it runs a recent language model at <strong>29.5 tokens per second</strong> and answers every phone and computer in the house through an OpenAI-compatible API. This is how we got there, one wall at a time.</p>
-        <div class="x-hero-actions"><a class="button button-dark" href="#story">Read the story <svg aria-hidden="true" class="icon"><use href="#i-arrow"/></svg></a><a class="text-link" href="#try">Try it on your console <span>↗</span></a></div>
+        <p class="x-lead">The game console under the TV was designed in 2013. Today it runs a recent language model at <strong>29.5 tokens per second</strong>, answers every phone and computer in the house, and <strong>talks back</strong>: plug a headset into the controller, ask, and hear the answer. No cloud, no new hardware.</p>
+        <div class="x-hero-actions"><a class="button button-dark" href="#voice">See it talk <svg aria-hidden="true" class="icon"><use href="#i-arrow"/></svg></a><a class="text-link" href="#story">Read the story <span>↓</span></a><a class="text-link" href="#try">Try it on your console <span>↗</span></a></div>
       </div>
       <figure class="x-hero-shot">
-        <img src="xbox-tv.png" width="1280" height="720" alt="Pithos.X Server on the TV: the server state, a chat, the addresses to connect to and the server log.">
-        <figcaption>The console's TV screen while the server runs. Real capture through the Device Portal.</figcaption>
+        <div class="x-live"><img src="xbox-talk.png" width="1280" height="720" alt="Talk mode on the TV: the Pithos mark between layers of a neural network, the spoken question and the answer as subtitles."></div>
+        <figcaption>Talk mode on the TV, after a spoken question. Real capture through the Device Portal.</figcaption>
       </figure>
     </section>
 
     <div class="x-stats wrap" aria-label="Results at a glance">
-      <div><strong data-count="5.1" data-suffix="×">5.1×</strong><span>faster generation than the CPU alone, in the same mode</span></div>
+      <div><strong data-count="29.5">29.5</strong><span>tokens per second writing the answer, on the console's GPU</span></div>
       <div><strong data-count="146">146</strong><span>tokens per second reading a prompt</span></div>
-      <div><strong data-count="29.5">29.5</strong><span>tokens per second writing the answer</span></div>
-      <div><strong data-count="1">1</strong><span>GPU submission per token, down from about 100</span></div>
+      <div><strong>&lt;&#8202;1&#8202;s</strong><span>to understand a spoken question</span></div>
+      <div><strong>0</strong><span>bytes sent to the cloud: voice, model and answers stay on the console</span></div>
     </div>
+
+    <section class="x-voice wrap" id="voice" aria-labelledby="voice-title">
+      <div class="x-voice-head">
+        <span class="eyebrow">NEW · LFM3-AUDIO-2B</span>
+        <h2 id="voice-title">It listens. <em>Then it answers out loud.</em></h2>
+        <p>One model hears, thinks and speaks, all inside the console. Hold the trigger, ask a question in your language, and the Xbox shows it, answers it and reads the answer to you, starting in under a second.</p>
+      </div>
+      <ol class="x-pipe" aria-label="What happens after a spoken question">
+        <li data-state="LISTENING"><span class="x-pipe-state">Listening</span><h3>Your voice</h3><p>The headset on the controller's jack, captured at 48 kHz. Hold <b>RT</b>, or just speak in hands-free mode.</p><span class="x-pipe-metric">48 kHz</span></li>
+        <li data-state="TRANSCRIBING"><span class="x-pipe-state">Transcribing</span><h3>Words</h3><p>The model's audio encoder turns speech into text, in the language you choose.</p><span class="x-pipe-metric">&lt; 1 s</span></li>
+        <li data-state="THINKING"><span class="x-pipe-state">Thinking</span><h3>An answer</h3><p>The same model writes on the GPU, reusing the conversation already in the cache.</p><span class="x-pipe-metric">~28 tok/s</span></li>
+        <li data-state="SPEAKING"><span class="x-pipe-state">Speaking</span><h3>A voice</h3><p>Sound is generated 80 ms at a time while the answer plays.</p><span class="x-pipe-metric">0.5–0.8 s to the first word</span></li>
+      </ol>
+      <div class="x-voice-grid">
+        <div class="x-voice-card">
+          <h3>Talk mode</h3>
+          <p>A full-screen assistant for the living room: the Pithos mark on deep black, an aura and rings that follow the voice, neural-network layers with travelling pulses, the clock, and subtitles for every question and answer. Answers are short, one or two sentences, and always spoken.</p>
+        </div>
+        <div class="x-voice-card">
+          <h3>Hands-free</h3>
+          <p>Press <b>X</b> and put the controller down. The console listens for speech above the noise of the room, sends the question after a short pause, and raises its threshold while it speaks so it does not hear itself.</p>
+        </div>
+        <div class="x-voice-card">
+          <h3>The controller is the remote</h3>
+          <dl class="x-pad">
+            <div><dt>RT</dt><dd>hold to talk</dd></div>
+            <div><dt>X</dt><dd>hands-free</dd></div>
+            <div><dt>Y</dt><dd>repeat, or stop</dd></div>
+            <div><dt>LB RB</dt><dd>language</dd></div>
+            <div><dt>↑ ↓</dt><dd>reasoning level</dd></div>
+            <div><dt>B</dt><dd>back to the chat</dd></div>
+          </dl>
+        </div>
+      </div>
+    </section>
 
     <article class="x-story" id="story">
       <section class="x-chapter wrap" aria-labelledby="c1">
@@ -107,6 +142,10 @@
           <h2 id="c3">Living inside an app.</h2>
           <p>An Xbox runs apps in a sandbox. There is no command line, no child processes, and only the app variants of the file APIs. The engine had to become a UWP package: the same C code compiled with <code>PITHOS_UWP</code>, inside a small C++ shell that waits for a model, starts the server on the local network and draws a screen for the TV.</p>
           <p>Everything happens from a PC through the console's Device Portal: <code>deploy.py</code> installs the package, uploads the 1.1 GB model into the app's folder, starts it and reads its log. The TV shows the state, the addresses to connect to, the log, and a chat you can use with the gamepad.</p>
+          <figure class="x-shot x-shot-inline">
+            <img src="xbox-tv.png" width="1280" height="720" loading="lazy" alt="Pithos.X Server on the TV: the server state, a chat, the addresses to connect to and the server log.">
+            <figcaption>The app's main screen on the TV while the server runs.</figcaption>
+          </figure>
         </div>
       </section>
 
@@ -181,11 +220,14 @@
               <li>Web chat at <code>http://CONSOLE-IP:8080</code> for every device in the house</li>
               <li>OpenAI-compatible API at <code>/v1</code>, with streaming and tool calls</li>
               <li>A chat on the TV, used with the gamepad</li>
+              <li>With LFM3-Audio-2B: push-to-talk, spoken answers, Talk mode and hands-free</li>
               <li>Agent mode with file tools, calculator and date</li>
               <li>Prompt reuse saved on the console</li>
             </ul></div>
             <div><h3>Honest limits</h3><ul class="x-list is-limits">
-              <li>Tested on an Xbox One S with LFM3-1.7B; the 24B model does not fit</li>
+              <li>Tested on an Xbox One S with LFM3-1.7B and LFM3-Audio-2B; the 24B model does not fit</li>
+              <li>The app's storage holds one model at a time</li>
+              <li>Speech runs at 0.87× real time, so a long answer starts after a longer wait</li>
               <li>Game mode must be set again after every reinstall</li>
               <li>No shell commands, MCP servers or web search inside the sandbox</li>
               <li>Needs Developer Mode and a PC to build and install</li>
@@ -194,11 +236,29 @@
         </div>
       </section>
 
-      <section class="x-chapter wrap" aria-labelledby="c8">
+      <section class="x-chapter x-chapter-wide wrap" aria-labelledby="c8">
         <div class="x-chapter-num">08</div>
         <div class="x-chapter-body">
+          <span class="eyebrow">THE NEXT WALL</span>
+          <h2 id="c8">Teaching the console to listen and speak.</h2>
+          <p>LFM3-Audio-2B is LFM3 with ears and a voice: an audio encoder in front, and behind it a depth decoder and a codec that turn the model's state into sound, one 80 ms frame at a time. Same architecture, same GPU path. The hard part was everything around it.</p>
+          <p><strong>A microphone in a sandbox.</strong> The headset on the controller's jack appears to the app as an ordinary capture device, but the permission dialog only opens from the UI thread, and so does closing the capture. Called from anywhere else, the app simply crashed. A probe built into the app recorded the first clips and sent them back to the PC; the voice was in one channel of eight, so the app now picks the loudest one.</p>
+          <p><strong>Too slow to speak.</strong> The first spoken answers came out at half of real time: each frame spent 77 ms in the depth decoder on the CPU. The decoder now runs on the GPU as whole passes, in one command list, and the codec decodes each frame on the CPU while the GPU works on the next one.</p>
+          <figure class="x-chart is-speech" aria-labelledby="chart-speech">
+            <figcaption id="chart-speech"><strong>Speech</strong> <span>× real time, higher is better</span></figcaption>
+            <div class="x-bar" style="--v:.2"><span>CPU only</span><b>~0.2×</b></div>
+            <div class="x-bar" style="--v:.48"><span>Model on the GPU</span><b>0.48×</b></div>
+            <div class="x-bar is-final" style="--v:.87"><span>+ decoder on the GPU</span><b>0.87×</b></div>
+          </figure>
+          <p><strong>Never run dry.</strong> Just below real time, playback would stutter. Instead the app estimates how long the answer will sound and waits until enough audio is queued to play it to the end without a gap: a short answer starts after half a second, a long one after a few.</p>
+        </div>
+      </section>
+
+      <section class="x-chapter wrap" aria-labelledby="c9">
+        <div class="x-chapter-num">09</div>
+        <div class="x-chapter-body">
           <span class="eyebrow">BACK TO THE PC</span>
-          <h2 id="c8">The console made the PC faster too.</h2>
+          <h2 id="c9">The console made the PC faster too.</h2>
           <p>The Direct3D 12 backend also works on Windows PCs. On the reference laptop (GTX 1650), <code>--gpu d3d12</code> runs LFM3-1.7B at <strong>330 tokens per second</strong> on the prompt and <strong>69</strong> on generation, against 67–103 and 56 with OpenCL. The AVX kernels give older PCs without AVX2 a fast CPU path. Nothing changed for the default path on Windows and Linux: the same tokens, at the same speed.</p>
         </div>
       </section>
@@ -214,6 +274,7 @@ xbox\build.cmd</code></pre></li>
 python xbox\deploy.py --xbox CONSOLE-IP upload models\LFM3-1.7B-Q4_K_M.gguf</code></pre></li>
         <li><strong>Game mode.</strong> Dev Home → Pithos.X Server → View details → App type: Game. Put <code>-t 6 --gpu d3d12</code> in <code>pithos.args</code>, then start the app.</li>
         <li><strong>Connect.</strong> Open <code>http://CONSOLE-IP:8080</code> from any device on the network.</li>
+        <li><strong>Want it to talk?</strong> Upload LFM3-Audio-2B and its projector instead of LFM3-1.7B, use <code>-t 5 --gpu d3d12</code> and the two lines of <code>pithos.env</code> from the README, plug a headset into the controller, and hold RT.</li>
       </ol>
       <a class="button button-dark" href="https://github.com/benmaster82/Pithos#xbox-one" target="_blank" rel="noopener noreferrer">Full instructions in the README <svg aria-hidden="true" class="icon"><use href="#i-external"/></svg></a>
     </section>
@@ -221,6 +282,6 @@ python xbox\deploy.py --xbox CONSOLE-IP upload models\LFM3-1.7B-Q4_K_M.gguf</cod
     <section class="closing-cta wrap"><div><span class="eyebrow">BEFORE YOU REPLACE IT.</span><h2>Old hardware is not obsolete. <em>It is waiting for software.</em></h2><p>Pithos is open source, written in C, with no dependencies.</p></div><a class="button button-dark" href="index.html">Discover Pithos <svg aria-hidden="true" class="icon"><use href="#i-arrow"/></svg></a></section>
   </main>
 
-  <footer class="wrap site-footer"><div><a class="brand" href="index.html"><img src="assets/pandora-mark.svg" width="27" height="27" alt=""><span>pithos<span class="brand-dot">.</span></span></a><p>Artificial intelligence. Closer to you.</p></div><div class="footer-links"><a href="https://github.com/benmaster82/Pithos" target="_blank" rel="noopener noreferrer">GitHub ↗</a><a href="https://github.com/benmaster82/Pithos#xbox-one" target="_blank" rel="noopener noreferrer">Xbox instructions ↗</a><a href="https://github.com/benmaster82/Pithos/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">Code license ↗</a><a href="https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF" target="_blank" rel="noopener noreferrer">LFM3-1.7B ↗</a></div><div class="footer-bottom"><span>An open-source project by <a href="https://github.com/benmaster82" target="_blank" rel="noopener noreferrer">benmaster82</a>. Xbox is a trademark of Microsoft; this project is not affiliated with or endorsed by Microsoft.</span><span>MIT-licensed code · Model weights retain their own license.</span></div></footer>
+  <footer class="wrap site-footer"><div><a class="brand" href="index.html"><img src="assets/pandora-mark.svg" width="27" height="27" alt=""><span>pithos<span class="brand-dot">.</span></span></a><p>Artificial intelligence. Closer to you.</p></div><div class="footer-links"><a href="https://github.com/benmaster82/Pithos" target="_blank" rel="noopener noreferrer">GitHub ↗</a><a href="https://github.com/benmaster82/Pithos#xbox-one" target="_blank" rel="noopener noreferrer">Xbox instructions ↗</a><a href="https://github.com/benmaster82/Pithos/blob/main/LICENSE" target="_blank" rel="noopener noreferrer">Code license ↗</a><a href="https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF" target="_blank" rel="noopener noreferrer">LFM3-1.7B ↗</a><a href="https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF" target="_blank" rel="noopener noreferrer">LFM3-Audio-2B ↗</a></div><div class="footer-bottom"><span>An open-source project by <a href="https://github.com/benmaster82" target="_blank" rel="noopener noreferrer">benmaster82</a>. Xbox is a trademark of Microsoft; this project is not affiliated with or endorsed by Microsoft.</span><span>MIT-licensed code · Model weights retain their own license.</span></div></footer>
 </body>
 </html>

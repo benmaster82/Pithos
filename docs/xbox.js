@@ -1,5 +1,6 @@
 'use strict';
-// xbox.js - the story page: mobile menu, chapters and charts revealed on scroll, counting numbers.
+// xbox.js - the story page: mobile menu, chapters and charts revealed on scroll, counting numbers,
+// and the voice pipeline lighting its stages in turn while it is on screen.
 document.documentElement.classList.add('js');
 
 const menuButton = document.querySelector('.menu-button'), navigation = document.querySelector('#navigation');
@@ -26,7 +27,20 @@ function count(el) {
   requestAnimationFrame(step);
 }
 
-const targets = [...document.querySelectorAll('.x-chapter, .x-chart, .x-stats, .x-try, .x-shot')];
+// the stages of a spoken question light up one after the other, as the app's states do; still
+// with reduced motion, and paused while the pipeline is off screen
+const pipe = document.querySelector('.x-pipe');
+if (pipe && !still && 'IntersectionObserver' in window) {
+  const stages = [...pipe.children];
+  let i = -1, timer = 0;
+  const next = () => { stages.forEach(s => s.classList.remove('is-on')); i = (i + 1) % stages.length; stages[i].classList.add('is-on'); };
+  new IntersectionObserver(entries => entries.forEach(entry => {
+    clearInterval(timer);
+    if (entry.isIntersecting) { next(); timer = setInterval(next, 1700); }
+  }), { threshold: .4 }).observe(pipe);
+}
+
+const targets = [...document.querySelectorAll('.x-chapter, .x-chart, .x-stats, .x-try, .x-shot, .x-voice')];
 targets.forEach(el => { if (!el.classList.contains('x-chart')) el.classList.add('x-reveal'); });
 if (!('IntersectionObserver' in window) || still) {
   targets.forEach(el => el.classList.add('is-visible'));
