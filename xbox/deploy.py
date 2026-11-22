@@ -19,9 +19,12 @@ files from LocalState (the app's storage holds one model at a time), uploads the
 projector (mmproj-..., found next to the model) before the model itself, since the app starts
 as soon as a model is complete, writes the recommended pithos.args (and for a speech model the
 speech lines of pithos.env, keeping its other lines), and starts the app. Files already there
-with the same size are not uploaded again. --dry-run only prints the steps, --keep-args leaves
-pithos.args and pithos.env alone, --args "..." chooses pithos.args, --no-launch does not start
-the app.
+with the same size are not uploaded again. The saved conversations of the other model
+(MODEL.gguf.pithos-cache) would not leave room for the new one: they move to the PC, into
+build-xbox\\conversations, and come back when that model is chosen again (--drop-cache deletes
+them instead). The recommended pithos.args caps them at --cache-mb 256 on the console.
+--dry-run only prints the steps, --keep-args leaves pithos.args and pithos.env alone, --args "..."
+chooses pithos.args, --no-launch does not start the app.
 
 The portal uses a self-signed certificate, so TLS verification is off. --user/--password are
 only needed when Device Portal authentication is enabled in Dev Home.
@@ -145,8 +148,8 @@ def need_package(px):
     return p
 
 
-def local_state(p, extra=""):
-    q = {"knownfolderid": "LocalAppData", "packagefullname": p["PackageFullName"], "path": "\\LocalState"}
+def local_state(p, extra="", sub=""):
+    q = {"knownfolderid": "LocalAppData", "packagefullname": p["PackageFullName"], "path": "\\LocalState" + (sub and "\\" + sub)}
     q.update(extra)
     return urllib.parse.urlencode(q)
 
@@ -213,9 +216,53 @@ def cmd_stop(px, a):
 
 
 # pithos.args for Game mode: the GPU does the work; with a speech model one more core stays free
-# for the audio codec. pithos.env: the speech depth decoder on the GPU, the codec on the engine's threads.
-ARGS_TEXT, ARGS_SPEECH = "-t 6 --gpu d3d12", "-t 5 --gpu d3d12"
+# for the audio codec. --cache-mb: the saved conversations' budget (the engine's 4 GB default is for
+# a PC; the app's storage is a few GB, and a model and its conversations must fit in it together).
+# pithos.env: the speech depth decoder on the GPU, the codec on the engine's threads.
+CACHE_MB = 256
+ARGS_TEXT, ARGS_SPEECH = f"-t 6 --gpu d3d12 --cache-mb {CACHE_MB}", f"-t 5 --gpu d3d12 --cache-mb {CACHE_MB}"
 ENV_SPEECH = {"PITHOS_SPEECH_DX": "1", "PITHOS_SPEECH_CODEC_THREADS": "0"}
+# a model's saved conversations are kept on the PC while another model is on the console
+CACHE_HOME = os.path.join(ROOT, "build-xbox", "conversations")
+CACHE_EXT = ".pithos-cache"
+
+
+def ls(px, p, sub=""):
+    return px.json("GET", "/api/filesystem/apps/files?" + local_state(p, sub=sub)).get("Items", [])
+
+
+def save_cache(px, p, folder, keep):
+    """moves a model's conversations folder from the console to the PC (keep=False: just deletes it)"""
+    items = [it for it in ls(px, p, folder) if it.get("Type") != 16]
+    dest = os.path.join(CACHE_HOME, folder)
+    if keep:
+        os.makedirs(dest, exist_ok=True)
+        for it in items:
+            data = px.request("GET", "/api/filesystem/apps/file?" + local_state(p, {"filename": it["Name"]}, folder))[1]
+            if len(data) != it.get("FileSize", len(data)): sys.exit(f"{folder}\\{it['Name']}: short download, nothing deleted")
+            with open(os.path.join(dest, it["Name"]), "wb") as f:
+                f.write(data)
+    for it in items:
+        px.request("DELETE", "/api/filesystem/apps/file?" + local_state(p, {"filename": it["Name"]}, folder))
+    px.request("DELETE", "/api/filesystem/apps/file?" + local_state(p, {"filename": folder}))
+    print(f"conversations {folder}: {len(items)} files " + (f"saved in {dest}, removed from the console" if keep else "deleted"))
+
+
+def restore_cache(px, p, folder):
+    """puts a model's conversations saved by save_cache back on the console; the PC copy is removed
+    once every file is there"""
+    src = os.path.join(CACHE_HOME, folder)
+    files = sorted(os.path.join(src, f) for f in os.listdir(src))
+    px.request("POST", "/api/filesystem/apps/folder?" + local_state(p, {"newfoldername": folder}))
+    try:
+        for f in files:
+            px.upload("/api/filesystem/apps/file?" + local_state(p, sub=folder), [f], progress=False)
+    except RuntimeError as e:
+        print(f"conversations {folder}: could not be put back ({e}); they stay in {src}")
+        return
+    for f in files: os.remove(f)
+    os.rmdir(src)
+    print(f"conversations {folder}: {len(files)} files back on the console")
 
 
 def find_projector(model):
@@ -251,10 +298,15 @@ def cmd_use(px, a):
     wanted = ([proj] if proj else []) + [a.model]   # the projector first: the app starts once the model is complete
     names = {os.path.basename(f): os.path.getsize(f) for f in wanted}
     p = need_package(px)
-    there = {it["Name"]: it.get("FileSize", 0)
-             for it in px.json("GET", "/api/filesystem/apps/files?" + local_state(p)).get("Items", []) if "Name" in it}
+    items = ls(px, p)
+    there = {it["Name"]: it.get("FileSize", 0) for it in items if it.get("Type") != 16}
     drop = [n for n in there if n.lower().endswith(".gguf") and names.get(n) != there[n]]
     send = [f for f in wanted if there.get(os.path.basename(f)) != names[os.path.basename(f)]]
+    # the conversations of any other model leave the console (saved on the PC unless --drop-cache),
+    # and the chosen model's come back if they were saved
+    mine = os.path.basename(a.model) + CACHE_EXT
+    away = [it["Name"] for it in items if it.get("Type") == 16 and it["Name"].endswith(CACHE_EXT) and it["Name"] != mine]
+    back = mine if (os.path.isdir(os.path.join(CACHE_HOME, mine)) and not any(it["Name"] == mine for it in items)) else None
     args = a.args or (ARGS_SPEECH if proj else ARGS_TEXT)
     env = None
     if proj and not a.keep_args:
@@ -265,10 +317,13 @@ def cmd_use(px, a):
                                                     else " (text; no projector next to it, so no voice)"))
     print("steps:")
     print("  stop the app")
+    for n in away:
+        print(f"  conversations {n}: " + ("delete" if a.drop_cache else f"save in {os.path.join(CACHE_HOME, n)}, then delete"))
     for n in drop: print(f"  delete {n} ({there[n] / 1e9:.2f} GB)")
     for f in wanted:
         n = os.path.basename(f)
         print(f"  upload {n} ({names[n] / 1e9:.2f} GB)" if f in send else f"  keep {n} (already there)")
+    if back: print(f"  conversations {back}: put back from {os.path.join(CACHE_HOME, back)}")
     if not a.keep_args:
         print(f"  pithos.args: {args}")
         if env: print("  pithos.env: " + " ".join(env.split()))
@@ -281,12 +336,22 @@ def cmd_use(px, a):
         cmd_stop(px, a)
     except urllib.error.HTTPError:
         print("(the app was not running)")
+    for n in away: save_cache(px, p, n, keep=not a.drop_cache)
     for n in drop:
         px.request("DELETE", "/api/filesystem/apps/file?" + local_state(p, {"filename": n}))
         print("removed", n)
     for f in send:
         print(f"uploading {os.path.basename(f)}")
-        px.upload("/api/filesystem/apps/file?" + local_state(p), [f])
+        try:
+            px.upload("/api/filesystem/apps/file?" + local_state(p), [f])
+        except RuntimeError as e:
+            free = "not enough space" in str(e).lower()
+            sys.exit(f"upload of {os.path.basename(f)} failed: {e}\n" +
+                     ("The console's storage is full. A failed upload leaves its copy in the portal's temporary folder until the "
+                      "console restarts: restart it (Settings, or the Device Portal), then run 'use' again; the files already "
+                      "there are kept. Crash dumps also take space (Device Portal > App crash dumps)."
+                      if free else "Run 'use' again: the files already there are kept."))
+    if back: restore_cache(px, p, back)
     if not a.keep_args:
         put_text(px, p, "pithos.args", args + "\n")
         if env: put_text(px, p, "pithos.env", env)
@@ -312,6 +377,7 @@ def main():
     m.add_argument("--args", help='pithos.args to write (default: "%s", or "%s" with a speech model)' % (ARGS_TEXT, ARGS_SPEECH))
     m.add_argument("--keep-args", action="store_true", help="leave pithos.args and pithos.env as they are")
     m.add_argument("--no-launch", action="store_true", help="do not start the app afterwards")
+    m.add_argument("--drop-cache", action="store_true", help="delete other models' saved conversations instead of saving them on the PC")
     m.add_argument("--dry-run", action="store_true", help="print the steps without changing anything")
     u = sub.add_parser("upload"); u.add_argument("file")
     sub.add_parser("files")

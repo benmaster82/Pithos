@@ -681,8 +681,8 @@ with "not enough space on the disk"), and `deploy.py use` switches between them 
 
 | Model | Files to download | What you get on the Xbox | Speed (Game mode) | `pithos.args` |
 |---|---|---|---|---|
-| [LFM3-1.7B](#lfm3-17b-small-and-fast) | `LFM3-1.7B-Q4_K_M.gguf` (1.1 GB) | text: the TV chat, Pandora and the API for the house | 146 tok/s prompt, 29.5 tok/s generation | `-t 6 --gpu d3d12` |
-| [LFM3-Audio-2B](#lfm3-audio-2b-speech-input-and-output-experimental) | `LFM3-Audio-2B-Q4_K_M.gguf` (1.1 GB) and its projector `mmproj-LFM3-Audio-2B-Q4_K_M.gguf` (0.17 GB) | the same text features, plus push-to-talk, spoken answers, Talk mode and hands-free | ~28 tok/s generation, speech at 0.87× real time | `-t 5 --gpu d3d12` and a `pithos.env` ([below](#options-and-best-use)) |
+| [LFM3-1.7B](#lfm3-17b-small-and-fast) | `LFM3-1.7B-Q4_K_M.gguf` (1.1 GB) | text: the TV chat, Pandora and the API for the house | 146 tok/s prompt, 29.5 tok/s generation | `-t 6 --gpu d3d12 --cache-mb 256` |
+| [LFM3-Audio-2B](#lfm3-audio-2b-speech-input-and-output-experimental) | `LFM3-Audio-2B-Q4_K_M.gguf` (1.1 GB) and its projector `mmproj-LFM3-Audio-2B-Q4_K_M.gguf` (0.17 GB) | the same text features, plus push-to-talk, spoken answers, Talk mode and hands-free | ~28 tok/s generation, speech at 0.87× real time | `-t 5 --gpu d3d12 --cache-mb 256` and a `pithos.env` ([below](#options-and-best-use)) |
 
 Download them on the PC into the `models` folder ([LFM3-1.7B](#lfm3-17b-small-and-fast),
 [LFM3-Audio-2B](#lfm3-audio-2b-speech-input-and-output-experimental)), keeping the projector next to
@@ -700,6 +700,19 @@ matters: the app starts as soon as a model has finished uploading, and a project
 later is not seen until the next restart, so the console would run without voice. Files already on
 the console with the same size are not uploaded again, so `use` with the model that is already
 there just rewrites the options and restarts. The upload takes a few minutes over the network.
+
+**Saved conversations.** The server keeps each conversation on the console so it can continue
+without reading it again ([Prompt reuse](#prompt-reuse)), in a folder next to the model
+(`MODEL.gguf.pithos-cache`, about 6–15 MB a conversation). On a PC they may take up to 4 GB; on the
+console the `pithos.args` written by `use` caps them at 256 MB (`--cache-mb 256`, about 15–40
+conversations), and the oldest are deleted when a new one is saved. When you switch model, `use`
+moves the other model's conversations to the PC (`build-xbox\conversations`) and puts them back when
+you choose that model again; `--drop-cache` deletes them instead.
+
+**If an upload fails with "not enough space on the disk"**: a failed upload leaves its copy in the
+Device Portal's temporary folder until the console restarts. Restart the console, then run `use`
+again (the files already there are kept). Crash dumps, if you enabled them, take space too
+(Device Portal → App crash dumps).
 
 - `--dry-run` prints the steps without changing anything;
 - `--args "..."` writes your own `pithos.args` (for example `--args "-t 8"` in App mode);
@@ -763,8 +776,8 @@ app:
 
 | Mode | Recommended `pithos.args` | Why |
 |---|---|---|
-| Game (recommended) | `-t 6 --gpu d3d12` | the GPU does all the work; 6 CPU threads leave room for the system |
-| Game, with LFM3-Audio-2B | `-t 5 --gpu d3d12` | the fifth free core runs the audio codec next to the GPU |
+| Game (recommended) | `-t 6 --gpu d3d12 --cache-mb 256` | the GPU does all the work; 6 CPU threads leave room for the system; saved conversations stay within 256 MB |
+| Game, with LFM3-Audio-2B | `-t 5 --gpu d3d12 --cache-mb 256` | the fifth free core runs the audio codec next to the GPU |
 | App (no Game type) | `-t 8` | Direct3D 12 is not available; all 8 cores give the best CPU speed |
 
 The older `-t 6 --d3d12` still works the same.
@@ -791,7 +804,7 @@ runs at about half that speed.
 - **Access**: the server listens on the whole local network without a key. Add `--api-key KEY`
   to require one on `/v1`.
 - **Prompt reuse** works as on the PC: conversations are saved in `LocalState` and continue after
-  a restart.
+  a restart, within the `--cache-mb` budget (see [Saved conversations](#models-for-the-xbox)).
 - **The TV screen** shows the state, the addresses, the end of the log, a chat with the model
   (without tools) and a button that stops the server; with LFM3-Audio-2B, also the voice buttons and
   Talk mode.
