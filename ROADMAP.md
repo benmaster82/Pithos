@@ -86,6 +86,11 @@ generation uses about 30 of them.
   when RT is pressed, or when a controller with a headset connects
   (`Windows.Gaming.Input.Gamepad.GamepadAdded`, or a `DeviceWatcher` on audio capture devices),
   and say on screen when no microphone is found.
+- [ ] **Conversation budget in the app**: on the console the saved conversations stay within 256 MB
+  only because `deploy.py use` writes `--cache-mb 256` in `pithos.args`. A model uploaded by hand
+  with a `pithos.args` without it gets the PC's 4 GB default, more than the app's storage. Put
+  `--cache-mb 256` among the app's own server options (before `pithos.args`, which can still change
+  it), so the cap holds however the model got there.
 - [ ] **Merge `xbox` into `main`** after review: shared-code changes are small and measured neutral
   on Windows and Linux.
 
