@@ -80,6 +80,12 @@ generation uses about 30 of them.
   does not fit in the Xbox's 5 GB, but it matters for PCs.
 - [ ] **Xbox app type**: every reinstall resets the app to "App", and the user must set "Game"
   again in Dev Home before Direct3D 12 is available. Look for a way to declare it in the package.
+- [ ] **Microphone found only at start**: the app looks for the headset once, when it starts. If
+  the controller is off at that moment (as after a console restart), the log says
+  `voice: no microphone (0xc00dabe0)` and push-to-talk stays off until the app restarts. Try again
+  when RT is pressed, or when a controller with a headset connects
+  (`Windows.Gaming.Input.Gamepad.GamepadAdded`, or a `DeviceWatcher` on audio capture devices),
+  and say on screen when no microphone is found.
 - [ ] **Merge `xbox` into `main`** after review: shared-code changes are small and measured neutral
   on Windows and Linux.
 
