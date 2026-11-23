@@ -147,6 +147,24 @@ for it, few and simple, since LFM3-Audio is a ~2B model:
 - Not possible or not advised: system settings, other apps and their files; launching apps (the
   app would go to the background, and in Game mode be suspended with the engine).
 
+## 10. Inkling 2 Mini (experimental)
+Runs on the CPU and on Vulkan (every layer on the GPU, the routed experts on the CPU, the most used
+NVFP4 experts in VRAM). Reference laptop: prompt 7.1 tok/s, generation 4.6–5.2 tok/s with Vulkan;
+generation is bound by the experts read from disk (the file does not fit in 16 GB of RAM).
+
+- [ ] **Images**: the vision encoder (a 23-layer ViT, `mmproj-F16.gguf`) and the image blocks of the
+  chat template (`<|content_image|>`); today image parts are refused.
+- [ ] **Fewer stops per token**: the GPU stops at each of the 48 layer runs for the CPU's experts.
+  Splitting prompt chunks in two halves, as for Qwen3.6, would keep the GPU busy meanwhile.
+- [ ] **The loop controllers on the GPU**: their small F32 matrices (64 rows, or 64 columns) go
+  through the router kernel with few groups (8 ms a token); a kernel of their own, or F16 weights.
+- [ ] **The other expert layers in VRAM**: layers 20–23 keep their experts in Q5_K and Q8_0 rows of
+  1,152 values, which the GPU kernels do not take yet.
+- [ ] **Smaller session files**: every checkpoint of a conversation holds the window layers' last
+  positions (up to ~164 MB); consecutive checkpoints share most of them.
+- [ ] **Direct3D 12 and OpenCL**: Vulkan only for now.
+- [ ] **The DSpark drafter** (`dspark-Inkling-2-Mini-Q8_0.gguf`, speculative decoding).
+
 ## Done
 - v0.8.0: voice on the Xbox One with LFM3-Audio-2B: push-to-talk through the controller's headset,
   spoken answers with an adaptive playback buffer, Talk mode (full screen) and hands-free listening,

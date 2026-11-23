@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <b>A dependency-free C inference engine for Liquid AI's LFM2 / LFM2.5 / LFM3 models and Qwen3.6.</b><br>
+  <b>A dependency-free C inference engine for Liquid AI's LFM2 / LFM2.5 / LFM3 models, Qwen3.6 and Inkling 2 Mini.</b><br>
   Terminal chat, an OpenAI-compatible server, a web agent, a terminal agent and a voice, all in one executable.
 </p>
 
@@ -15,6 +15,7 @@
   <img alt="GPU: OpenCL, Direct3D 12 or Vulkan, optional" src="https://img.shields.io/badge/GPU-OpenCL%20%7C%20Direct3D%2012%20%7C%20Vulkan%2C%20optional-f5a05a">
   <a href="#lfm3-audio-2b-speech-input-and-output-experimental"><img alt="Speech in and out with LFM3-Audio" src="https://img.shields.io/badge/speech-LFM3--Audio%20in%20%26%20out-14b8a6"></a>
   <a href="#qwen36-35b-a3b-experimental"><img alt="Qwen3.6-35B-A3B (experimental)" src="https://img.shields.io/badge/model-Qwen3.6--35B--A3B%20%28experimental%29-6366f1"></a>
+  <a href="#inkling-2-mini-experimental"><img alt="Inkling 2 Mini (experimental)" src="https://img.shields.io/badge/model-Inkling%202%20Mini%20%28experimental%29-8b5cf6"></a>
   <a href="#server-and-web-chat"><img alt="OpenAI-compatible API: chat and audio" src="https://img.shields.io/badge/API-OpenAI--compatible%20chat%20%26%20audio-6b7280"></a>
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-2ea043"></a>
 </p>
@@ -137,7 +138,7 @@ On Linux / macOS the binary is `build/pithos`, with the same options. For the co
 [Xbox One](#xbox-one): the app is built on a Windows PC and installed over the network.
 
 ### Downloading the model
-Three models are validated, and Qwen3.6 is experimental. Choose by the memory of your computer:
+Three models are validated, and Qwen3.6 and Inkling 2 Mini are experimental. Choose by the memory of your computer:
 
 | Model | Download | RAM | Best for |
 |---|---:|---:|---|
@@ -145,6 +146,7 @@ Three models are validated, and Qwen3.6 is experimental. Choose by the memory of
 | [LFM2.5-8B-A1B](#lfm25-8b-a1b-the-middle-ground) (MoE) | 4.8 GiB | 8 GB | a larger model on the CPU: it fits in RAM and generates as fast as LFM3-1.7B there |
 | [LFM3-1.7B](#lfm3-17b-small-and-fast) (dense) | 1.0 GiB | 4 GB | modest hardware, the fastest with a GPU (the whole model in VRAM), the Xbox One |
 | [Qwen3.6-35B-A3B](#qwen36-35b-a3b-experimental) (MoE, experimental) | 19.1 GiB | 16 GB | the largest; it runs from disk when it does not fit in RAM, best with a GPU |
+| [Inkling 2 Mini](#inkling-2-mini-experimental) (looped MoE, experimental) | 15.5 GiB | 16 GB | strong at coding and agents for its size; slower per token (each token runs 48 layers) |
 
 For speech, [LFM3-Audio-2B](#lfm3-audio-2b-speech-input-and-output-experimental) (experimental,
 1.2 GiB with its audio projector, 4 GB of RAM) transcribes, translates, speaks and holds voice
@@ -396,6 +398,49 @@ with `-m`:
 ```
 build/pithos -m models/Qwen3.6-35B-A3B-Q4_K_M.gguf -i
 build/pithos -m models/Qwen3.6-35B-A3B-Q4_K_M.gguf --server --open
+```
+
+### Inkling 2 Mini (experimental)
+[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) is a looped
+transformer: 24 layers, the middle 12 of which run three times with the same weights, so each token
+goes through 48 layers. Its feed-forward layers are mixtures of 128 experts, 8 per token (26.4 billion
+parameters, 3.4 billion active per layer pass). Attention has no rotary positions: a learned
+relative-position bias, 20 layers with a 1,024-token window and 4 over the whole context; the later
+passes of the loop get messages from the earlier ones. The experts are stored in NVFP4, the 4-bit
+format the model was trained in. It reasons before it answers (its "thinking effort", set with
+`--reasoning` or `reasoning_effort`) and calls tools in JSON, with the same chat, server, Pandora and
+terminal agent as the other models. Images are not supported yet.
+
+With Vulkan (the default for this model on a discrete NVIDIA GPU) every layer runs on the GPU and the
+routed experts on the CPU, the most used of them also in the VRAM that is left (about 450, 1.9 GB on a
+4 GB GPU), computed by the GPU while the CPU computes the others. The window layers keep only their
+last positions, so the KV cache takes about 32 KB per token.
+
+| Inkling 2 Mini on the reference laptop (6-core CPU, 16 GB, 4 GB laptop GPU), warm | Prompt | Generation |
+|---|---:|---:|
+| llama.cpp (master of 2026-11-22), CPU only, cold | 0.8 tok/s | 2.4 tok/s |
+| Pithos, CPU only (`--gpu off`) | 4.2 tok/s | 3.2–3.4 tok/s |
+| **Pithos, Vulkan (default here)** | **7.1 tok/s** | **4.6–5.2 tok/s** |
+
+Each token reads about 1.8 GB of experts, three times as much as Qwen3.6, and the 15.5 GiB file does
+not fit in 16 GB of RAM with everything else: the less used experts come from the disk, which sets
+the speed of generation (with every expert in RAM the GPU path reaches about 6.3 tok/s). Pithos reads
+ahead the experts it expects the next layer to use. Checked against llama.cpp on the same file and
+tokens: perplexity 2.013 (llama.cpp 2.043) over 3 × 256 tokens, 6.808 (6.785) over 1,536 tokens, the same
+most likely token 97% of the time; the tokenizer gives the same ids as Hugging Face's, and the chat
+template the same text as the model's own.
+
+| | |
+|---|---|
+| File | `Inkling-2-Mini-UD-Q4_K_M.gguf` from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), folder `Mainline_Support` (the llama.cpp layout; there it is named `.gguf_file`) |
+| Size | 16,610,544,608 bytes (15.5 GiB): keep about 17 GB free on the disk |
+| SHA-256 | `78fcedcf93c5d1bfe83e225513b71392bb52259be0eaa5f8899c856a2e5834ae` |
+| Download | `bash build.sh --download-model=inkling-2-mini` |
+| License | Apache 2.0 (see the model card) |
+
+```
+build/pithos -m models/Inkling-2-Mini-UD-Q4_K_M.gguf -i
+build/pithos -m models/Inkling-2-Mini-UD-Q4_K_M.gguf --server --open
 ```
 
 ## Results
