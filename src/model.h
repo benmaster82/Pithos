@@ -141,14 +141,17 @@ struct Vulkan;
 /* matmuls on the Vulkan GPU; info: whether single tokens run entirely there (returns 1), or why not */
 int      ctx_set_vk(Context *c, struct Vulkan *v, char *info, int infolen);
 
-/* Snapshot / restore the recurrent state + position (KV entries beyond pos are ignored). */
-typedef struct { int pos; float *conv; } CtxSnapshot;
+/* Snapshot / restore the recurrent state + position (KV entries beyond pos are ignored). Inkling's
+ * snapshot also holds the sliding-window slots' last positions (their KV is a ring): its size,
+ * bytes, grows with pos up to the window; for the other models it is ctx_conv_bytes. */
+typedef struct { int pos; float *conv; size_t bytes; } CtxSnapshot;
 void ctx_snapshot(const Context *c, CtxSnapshot *s);
 void ctx_restore(Context *c, const CtxSnapshot *s);
 void ctx_snapshot_free(CtxSnapshot *s);
 size_t ctx_conv_bytes(const Context *c);
 
-/* Serialize the KV cache rows [0, n) (prompt reuse across processes). The recurrent state
+/* Serialize the KV cache rows [0, n) (prompt reuse across processes); for Inkling those of the
+ * full-attention slots (the window ones are in the snapshots). The recurrent state
  * travels separately as a CtxSnapshot; ctx_kv_read does not change the position.
  * ctx_kv_read loads the first n rows of a block written with n_file rows. */
 size_t ctx_kv_bytes(const Context *c, int n);

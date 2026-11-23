@@ -294,6 +294,7 @@ static int load_inkling2(Model *m, char *err, int errlen) {
         }
     m->n_slot = m->n_layer + (m->n_pass - 1) * (m->loop_end - m->loop_start);
     m->n_attn = m->n_slot;          /* a KV cache per slot */
+    if (m->n_slot > 64) { snprintf(err, errlen, "inkling2_loop: %d cache slots (at most 64)", m->n_slot); return 0; }
     const int D = m->dim, hd = m->head_dim, kvd = m->n_kv_head * hd, qd = m->n_head * hd, lc = m->l_cache;
     m->ik_ch = 2 * kvd + 2 * D;
 
@@ -687,6 +688,10 @@ struct Context {
         float *arena, *pre, *blk[16], *bank_out, *msg, *in, *q, *k, *v, *r, *g, *s, *kd, *vd;
         float *z, *cg, *gain, *forget, *gu, *act, *tab, *mix;
         block_q8_K *qin, *eq;
+        /* KV rows: slot s starts at row koff[s]; the sliding-window slots keep a ring of R rows
+         * (position p in row p % R), the others every position */
+        size_t koff[64];
+        int R, n_full, n_swa;
     } ik;
     /* matmul scheduling */
     MatJob jobs[MAX_JOBS]; int njobs;
@@ -700,6 +705,36 @@ static void *amalloc(size_t n) {
     return p;
 }
 
+/* Inkling: the physical layer a cache slot runs */
+static int ik_phys(const Model *m, int slot) {
+    return slot < m->n_layer ? slot : m->loop_start + (slot - m->n_layer) % (m->loop_end - m->loop_start);
+}
+
+static int ik_swa(const Model *m, int slot) { return m->layers[ik_phys(m, slot)].is_swa; }
+
+/* Inkling's KV rows: a ring of window + batch rows per sliding-window slot (a chunk's tokens
+ * still see their windows while the chunk writes), the whole context per full-attention one */
+static size_t ik_kv_layout(Context *c, int n_ctx) {
+    const Model *m = c->m;
+    c->ik.R = m->swa_window + c->n_batch < n_ctx ? m->swa_window + c->n_batch : n_ctx;
+    size_t rows = 0;
+    for (int s = 0; s < m->n_slot; s++) {
+        c->ik.koff[s] = rows;
+        rows += ik_swa(m, s) ? (size_t)c->ik.R : (size_t)n_ctx;
+        if (ik_swa(m, s)) c->ik.n_swa++;
+        else c->ik.n_full++;
+    }
+    return rows;
+}
+
+/* the KV row of position pos in slot s */
+static size_t ik_row(const Context *c, int s, int pos) {
+    return c->ik.koff[s] + (size_t)(ik_swa(c->m, s) ? pos % c->ik.R : pos);
+}
+
+/* the window rows a snapshot at pos keeps per sliding-window slot: positions [pos - n, pos) */
+static int ik_window(const Context *c, int pos) { return pos < c->m->swa_window ? pos : c->m->swa_window; }
+
 Context *ctx_create(Model *m, ThreadPool *pool, int n_ctx, int n_batch) {
     Context *c = (Context *)calloc(1, sizeof(Context));
     c->m = m;
@@ -712,7 +747,7 @@ Context *ctx_create(Model *m, ThreadPool *pool, int n_ctx, int n_batch) {
     c->pred_layer = -1;
     int B = c->n_batch, D = m->dim, kvd = m->n_kv_head * m->head_dim, qd = m->n_head * m->head_dim;
     int nbd = D / QK_K;
-    size_t kvn = (size_t)m->n_attn * n_ctx * kvd;
+    size_t kvn = (m->ik ? ik_kv_layout(c, n_ctx) : (size_t)m->n_attn * n_ctx) * kvd;
     c->kc = (f16_t *)aligned_malloc(kvn * sizeof(f16_t) + 64, 64);
     c->vc = (f16_t *)aligned_malloc(kvn * sizeof(f16_t) + 64, 64);
     const int vd = m->ssm_vh * m->ssm_d, qkv = 2 * m->ssm_kh * m->ssm_d + vd;
@@ -884,12 +919,33 @@ static size_t conv_state_size(const Context *c) {
     return sizeof(float) * (c->delta_off + (size_t)c->m->n_delta * c->delta_size);
 }
 
+/* Inkling: copy the sliding-window slots' rows of positions [pos - window, pos) between the ring
+ * and buf (K of every such slot, then V), out: ring -> buf */
+static void ik_window_copy(Context *c, int pos, f16_t *buf, int out) {
+    const Model *m = c->m;
+    const size_t kvd = (size_t)m->n_kv_head * m->head_dim;
+    const int w = ik_window(c, pos);
+    for (int kv = 0; kv < 2; kv++)
+        for (int s = 0; s < m->n_slot; s++) {
+            if (!ik_swa(m, s)) continue;
+            f16_t *cache = kv ? c->vc : c->kc;
+            for (int p = pos - w; p < pos; p++, buf += kvd) {
+                f16_t *row = cache + ik_row(c, s, p) * kvd;
+                memcpy(out ? buf : row, out ? row : buf, sizeof(f16_t) * kvd);
+            }
+        }
+}
+
 void ctx_snapshot(const Context *cc, CtxSnapshot *s) {
     Context *c = (Context *)cc;
     sync_to_cpu(c, c->pos);
     s->pos = c->pos;
-    s->conv = (float *)malloc(conv_state_size(c));
-    memcpy(s->conv, c->conv, conv_state_size(c));
+    const size_t cb = conv_state_size(c);
+    const size_t wb = c->m->ik ? 2 * sizeof(f16_t) * (size_t)c->ik.n_swa * ik_window(c, c->pos) * c->m->n_kv_head * c->m->head_dim : 0;
+    s->bytes = cb + wb;
+    s->conv = (float *)malloc(s->bytes);
+    memcpy(s->conv, c->conv, cb);
+    if (wb) ik_window_copy(c, c->pos, (f16_t *)((char *)s->conv + cb), 1);
 }
 
 void ctx_restore(Context *c, const CtxSnapshot *s) {
@@ -898,7 +954,9 @@ void ctx_restore(Context *c, const CtxSnapshot *s) {
     if (c->kv_gpu_n > s->pos) c->kv_gpu_n = s->pos;
     c->conv_cpu_ok = 1;
     c->conv_gpu_ok = 0;
-    memcpy(c->conv, s->conv, conv_state_size(c));
+    const size_t cb = conv_state_size(c);
+    memcpy(c->conv, s->conv, cb);
+    if (c->m->ik) ik_window_copy(c, s->pos, (f16_t *)((char *)s->conv + cb), 0);
 }
 
 void ctx_snapshot_free(CtxSnapshot *s) {
@@ -908,8 +966,18 @@ void ctx_snapshot_free(CtxSnapshot *s) {
 
 size_t ctx_conv_bytes(const Context *c) { return conv_state_size(c); }
 
+/* the attention layers whose KV rows are stored, and where layer l's start (in rows) */
+static int kv_layers(const Context *c) { return c->m->ik ? c->ik.n_full : c->m->n_attn; }
+
+static size_t kv_base(const Context *c, int l) {
+    if (!c->m->ik) return (size_t)l * c->n_ctx;
+    for (int s = 0; s < c->m->n_slot; s++)   /* Inkling: the l-th full-attention slot */
+        if (!ik_swa(c->m, s) && l-- == 0) return c->ik.koff[s];
+    return 0;
+}
+
 size_t ctx_kv_bytes(const Context *c, int n) {
-    return 2 * sizeof(f16_t) * (size_t)c->m->n_attn * n * c->m->n_kv_head * c->m->head_dim;
+    return 2 * sizeof(f16_t) * (size_t)kv_layers(c) * n * c->m->n_kv_head * c->m->head_dim;
 }
 
 /* KV rows [0, n) of every attention layer: all K, then all V. */
@@ -918,8 +986,8 @@ int ctx_kv_write(const Context *cc, int n, FILE *f) {
     sync_to_cpu(c, n);
     const size_t kvd = (size_t)c->m->n_kv_head * c->m->head_dim;
     for (int w = 0; w < 2; w++)
-        for (int l = 0; l < c->m->n_attn; l++) {
-            const f16_t *src = (w ? c->vc : c->kc) + (size_t)l * c->n_ctx * kvd;
+        for (int l = 0; l < kv_layers(c); l++) {
+            const f16_t *src = (w ? c->vc : c->kc) + kv_base(c, l) * kvd;
             if (fwrite(src, sizeof(f16_t) * kvd, (size_t)n, f) != (size_t)n) return 0;
         }
     return 1;
@@ -929,8 +997,8 @@ int ctx_kv_read(Context *c, int n, int n_file, FILE *f) {
     if (n > c->n_ctx || n > n_file) return 0;
     const size_t kvd = (size_t)c->m->n_kv_head * c->m->head_dim;
     for (int w = 0; w < 2; w++)
-        for (int l = 0; l < c->m->n_attn; l++) {
-            f16_t *dst = (w ? c->vc : c->kc) + (size_t)l * c->n_ctx * kvd;
+        for (int l = 0; l < kv_layers(c); l++) {
+            f16_t *dst = (w ? c->vc : c->kc) + kv_base(c, l) * kvd;
             if (fread(dst, sizeof(f16_t) * kvd, (size_t)n, f) != (size_t)n) return 0;
             if (n < n_file && fseek(f, (long)(sizeof(f16_t) * kvd * (size_t)(n_file - n)), SEEK_CUR)) return 0;
         }
@@ -1873,10 +1941,6 @@ static void ik_clip(float *v, int n, float thr) {
         for (int i = 0; i < n; i++) v[i] *= f;
 }
 
-static int ik_phys(const Model *m, int slot) {
-    return slot < m->n_layer ? slot : m->loop_start + (slot - m->n_layer) % (m->loop_end - m->loop_start);
-}
-
 typedef struct {
     Context *c;
     float *const *blk;
@@ -1987,8 +2051,7 @@ static void ik_attn_task(void *ctx, int task, int tid) {
     const int npos = a->pos0 + t + 1;
     const int j0 = a->L->is_swa && npos > m->swa_window ? npos - m->swa_window : 0;
     const int extent = a->L->is_swa ? m->swa_window : m->rel_extent;
-    const size_t lbase = (size_t)a->slot * c->n_ctx * kvd;
-    const f16_t *kc = c->kc + lbase + (size_t)kvh * hd, *vc = c->vc + lbase + (size_t)kvh * hd;
+    const f16_t *kc = c->kc + (size_t)kvh * hd, *vc = c->vc + (size_t)kvh * hd;
     float *s = c->scores + (size_t)tid * c->n_ctx;
     /* the bias by distance, up to the farthest position seen */
     float *tab = c->ik.tab + (size_t)tid * ((m->rel_extent > m->swa_window ? m->rel_extent : m->swa_window) + 1);
@@ -2003,7 +2066,7 @@ static void ik_attn_task(void *ctx, int task, int tid) {
     float mx = sink;
     for (int j = j0; j < npos; j++) {
         const int d = npos - 1 - j;
-        const float v = KS.dot_f16_f32(kc + (size_t)j * kvd, q, hd) * scale + (d < extent ? tab[d] : 0.f);
+        const float v = KS.dot_f16_f32(kc + ik_row(c, a->slot, j) * kvd, q, hd) * scale + (d < extent ? tab[d] : 0.f);
         s[j - j0] = v;
         if (v > mx) mx = v;
     }
@@ -2011,7 +2074,7 @@ static void ik_attn_task(void *ctx, int task, int tid) {
     const float inv = 1.f / sum;
     float acc[256];
     memset(acc, 0, sizeof(float) * hd);
-    for (int j = j0; j < npos; j++) KS.axpy_f16(s[j - j0] * inv, vc + (size_t)j * kvd, acc, hd);
+    for (int j = j0; j < npos; j++) KS.axpy_f16(s[j - j0] * inv, vc + ik_row(c, a->slot, j) * kvd, acc, hd);
     memcpy(c->tmp + (size_t)t * qd + (size_t)h * hd, acc, sizeof(float) * hd);
 }
 
@@ -2147,7 +2210,6 @@ static void ik_layer(Context *c, int slot, int ip, int n, float **blk, int *nblk
     double t0 = time_sec();
     ik_conv(c, slot, c->ik.k, kvd, 0, L->ik_k_conv, swa ? NULL : c->ik.kd, nkv, n);
     ik_conv(c, slot, c->ik.v, kvd, kvd, L->ik_v_conv, swa ? NULL : c->ik.vd, nkv, n);
-    const size_t lbase = (size_t)slot * c->n_ctx * kvd;
     for (int t = 0; t < n; t++) {
         const int pos = c->pos + t;
         const float tau = swa ? 1.f : 1.f + m->log_alpha * logf(fmaxf(1.f, (float)(pos + 1) / (float)m->log_floor));
@@ -2169,8 +2231,8 @@ static void ik_layer(Context *c, int slot, int ip, int n, float **blk, int *nblk
             const float s = (float)(1.0 / sqrt(ss / hd + m->eps));
             for (int i = 0; i < hd; i++) vh[i] *= s;
         }
-        KS.f32_to_f16_row(k, c->kc + lbase + (size_t)pos * kvd, kvd);
-        KS.f32_to_f16_row(v, c->vc + lbase + (size_t)pos * kvd, kvd);
+        KS.f32_to_f16_row(k, c->kc + ik_row(c, slot, pos) * kvd, kvd);
+        KS.f32_to_f16_row(v, c->vc + ik_row(c, slot, pos) * kvd, kvd);
     }
     IkAttnArgs aa = { c, L, slot, n, c->pos };
     pool_run(c->pool, ik_attn_task, &aa, n * nh);

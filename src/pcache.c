@@ -4,10 +4,10 @@
 #include <string.h>
 
 #define MAX_CK 64
-/* Qwen's recurrent state is ~63 MB a checkpoint (LFM's a few hundred KB): at most this many
- * bytes of them in memory, and the first two and last two only in a stored session when they
- * are over DISK_CK_BYTES (a new conversation reuses the system prompt and the tools, a
- * continued one the end) */
+/* Qwen's recurrent state is ~63 MB a checkpoint (LFM's a few hundred KB, Inkling's up to ~170 MB
+ * with its window rows): at most this many bytes of them in memory, and in a stored session
+ * those that fit in DISK_CK_BYTES, the last one first, then the first ones and the ones before
+ * the last (a new conversation reuses the system prompt and the tools, a continued one the end) */
 #define CK_BYTES (512ull << 20)
 #define DISK_CK_BYTES (256ull << 20)
 #define FILE_EXT ".pithoskv"
@@ -27,6 +27,8 @@ typedef struct {
 } FileHdr;
 
 static const char MAGIC[8] = { 'L', 'F', 'M', 'C', 'K', 'V', '1', 0 };
+/* checkpoints of different sizes (Inkling): their sizes (uint64) follow the positions */
+static const char MAGIC2[8] = { 'L', 'F', 'M', 'C', 'K', 'V', '2', 0 };
 
 struct PCache {
     Context *c;
@@ -74,7 +76,8 @@ static int read_index_entry(PCache *pc, const char *name, Stored *s) {
     FILE *f = file_open(path, "rb");
     if (!f) return 0;
     FileHdr h;
-    int ok = fread(&h, sizeof(h), 1, f) == 1 && !memcmp(h.magic, MAGIC, 8) && h.model_id == pc->model_id &&
+    int ok = fread(&h, sizeof(h), 1, f) == 1 && (!memcmp(h.magic, MAGIC, 8) || !memcmp(h.magic, MAGIC2, 8)) &&
+             h.model_id == pc->model_id &&
              h.n > 0 && h.nck > 0 && h.nck <= MAX_CK && h.n <= ctx_n_ctx(pc->c) &&
              h.conv_bytes == ctx_conv_bytes(pc->c) && h.kv_row_bytes == ctx_kv_bytes(pc->c, 1);
     if (ok) {
@@ -87,7 +90,13 @@ static int read_index_entry(PCache *pc, const char *name, Stored *s) {
         s->ckpos = (int *)malloc(sizeof(int) * (size_t)h.nck);
         ok = fread(s->toks, sizeof(int), (size_t)h.n, f) == (size_t)h.n &&
              fread(s->ckpos, sizeof(int), (size_t)h.nck, f) == (size_t)h.nck && s->ckpos[h.nck - 1] == h.n;
-        s->bytes = sizeof(h) + sizeof(int) * (uint64_t)(h.n + h.nck) + h.conv_bytes * h.nck + h.kv_row_bytes * h.n;
+        uint64_t ckb = h.conv_bytes * h.nck, sz[MAX_CK];
+        if (ok && !memcmp(h.magic, MAGIC2, 8)) {
+            ok = fread(sz, sizeof(uint64_t), (size_t)h.nck, f) == (size_t)h.nck;
+            ckb = sizeof(uint64_t) * (uint64_t)h.nck;
+            for (int k = 0; ok && k < h.nck; k++) ckb += sz[k];
+        }
+        s->bytes = sizeof(h) + sizeof(int) * (uint64_t)(h.n + h.nck) + ckb + h.kv_row_bytes * h.n;
         if (!ok) stored_free(s);
     }
     fclose(f);
@@ -219,18 +228,22 @@ static int load_stored(PCache *pc, int i, int upto) {
     FileHdr h;
     int ok = fread(&h, sizeof(h), 1, f) == 1 && h.n == s->n && h.nck == s->nck;
     ok = ok && !fseek(f, (long)(sizeof(int) * (size_t)(h.n + h.nck)), SEEK_CUR);
+    uint64_t sz[MAX_CK];
+    for (int k = 0; k < MAX_CK; k++) sz[k] = h.conv_bytes;
+    if (ok && !memcmp(h.magic, MAGIC2, 8)) ok = fread(sz, sizeof(uint64_t), (size_t)h.nck, f) == (size_t)h.nck;
     drop_ck_after(pc, -1);
     pc->n = 0;
     for (int k = 0; ok && k < s->nck; k++) {
         if (s->ckpos[k] > upto) {
-            ok = !fseek(f, (long)h.conv_bytes, SEEK_CUR);
+            ok = !fseek(f, (long)sz[k], SEEK_CUR);
             continue;
         }
         CtxSnapshot *cs = &pc->ck[pc->nck];
         cs->pos = s->ckpos[k];
-        cs->conv = (float *)malloc(h.conv_bytes);
+        cs->bytes = (size_t)sz[k];
+        cs->conv = (float *)malloc(cs->bytes);
         pc->nck++;
-        ok = fread(cs->conv, 1, h.conv_bytes, f) == h.conv_bytes;
+        ok = cs->conv && fread(cs->conv, 1, cs->bytes, f) == cs->bytes;
     }
     ok = ok && pc->nck > 0 && pc->ck[pc->nck - 1].pos == upto && ctx_kv_read(pc->c, upto, h.n, f);
     fclose(f);
@@ -284,20 +297,28 @@ float *pcache_feed(PCache *pc, const int *toks, int n) {
     return lg;
 }
 
+/* drop the checkpoint whose removal leaves the smallest gap (keep the latest one) */
+static void drop_one_ck(PCache *pc) {
+    int vi = 0, vgap = 0;
+    for (int i = 0; i < pc->nck - 1; i++) {
+        int gap = pc->ck[i + 1].pos - (i ? pc->ck[i - 1].pos : 0);
+        if (i == 0 || gap < vgap) { vi = i; vgap = gap; }
+    }
+    ctx_snapshot_free(&pc->ck[vi]);
+    memmove(&pc->ck[vi], &pc->ck[vi + 1], sizeof(CtxSnapshot) * (size_t)(pc->nck - 1 - vi));
+    pc->nck--;
+}
+
 void pcache_checkpoint(PCache *pc) {
     if (pc->n == 0 || (pc->nck > 0 && pc->ck[pc->nck - 1].pos == pc->n)) return;
-    if (pc->nck == pc->max_ck) {
-        /* drop the checkpoint whose removal leaves the smallest gap (keep the latest one) */
-        int vi = 0, vgap = 0;
-        for (int i = 0; i < pc->nck - 1; i++) {
-            int gap = pc->ck[i + 1].pos - (i ? pc->ck[i - 1].pos : 0);
-            if (i == 0 || gap < vgap) { vi = i; vgap = gap; }
-        }
-        ctx_snapshot_free(&pc->ck[vi]);
-        memmove(&pc->ck[vi], &pc->ck[vi + 1], sizeof(CtxSnapshot) * (size_t)(pc->nck - 1 - vi));
-        pc->nck--;
-    }
+    if (pc->nck == pc->max_ck) drop_one_ck(pc);
     ctx_snapshot(pc->c, &pc->ck[pc->nck++]);
+    for (;;) {   /* within CK_BYTES (Inkling's snapshots grow with the position) */
+        uint64_t tot = 0;
+        for (int i = 0; i < pc->nck; i++) tot += pc->ck[i].bytes;
+        if (tot <= CK_BYTES || pc->nck <= 1) break;
+        drop_one_ck(pc);
+    }
 }
 
 int pcache_save(PCache *pc) {
@@ -316,10 +337,20 @@ int pcache_save(PCache *pc) {
     h.model_id = pc->model_id;
     h.n = pc->n;
     h.conv_bytes = ctx_conv_bytes(pc->c);
-    int sel[MAX_CK], ns = 0;   /* the checkpoints written */
-    const int few = (uint64_t)h.conv_bytes * (uint64_t)pc->nck > DISK_CK_BYTES && pc->nck > 4;
+    /* the checkpoints written: the last, then by turns the first ones and the ones before the
+     * last, while they fit in DISK_CK_BYTES */
+    int sel[MAX_CK], ns = 0, keep[MAX_CK] = {0}, varied = 0;
+    uint64_t tot = 0, ckb = 0;
+    for (int k = 0; k < pc->nck; k++) varied |= pc->ck[k].bytes != h.conv_bytes;
+    for (int r = 0; r < pc->nck; r++) {
+        const int k = r == 0 ? pc->nck - 1 : r % 2 ? (r - 1) / 2 : pc->nck - 1 - r / 2;
+        if (keep[k] || (r && tot + pc->ck[k].bytes > DISK_CK_BYTES)) continue;
+        keep[k] = 1;
+        tot += pc->ck[k].bytes;
+    }
     for (int k = 0; k < pc->nck; k++)
-        if (!few || k < 2 || k >= pc->nck - 2) sel[ns++] = k;
+        if (keep[k]) { sel[ns++] = k; ckb += pc->ck[k].bytes; }
+    if (varied) memcpy(h.magic, MAGIC2, 8);
     h.nck = ns;
     h.kv_row_bytes = ctx_kv_bytes(pc->c, 1);
     h.seq = ++pc->seq;
@@ -327,7 +358,11 @@ int pcache_save(PCache *pc) {
     if (!f) return 0;
     int ok = fwrite(&h, sizeof(h), 1, f) == 1 && fwrite(pc->toks, sizeof(int), (size_t)pc->n, f) == (size_t)pc->n;
     for (int k = 0; ok && k < ns; k++) ok = fwrite(&pc->ck[sel[k]].pos, sizeof(int), 1, f) == 1;
-    for (int k = 0; ok && k < ns; k++) ok = fwrite(pc->ck[sel[k]].conv, 1, h.conv_bytes, f) == h.conv_bytes;
+    for (int k = 0; ok && varied && k < ns; k++) {
+        const uint64_t b = pc->ck[sel[k]].bytes;
+        ok = fwrite(&b, sizeof(b), 1, f) == 1;
+    }
+    for (int k = 0; ok && k < ns; k++) ok = fwrite(pc->ck[sel[k]].conv, 1, pc->ck[sel[k]].bytes, f) == pc->ck[sel[k]].bytes;
     ok = ok && ctx_kv_write(pc->c, pc->n, f);
     ok = (fclose(f) == 0) && ok;
     if (!ok || !file_rename(tmp, path)) { file_remove(tmp); return 0; }
@@ -339,7 +374,8 @@ int pcache_save(PCache *pc) {
     memcpy(s.toks, pc->toks, sizeof(int) * (size_t)s.n);
     s.ckpos = (int *)malloc(sizeof(int) * (size_t)s.nck);
     for (int k = 0; k < s.nck; k++) s.ckpos[k] = pc->ck[sel[k]].pos;
-    s.bytes = sizeof(h) + sizeof(int) * (uint64_t)(s.n + s.nck) + h.conv_bytes * s.nck + h.kv_row_bytes * s.n;
+    s.bytes = sizeof(h) + sizeof(int) * (uint64_t)(s.n + s.nck) + (varied ? sizeof(uint64_t) * (uint64_t)s.nck : 0) + ckb +
+              h.kv_row_bytes * s.n;
     if (pc->src >= 0) {
         stored_free(&pc->files[pc->src]);
         pc->files[pc->src] = s;
