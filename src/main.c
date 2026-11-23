@@ -1092,10 +1092,12 @@ static int real_main(int argc, char **argv) {
         fprintf(stderr, "mlock: %s\n", ok ? "ok" : "failed (continuing without it)");
     }
 
+    int ik_auto = 0;   /* Inkling 2 runs on Vulkan only: --gpu auto takes a discrete NVIDIA GPU, as for dense models */
     if (m.ik && (a.gpu_auto || a.gpu_use)) {
-        fprintf(stderr, "GPU: none, Inkling 2 runs on the CPU only for now\n");
+        if (a.gpu_use & (USE_CL | USE_DX)) fprintf(stderr, "GPU: Inkling 2 runs on Vulkan only (not OpenCL / Direct3D 12)\n");
+        ik_auto = a.gpu_auto && a.gpu_device < 0;
         a.gpu_auto = 0;
-        a.gpu_use = 0;
+        a.gpu_use = USE_VK;
     }
     /* OpenCL alone on a GPU that takes the prompt in tiles: larger batches fill them (gpu_prompt_batch) */
     {
@@ -1138,7 +1140,7 @@ static int real_main(int argc, char **argv) {
         if ((use & USE_VK) && dx) {
             fprintf(stderr, "GPU: Vulkan not used (Direct3D 12 already runs the matmuls: choose one)\n");
         } else if (use & USE_VK) {
-            const int dev = a.vk_device >= 0 ? a.vk_device : one ? a.gpu_device : -1;
+            const int dev = a.vk_device >= 0 ? a.vk_device : ik_auto ? VK_AUTO_DEVICE : one ? a.gpu_device : -1;
             vk = start_vk(&m, ctx, dev, info_vk, sizeof(info_vk));
             if (vk) print_gpu("Vulkan", info_vk);
             else fprintf(stderr, "GPU: Vulkan not used (%s)\n", info_vk);

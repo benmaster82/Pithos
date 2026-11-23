@@ -403,7 +403,8 @@ static VkInstance vk_instance(VkApi *vk) {
 
 enum { K_Q4_K, K_Q6_K, K_Q8_0, N_KERNELS };
 enum { T_RESID, T_QUANT, T_SILU, T_CONV, T_PREP, T_ATTN, T_CONV_CHUNK, T_CONV_STATE, T_ATTN_CHUNK,
-       T_MOE_RESID, T_DCONV, T_DREC, T_QPREP, T_QATTN, T_ROUTER, T_COMBINE, N_TOKEN_KERNELS };   /* kernels_dx_token.hlsl */
+       T_MOE_RESID, T_DCONV, T_DREC, T_QPREP, T_QATTN, T_ROUTER, T_COMBINE,
+       T_IK_MIX, T_IK_NORM, T_IK_CTL, T_IK_ADD, T_IK_CONV, T_IK_PREP, T_IK_ATTN, N_TOKEN_KERNELS };   /* kernels_dx_token.hlsl */
 enum { B_U0 = 0, B_U1 = 1, B_U2 = 2, B_T0 = 8, B_T1 = 9, B_CONST = 16 };   /* descriptor bindings */
 
 typedef struct {
@@ -762,6 +763,10 @@ static int create_pipelines(Vulkan *v) {
         {g_vk_delta_rec, sizeof(g_vk_delta_rec), "delta_rec"}, {g_vk_qattn_prep, sizeof(g_vk_qattn_prep), "qattn_prep"},
         {g_vk_qattn, sizeof(g_vk_qattn), "qattn"}, {g_vk_router, sizeof(g_vk_router), "router"},
         {g_vk_moe_combine, sizeof(g_vk_moe_combine), "moe_combine"},
+        {g_vk_ik_mix, sizeof(g_vk_ik_mix), "ik_mix"}, {g_vk_ik_norm, sizeof(g_vk_ik_norm), "ik_norm"},
+        {g_vk_ik_ctl, sizeof(g_vk_ik_ctl), "ik_ctl"}, {g_vk_ik_add, sizeof(g_vk_ik_add), "ik_add"},
+        {g_vk_ik_conv, sizeof(g_vk_ik_conv), "ik_conv"}, {g_vk_ik_prep, sizeof(g_vk_ik_prep), "ik_prep"},
+        {g_vk_ik_attn, sizeof(g_vk_ik_attn), "ik_attn"},
         {g_vk_mvx_q4_K, sizeof(g_vk_mvx_q4_K), "mv_q4_K"}, {g_vk_mvx_q6_K, sizeof(g_vk_mvx_q6_K), "mv_q6_K"},
         {g_vk_mvx_q8_0, sizeof(g_vk_mvx_q8_0), "mv_q8_0"},
     };
@@ -1024,7 +1029,7 @@ Vulkan *vk_create(const Model *m, int device, char *info, int infolen) {
         const Layer *L = &m->layers[l];
         const Mat *ws[] = {&L->in_proj, &L->out_proj, &L->wq, &L->wk, &L->wv, &L->wo, &L->attn_gate,
                            &L->w_gate, &L->w_up, &L->w_down, &L->ssm_qkv, &L->ssm_z, &L->ssm_alpha,
-                           &L->ssm_beta, &L->ssm_out, &L->sh_gate, &L->sh_up, &L->sh_down};
+                           &L->ssm_beta, &L->ssm_out, &L->sh_gate, &L->sh_up, &L->sh_down, &L->ik_rel, &L->ik_gate};
         for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) add_mat(v, ws[i], &cap);
     }
     add_mat(v, &m->output, &cap);
@@ -1233,9 +1238,11 @@ typedef struct VDense {
     void *moe_arg;
     int cur_t0, cur_n, cur_split;   /* the rows of the running moe callback, and whether the pass is split */
     struct VExp *xp;                /* the experts in VRAM, or NULL */
+    struct IkV *ik;                 /* Inkling 2 (ik_forward), or NULL */
 } VDense;
 
 static void xp_free(Vulkan *v);
+static void ik_free(VDense *t);
 
 static void dense_free(Vulkan *v) {
     VDense *t = v->dense;
@@ -1243,6 +1250,7 @@ static void dense_free(Vulkan *v) {
     VBuf *bufs[] = {&t->scratch, &t->kv, &t->cs, &t->sw, &t->in, &t->lrb, &t->hrb};
     for (size_t i = 0; i < sizeof(bufs) / sizeof(bufs[0]); i++) vbuf_free(v, bufs[i]);
     xp_free(v);
+    ik_free(t);
     free(t->layers);
     free(t);
     v->dense = NULL;
@@ -1269,11 +1277,13 @@ static size_t carve(size_t *top, size_t bytes) {
 }
 
 static int hybrid_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *info, int infolen);
+static int ik_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *info, int infolen);
 
 int vk_dense_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *info, int infolen) {
     info[0] = 0;
     if (!v || v->broken) return 0;
     if (m->n_delta) return hybrid_init(v, m, n_ctx, n_batch, info, infolen);
+    if (m->ik) return ik_init(v, m, n_ctx, n_batch, info, infolen);
     const int D = m->dim, hd = m->head_dim;
     int F = 0, ok = D % QK_K == 0 && hd % 2 == 0 && hd <= 512 && 256 % (hd / 2) == 0 && m->l_cache >= 2;
     const VMat *output = find_mat(v, m->output.data);
@@ -1816,6 +1826,452 @@ static int hybrid_forward(Vulkan *v, const float *x, int n, const float *rope_cs
     return ok;
 }
 
+/* ------------------------------------------------------------------ Inkling 2
+ *
+ * inkling2_loop: every slot on the GPU but the routed experts, as model.c's ik_layers does it on
+ * the CPU (the same steps, in the same order). At each slot the GPU stops with the FFN input h
+ * and the router's logits read back; the CPU's experts come back through IN (in_y) and the next
+ * command buffer starts with that slot's FFN output convolution and residual add. The KV buffer
+ * and the state are the CPU's arrays as they are (the window slots in rings), so vk_dense_kv and
+ * vk_dense_conv copy rows and state between the two. */
+
+typedef struct {
+    const VMat *wq, *wk, *wv, *wo, *rel, *gate;
+    uint32_t attn_norm, q_norm, k_norm, v_norm, attn_query, ffn_query, ffn_norm;   /* SW offsets */
+    uint32_t q_clip, rel_clip, rel_bias, k_conv, v_conv, o_conv, f_conv, sink, kdyn, vdyn, router;
+    int swa, extent;
+} IkVLayer;
+
+typedef struct { uint32_t msg_query, down[4], gain[4], forget[4]; } IkVLoop;
+
+typedef struct IkV {
+    IkVLayer *L;
+    IkVLoop *lp;
+    uint32_t embd_norm, out_query;
+    int R, nr, lc, ch, E, rank;
+    size_t koff[64];                /* the KV rows of each slot, as model.c's ik_kv_layout */
+    size_t o_pre, o_bank, o_blk, blk_stride, o_msg, o_in, o_q, o_k, o_v, o_r, o_g, o_s, o_kd, o_vd, o_tmp, o_qin, o_q8t;
+    size_t o_h, o_z, o_cg, o_gain, o_forget, o_rl, o_mix;
+    size_t in_y;                    /* IN: the CPU's experts of the slot [n][dim] */
+} IkV;
+
+static void ik_free(VDense *t) {
+    if (!t || !t->ik) return;
+    free(t->ik->L);
+    free(t->ik->lp);
+    free(t->ik);
+    t->ik = NULL;
+}
+
+static int ik_swa(const Model *m, int slot) {
+    return m->layers[slot < m->n_layer ? slot : m->loop_start + (slot - m->n_layer) % (m->loop_end - m->loop_start)].is_swa;
+}
+
+static int ik_init(Vulkan *v, const Model *m, int n_ctx, int n_batch, char *info, int infolen) {
+    const int D = m->dim, hd = m->head_dim, nh = m->n_head, nkv = m->n_kv_head, kvd = nkv * hd, qd = nh * hd;
+    const int lc = m->l_cache, nblk = 2 * (m->n_layer / m->res_block);
+    const VMat *output = find_mat(v, m->output.data);
+    int ok = D % QK_K == 0 && qd % QK_K == 0 && hd % 2 == 0 && hd <= 128 && m->n_rel <= 64 && m->rel_extent <= 1024 &&
+             m->swa_window <= 1024 && lc <= 8 && nblk <= 16 && m->n_slot <= 64 && fabsf(m->eps - 1e-6f) < 1e-9f &&
+             m->gate_rank % 4 == 0 && output && output->nparts;
+    VDense *t = (VDense *)calloc(1, sizeof(VDense));
+    IkV *k = (IkV *)calloc(1, sizeof(IkV));
+    t->m = m;
+    t->ik = k;
+    t->n_ctx = n_ctx;
+    t->B = n_batch < 1 ? 1 : n_batch;
+    t->D = D;
+    t->hd = hd;
+    t->nh = nh;
+    t->nkv = nkv;
+    t->kvd = kvd;
+    t->qd = qd;
+    t->E = m->n_expert;
+    t->n_attn = m->n_slot;
+    t->output = output;
+    k->nr = m->n_rel;
+    k->lc = lc;
+    k->ch = m->ik_ch;
+    k->E = m->n_expert;
+    k->rank = m->gate_rank;
+    v->dense = t;
+    /* the KV rows: model.c's ik_kv_layout with the same batch size */
+    k->R = m->swa_window + t->B < n_ctx ? m->swa_window + t->B : n_ctx;
+    size_t rows = 0;
+    for (int s = 0; s < m->n_slot; s++) {
+        k->koff[s] = rows;
+        rows += ik_swa(m, s) ? (size_t)k->R : (size_t)n_ctx;
+    }
+    t->kv_half = rows * (size_t)kvd * 2;
+    t->cs_bytes = (size_t)m->n_slot * (size_t)(lc - 1) * (size_t)m->ik_ch * 4;
+
+    float *sw = NULL;
+    size_t len = 0, cap = 0;
+    k->L = (IkVLayer *)calloc((size_t)m->n_layer, sizeof(IkVLayer));
+    k->lp = (IkVLoop *)calloc((size_t)(m->loop_end - m->loop_start), sizeof(IkVLoop));
+#define F32(mat) ((const float *)(mat).data)
+    for (int l = 0; l < m->n_layer && ok; l++) {
+        const Layer *L = &m->layers[l];
+        IkVLayer *X = &k->L[l];
+        X->swa = L->is_swa;
+        X->extent = L->is_swa ? m->swa_window : m->rel_extent;
+        X->wq = find_mat(v, L->wq.data);
+        X->wk = find_mat(v, L->wk.data);
+        X->wv = find_mat(v, L->wv.data);
+        X->wo = find_mat(v, L->wo.data);
+        X->rel = find_mat(v, L->ik_rel.data);
+        X->gate = find_mat(v, L->ik_gate.data);
+        const VMat *ms[] = {X->wq, X->wk, X->wv, X->wo, X->rel, X->gate};
+        for (size_t i = 0; i < sizeof(ms) / sizeof(ms[0]) && ok; i++) ok = ms[i] && ms[i]->nparts;
+        ok = ok && L->ik_sink.type == GGML_F32 && L->router.type == GGML_F32 && (L->is_swa || L->ik_kdyn.type == GGML_F32);
+        if (!ok) break;
+        X->attn_norm = add_vec(&sw, &len, &cap, L->attn_norm, (size_t)D);
+        X->q_norm = add_vec(&sw, &len, &cap, L->ik_q_norm, (size_t)D);
+        X->k_norm = add_vec(&sw, &len, &cap, L->ik_k_norm, (size_t)D);
+        X->v_norm = add_vec(&sw, &len, &cap, L->ik_v_norm, (size_t)D);
+        X->attn_query = add_vec(&sw, &len, &cap, L->ik_attn_query, (size_t)D * (L->is_swa ? 1 : 3));
+        X->ffn_query = add_vec(&sw, &len, &cap, L->ik_ffn_query, (size_t)D);
+        X->ffn_norm = add_vec(&sw, &len, &cap, L->ffn_norm, (size_t)D);
+        X->q_clip = add_vec(&sw, &len, &cap, L->ik_q_clip, (size_t)qd);
+        X->rel_clip = add_vec(&sw, &len, &cap, L->ik_rel_clip, (size_t)nh * m->n_rel);
+        X->rel_bias = add_vec(&sw, &len, &cap, L->ik_rel_bias, (size_t)X->extent * m->n_rel);
+        X->k_conv = add_vec(&sw, &len, &cap, L->ik_k_conv, (size_t)kvd * lc);
+        X->v_conv = add_vec(&sw, &len, &cap, L->ik_v_conv, (size_t)kvd * lc);
+        X->o_conv = add_vec(&sw, &len, &cap, L->ik_o_conv, (size_t)D * lc);
+        X->f_conv = add_vec(&sw, &len, &cap, L->ik_f_conv, (size_t)D * lc);
+        X->sink = add_vec(&sw, &len, &cap, F32(L->ik_sink), (size_t)nh * D);
+        X->kdyn = L->is_swa ? NONE_OFF : add_vec(&sw, &len, &cap, F32(L->ik_kdyn), (size_t)lc * nkv * D);
+        X->vdyn = L->is_swa ? NONE_OFF : add_vec(&sw, &len, &cap, F32(L->ik_vdyn), (size_t)lc * nkv * D);
+        X->router = add_vec(&sw, &len, &cap, F32(L->router), (size_t)m->n_expert * D);
+    }
+    for (int l = m->loop_start; l < m->loop_end && ok; l++) {
+        const IkLoop *lp = &m->ik_loop[l - m->loop_start];
+        IkVLoop *Y = &k->lp[l - m->loop_start];
+        Y->msg_query = add_vec(&sw, &len, &cap, lp->msg_query, (size_t)4 * D);
+        for (int c = 0; c < 4; c++) {
+            Y->down[c] = add_vec(&sw, &len, &cap, F32(lp->down[c]), (size_t)k->rank * 2 * D);
+            Y->gain[c] = add_vec(&sw, &len, &cap, F32(lp->gain[c]), (size_t)D * k->rank);
+            Y->forget[c] = add_vec(&sw, &len, &cap, F32(lp->forget[c]), (size_t)D * k->rank);
+        }
+    }
+#undef F32
+    k->embd_norm = add_vec(&sw, &len, &cap, m->embd_norm, (size_t)D);
+    k->out_query = add_vec(&sw, &len, &cap, m->out_query, (size_t)D);
+    t->final_norm = add_vec(&sw, &len, &cap, m->final_norm, (size_t)D);
+    if (!ok) {
+        free(sw);
+        dense_free(v);
+        snprintf(info, (size_t)infolen, "some weights or sizes of this model do not fit the GPU kernels");
+        return 0;
+    }
+
+    size_t top = 0;
+    const size_t B = (size_t)t->B, BD = B * D * 4, nbd = (size_t)(D / QK_K);
+    t->o_x = carve(&top, BD);
+    t->o_out = carve(&top, BD);
+    t->o_hq = carve(&top, B * nbd * Q8_BYTES);
+    k->o_pre = carve(&top, BD);
+    k->o_bank = carve(&top, BD);
+    k->blk_stride = BD;
+    k->o_blk = carve(&top, BD * (size_t)nblk);
+    k->o_msg = carve(&top, 4 * BD);
+    k->o_in = carve(&top, 3 * BD);
+    k->o_qin = carve(&top, 3 * B * nbd * Q8_BYTES);
+    k->o_q = carve(&top, B * qd * 4);
+    k->o_k = carve(&top, B * kvd * 4);
+    k->o_v = carve(&top, B * kvd * 4);
+    k->o_r = carve(&top, B * nh * m->n_rel * 4);
+    k->o_g = carve(&top, B * qd * 4);
+    k->o_s = carve(&top, B * nh * 4);
+    k->o_kd = carve(&top, B * lc * nkv * 4);
+    k->o_vd = carve(&top, B * lc * nkv * 4);
+    k->o_tmp = carve(&top, B * qd * 4);
+    k->o_q8t = carve(&top, B * (qd / QK_K) * Q8_BYTES);
+    k->o_h = carve(&top, BD);
+    k->o_z = carve(&top, 2 * BD);
+    k->o_cg = carve(&top, B * k->rank * 4);
+    k->o_gain = carve(&top, BD);
+    k->o_forget = carve(&top, BD);
+    k->o_rl = carve(&top, B * k->E * 4);
+    k->o_mix = carve(&top, BD);
+    t->o_logits = carve(&top, (size_t)m->n_vocab * 4);
+    t->o_last = carve(&top, nbd * Q8_BYTES);
+    k->in_y = BD;
+    t->hb_rl = BD;
+    const size_t kv_bytes = 2 * t->kv_half, max_buf = v->props.limits.maxStorageBufferRange;
+    if (kv_bytes > max_buf || top > max_buf || t->cs_bytes > max_buf || len * 4 > max_buf) {
+        free(sw);
+        dense_free(v);
+        snprintf(info, (size_t)infolen, "a %d-token KV cache (%.0f MB) exceeds the %u MB buffer limit: lower -c", n_ctx,
+                 kv_bytes / 1048576.0, (unsigned)(max_buf >> 20));
+        return 0;
+    }
+    ok = vbuf_create(v, &t->scratch, top, HOST_NONE) && vbuf_create(v, &t->kv, kv_bytes, HOST_NONE) &&
+         vbuf_create(v, &t->cs, t->cs_bytes, HOST_NONE) && vbuf_create(v, &t->sw, len * 4, HOST_NONE) &&
+         vbuf_create(v, &t->in, 2 * BD + 256, HOST_UPLOAD) && vbuf_create(v, &t->lrb, (size_t)(m->n_vocab + D) * 4, HOST_READBACK) &&
+         vbuf_create(v, &t->hrb, BD + B * k->E * 4, HOST_READBACK) && vbuf_reserve(v, &v->up, len * 4, HOST_UPLOAD);
+    if (ok) {
+        memcpy(v->up.map, sw, len * 4);
+        copy(v, &t->sw, 0, &v->up, 0, len * 4);
+        ok = submit(v);
+    }
+    free(sw);
+    if (!ok) {
+        dense_free(v);
+        snprintf(info, (size_t)infolen, "not enough GPU memory for a %d-token context and %d-token batches", n_ctx, t->B);
+        return 0;
+    }
+    snprintf(info, (size_t)infolen, "every slot on the GPU, the routed experts on the CPU, %.0f MB of KV cache, %.0f MB of "
+             "state, %.0f MB of small weights, %.0f MB of activations", kv_bytes / 1048576.0, t->cs_bytes / 1048576.0,
+             len * 4 / 1048576.0, top / 1048576.0);
+    return 1;
+}
+
+/* the GPU steps: offsets in scratch unless said otherwise, rows of n tokens */
+static int ik_add(Vulkan *v, size_t dst, size_t a, size_t b, int a_in, int n) {
+    const VDense *t = v->dense;
+    const uint32_t c[16] = {(uint32_t)t->D, (uint32_t)dst, (uint32_t)a, b == (size_t)NONE_OFF ? NONE_OFF : (uint32_t)b, 0,
+                            (uint32_t)a_in};
+    return tok_run(v, T_IK_ADD, c, (uint32_t)(t->D + 255) / 256, (uint32_t)n);
+}
+
+/* rmsnorm (weight NONE_OFF: none) of rows at in (row bytes irow) to out (orow, NONE_OFF: not) and Q8_K at q (NONE_OFF: not) */
+static int ik_norm(Vulkan *v, size_t in, uint32_t irow, size_t out, uint32_t orow, size_t q, uint32_t w, float eps, int n) {
+    const VDense *t = v->dense;
+    const uint32_t c[16] = {(uint32_t)t->D, (uint32_t)in, irow, out == (size_t)NONE_OFF ? NONE_OFF : (uint32_t)out, orow,
+                            q == (size_t)NONE_OFF ? NONE_OFF : (uint32_t)q, w, fbits(eps)};
+    return tok_run(v, T_IK_NORM, c, 1, (uint32_t)n);
+}
+
+/* out[t][r] = f32 matrix (SW, rows x cols) . row t of x (cols floats), out rows orow floats apart */
+static int ik_f32(Vulkan *v, uint32_t w, int rows, int cols, size_t x, size_t out, int orow, int n) {
+    const uint32_t c[16] = {(uint32_t)cols, (uint32_t)x, (uint32_t)n, (uint32_t)out, w, (uint32_t)rows, (uint32_t)orow, NONE_OFF};
+    return tok_run(v, T_ROUTER, c, (uint32_t)(rows + 3) / 4, (uint32_t)(n + 7) / 8);
+}
+
+/* depth attention: out (query q at out + q * B dim) over the block buffers of mask and cur */
+static int ik_mix(Vulkan *v, size_t cur, uint32_t mask, uint32_t queries, int nq, size_t out, int n) {
+    const VDense *t = v->dense;
+    const IkV *k = t->ik;
+    const uint32_t c[16] = {(uint32_t)t->D, (uint32_t)cur, (uint32_t)k->o_blk, (uint32_t)k->blk_stride, mask, queries,
+                            (uint32_t)out, (uint32_t)((size_t)t->B * t->D * 4)};
+    return tok_run(v, T_IK_MIX, c, (uint32_t)nq, (uint32_t)n);
+}
+
+/* controller c of a core layer: x = x - tanh(forget) x + tanh(gain) msg */
+static int ik_control(Vulkan *v, const IkVLoop *Y, int c, size_t x, size_t msg, int n) {
+    const VDense *t = v->dense;
+    const IkV *k = t->ik;
+    const int D = t->D;
+    int ok = ik_norm(v, x, 4 * D, k->o_z, 8 * D, NONE_OFF, NONE_OFF, 1e-6f, n) &&
+             ik_norm(v, msg, 4 * D, k->o_z + 4 * (size_t)D, 8 * D, NONE_OFF, NONE_OFF, 1e-6f, n) &&
+             ik_f32(v, Y->down[c], k->rank, 2 * D, k->o_z, k->o_cg, k->rank, n) &&
+             ik_f32(v, Y->gain[c], D, k->rank, k->o_cg, k->o_gain, D, n) &&
+             ik_f32(v, Y->forget[c], D, k->rank, k->o_cg, k->o_forget, D, n);
+    const uint32_t cc[16] = {(uint32_t)D, (uint32_t)x, (uint32_t)k->o_gain, (uint32_t)k->o_forget, (uint32_t)msg};
+    return ok && tok_run(v, T_IK_CTL, cc, (uint32_t)(D + 255) / 256, (uint32_t)n);
+}
+
+/* the short convolution of slot s over nc channels from channel choff of its state */
+static int ik_conv(Vulkan *v, int s, size_t x, int nc, int choff, uint32_t w, size_t dyn, int n) {
+    const VDense *t = v->dense;
+    const IkV *k = t->ik;
+    const uint32_t state = (uint32_t)(((size_t)s * (size_t)(k->lc - 1) * (size_t)k->ch + (size_t)choff) * 4);
+    const uint32_t c[16] = {(uint32_t)nc, (uint32_t)x, (uint32_t)nc * 4, (uint32_t)n, w, state, (uint32_t)k->lc,
+                            dyn == (size_t)NONE_OFF ? NONE_OFF : (uint32_t)dyn, (uint32_t)(k->lc * t->nkv * 4), (uint32_t)t->hd,
+                            fbits(1.f / sqrtf((float)((dyn == (size_t)NONE_OFF ? 1 : 2) * k->lc + 1))), (uint32_t)(k->ch * 4)};
+    return tok_run(v, T_IK_CONV, c, (uint32_t)(nc + 255) / 256, 1);
+}
+
+/* slot s (physical layer ip) up to the router: its attention, the block bookkeeping, the FFN
+ * input; buf: the block buffer its input goes to if it starts a block; msg: the pass's messages */
+static int ik_slot(Vulkan *v, int s, int ip, int n, int pos0, uint32_t *mask, int buf, const IkVLoop *Y) {
+    VDense *t = v->dense;
+    IkV *k = t->ik;
+    const Model *m = t->m;
+    const IkVLayer *X = &k->L[ip];
+    const int D = t->D, hd = t->hd, nh = t->nh, nkv = t->nkv, kvd = t->kvd, qd = t->qd, swa = X->swa;
+    const size_t BD = (size_t)t->B * D * 4, nbq = (size_t)t->B * (D / QK_K) * Q8_BYTES;
+    const int ninp = swa && !Y ? 1 : 3;
+    int ok = 1;
+    v->tag = "ik.in";
+    if (X->attn_query != NONE_OFF) ok = ik_mix(v, t->o_x, *mask, X->attn_query, swa ? 1 : 3, k->o_in, n);
+    else ok = ik_add(v, k->o_in, t->o_x, NONE_OFF, 0, n);
+    for (int j = 1; j < ninp && ok; j++)
+        if (swa || X->attn_query == NONE_OFF) ok = ik_add(v, k->o_in + j * BD, k->o_in, NONE_OFF, 0, n);
+    for (int j = 0; j < 3 && ok && Y; j++) ok = ik_control(v, Y, j, k->o_in + j * BD, k->o_msg + j * BD, n);
+    for (int j = 0; j < ninp && ok; j++) {
+        const uint32_t w = swa ? X->attn_norm : j == 0 ? X->q_norm : j == 1 ? X->k_norm : X->v_norm;
+        ok = ik_norm(v, k->o_in + j * BD, 4 * D, k->o_in + j * BD, 4 * D, k->o_qin + j * nbq, w, m->eps, n);
+    }
+    const size_t qq = k->o_qin, kq = ninp > 1 ? qq + nbq : qq, vq = ninp > 1 ? qq + 2 * nbq : qq;
+    const size_t qin = k->o_in, kin = ninp > 1 ? qin + BD : qin, vin = ninp > 1 ? qin + 2 * BD : qin;
+    v->tag = "ik.proj";
+    ok = ok && tok_mm(v, X->wq, qq, k->o_q, n, qd) && tok_mm(v, X->wk, kq, k->o_k, n, kvd) && tok_mm(v, X->wv, vq, k->o_v, n, kvd) &&
+         tok_mm(v, X->rel, qq, k->o_r, n, nh * k->nr) && tok_mm(v, X->gate, qq, k->o_g, n, qd);
+    ok = ok && ik_f32(v, X->sink, nh, D, qin, k->o_s, nh, n);
+    if (!swa) ok = ok && ik_f32(v, X->kdyn, k->lc * nkv, D, kin, k->o_kd, k->lc * nkv, n) &&
+                   ik_f32(v, X->vdyn, k->lc * nkv, D, vin, k->o_vd, k->lc * nkv, n);
+    compute_barrier(v);
+    v->tag = "ik.conv";
+    ok = ok && ik_conv(v, s, k->o_k, kvd, 0, X->k_conv, swa ? NONE_OFF : k->o_kd, n) &&
+         ik_conv(v, s, k->o_v, kvd, kvd, X->v_conv, swa ? NONE_OFF : k->o_vd, n);
+    const size_t kbase = k->koff[s] * (size_t)kvd * 2;
+    const uint32_t ring = swa ? (uint32_t)k->R : 0;
+    const uint32_t cp[16] = {(uint32_t)k->o_q, (uint32_t)k->o_r, (uint32_t)k->o_k, (uint32_t)k->o_v,
+                             (uint32_t)kbase, (uint32_t)(t->kv_half + kbase), ring, (uint32_t)pos0,
+                             (uint32_t)(nh | nkv << 16), (uint32_t)(hd | k->nr << 16), X->q_clip, X->rel_clip,
+                             fbits(m->qk_clip), fbits(m->rel_clip), fbits(swa ? 0.f : m->log_alpha), (uint32_t)m->log_floor};
+    v->tag = "ik.prep";
+    ok = ok && tok_run(v, T_IK_PREP, cp, (uint32_t)(2 * nh + 2 * nkv), (uint32_t)n);
+    const uint32_t ca[16] = {(uint32_t)(hd | k->nr << 16), (uint32_t)k->o_q, (uint32_t)k->o_r, (uint32_t)k->o_tmp,
+                             (uint32_t)kbase, (uint32_t)(t->kv_half + kbase), (uint32_t)(nh | nkv << 16), (uint32_t)k->o_g,
+                             (uint32_t)pos0, swa ? (uint32_t)m->swa_window : 0, ring, (uint32_t)k->o_s,
+                             fbits(1.f / sqrtf((float)hd)), X->rel_bias, (uint32_t)X->extent};
+    v->tag = "ik.attn";
+    ok = ok && tok_run(v, T_IK_ATTN, ca, (uint32_t)nh, (uint32_t)n);
+    const uint32_t nbw = (uint32_t)(qd / QK_K);
+    const uint32_t cq[16] = {(uint32_t)k->o_tmp, (uint32_t)k->o_q8t, (uint32_t)qd * 4, nbw * Q8_BYTES};
+    v->tag = "ik.out";
+    ok = ok && tok_run(v, T_QUANT, cq, nbw, (uint32_t)n) && tok_mm(v, X->wo, k->o_q8t, t->o_out, n, D);
+    compute_barrier(v);
+    ok = ok && ik_conv(v, s, t->o_out, D, 2 * kvd, X->o_conv, NONE_OFF, n);
+    v->tag = "ik.block";
+    if (ip % m->res_block == 0) {   /* a block's first layer: its input joins the blocks */
+        const size_t b = k->o_blk + (size_t)buf * k->blk_stride;
+        ok = ok && ik_add(v, b, t->o_x, NONE_OFF, 0, n) && ik_add(v, t->o_x, t->o_out, NONE_OFF, 0, n);
+        *mask |= 1u << buf;
+    } else {
+        ok = ok && ik_add(v, t->o_x, t->o_x, t->o_out, 0, n);
+    }
+    v->tag = "ik.ffn";
+    ok = ok && ik_mix(v, t->o_x, *mask, X->ffn_query, 1, k->o_h, n);
+    if (Y) ok = ok && ik_control(v, Y, 3, k->o_h, k->o_msg + 3 * BD, n);
+    ok = ok && ik_norm(v, k->o_h, 4 * D, k->o_h, 4 * D, t->o_hq, X->ffn_norm, m->eps, n);
+    v->tag = "ik.router";
+    ok = ok && ik_f32(v, X->router, k->E, D, k->o_h, k->o_rl, k->E, n);
+    barrier(v, PS_COMPUTE, AC_SHADER_WRITE, PS_TRANSFER, AC_TRANSFER_READ);
+    copy(v, &t->hrb, 0, &t->scratch, k->o_h, (VkDeviceSize)n * D * 4);
+    copy(v, &t->hrb, t->hb_rl, &t->scratch, k->o_rl, (VkDeviceSize)n * k->E * 4);
+    barrier(v, PS_TRANSFER, AC_TRANSFER_WRITE, PS_HOST, AC_HOST_READ);
+    return ok;
+}
+
+/* the experts of slot s's FFN from the CPU (IN, in_y): their convolution and the residual add */
+static int ik_ffn_end(Vulkan *v, int s, int ip, int n) {
+    VDense *t = v->dense;
+    const IkV *k = t->ik;
+    v->tag = "ik.ffnout";
+    return ik_add(v, t->o_out, k->in_y, NONE_OFF, 1, n) && ik_conv(v, s, t->o_out, t->D, 2 * t->kvd + t->D, k->L[ip].f_conv, NONE_OFF, n) &&
+           ik_add(v, t->o_x, t->o_x, t->o_out, 0, n);
+}
+
+static int ik_forward(Vulkan *v, const float *x, int n, int pos0, float *logits) {
+    VDense *t = v->dense;
+    IkV *k = t->ik;
+    const Model *m = t->m;
+    const int D = t->D, s0 = m->loop_start, s1 = m->loop_end, rb = m->res_block;
+    const size_t BD = (size_t)t->B * D * 4;
+    const float *hb = (const float *)t->hrb.map;
+    float *y = (float *)(t->in.map + k->in_y);
+    v->prof_on = n == 1;
+    v->prof_passes += n == 1 && v->prof;
+    memcpy(t->in.map, x, sizeof(float) * (size_t)n * D);
+    int ok = ik_add(v, t->o_x, 0, NONE_OFF, 1, n) && ik_norm(v, t->o_x, 4 * D, t->o_x, 4 * D, NONE_OFF, k->embd_norm, m->eps, n);
+    uint32_t mask = 0, pre_mask = 0, bank = 0;
+    int prev = -1, prev_ip = -1;   /* the slot whose experts the next command buffer adds */
+#define BUF(ip, pass) (2 * ((ip) / rb) + ((ip) >= s0 && (ip) < s1 ? (pass) & 1 : 0))
+#define RUN(s, ip, Y, pass)                                                                    \
+    do {                                                                                       \
+        if (ok && prev >= 0) ok = ik_ffn_end(v, prev, prev_ip, n);                             \
+        ok = ok && ik_slot(v, s, ip, n, pos0, &mask, BUF(ip, pass), Y) && submit(v);           \
+        if (ok) t->moe(t->moe_arg, ip, hb, hb + t->hb_rl / 4, NULL, n, y, NULL);                \
+        prev = s;                                                                              \
+        prev_ip = ip;                                                                          \
+    } while (0)
+    for (int l = 0; l < s0 && ok; l++) RUN(l, l, NULL, 0);
+    ok = ok && ik_ffn_end(v, prev, prev_ip, n) && ik_add(v, k->o_pre, t->o_x, NONE_OFF, 0, n);
+    prev = -1;
+    pre_mask = mask;
+    for (int pass = 0; pass < m->n_pass && ok; pass++) {
+        if (pass > 0) {
+            if (prev >= 0) ok = ik_ffn_end(v, prev, prev_ip, n);
+            prev = -1;
+            /* the previous pass's blocks after its first core block, and its output */
+            bank = mask & ~pre_mask & ~(1u << BUF(s0, pass - 1));
+            ok = ok && ik_add(v, k->o_bank, t->o_x, NONE_OFF, 0, n) && ik_add(v, t->o_x, k->o_pre, NONE_OFF, 0, n);
+            mask = pre_mask;
+        }
+        for (int ip = s0; ip < s1 && ok; ip++) {
+            const int slot = pass == 0 ? ip : m->n_layer + (pass - 1) * (s1 - s0) + (ip - s0);
+            const IkVLoop *Y = pass > 0 ? &k->lp[ip - s0] : NULL;
+            if (Y) {
+                if (prev >= 0) ok = ik_ffn_end(v, prev, prev_ip, n);
+                prev = -1;
+                ok = ok && ik_mix(v, k->o_bank, bank, Y->msg_query, 4, k->o_msg, n);
+            }
+            RUN(slot, ip, Y, pass);
+        }
+    }
+    for (int l = s1; l < m->n_layer && ok; l++) RUN(l, l, NULL, 0);
+#undef RUN
+#undef BUF
+    ok = ok && ik_ffn_end(v, prev, prev_ip, n) && ik_mix(v, t->o_x, mask, k->out_query, 1, k->o_mix, n) &&
+         ik_norm(v, k->o_mix, 4 * D, NONE_OFF, 0, t->o_hq, t->final_norm, m->eps, n);
+    (void)BD;
+    return finish_pass(v, ok, n, logits, NULL);
+}
+
+/* KV rows of the positions [r0, r1) of every slot (ring slots: their rows of those positions,
+ * the last R at most) between the host arrays and the GPU copy */
+static void ik_kv(Vulkan *v, uint16_t *kc, uint16_t *vc, int r0, int r1, int to_gpu) {
+    VDense *t = v->dense;
+    const IkV *k = t->ik;
+    const Model *m = t->m;
+    const size_t row = (size_t)t->kvd * 2;
+    size_t seg0[128], segn[128], total = 0;   /* row ranges, in rows from the start of the buffer half */
+    int ns = 0;
+    for (int s = 0; s < m->n_slot; s++) {
+        if (!ik_swa(m, s)) {
+            seg0[ns] = k->koff[s] + (size_t)r0;
+            segn[ns++] = (size_t)(r1 - r0);
+            continue;
+        }
+        const int a = r1 - r0 > k->R ? r1 - k->R : r0;   /* positions [a, r1) */
+        const int ra = a % k->R, cnt = r1 - a, first = cnt < k->R - ra ? cnt : k->R - ra;
+        seg0[ns] = k->koff[s] + (size_t)ra;
+        segn[ns++] = (size_t)first;
+        if (cnt > first) {
+            seg0[ns] = k->koff[s];
+            segn[ns++] = (size_t)(cnt - first);
+        }
+    }
+    for (int i = 0; i < ns; i++) total += 2 * segn[i] * row;
+    VBuf *st = to_gpu ? &v->up : &v->rb;
+    if (!vbuf_reserve(v, st, total, to_gpu ? HOST_UPLOAD : HOST_READBACK)) return;
+    size_t so = 0;
+    for (int i = 0; i < ns; i++)
+        for (int h = 0; h < 2; h++) {
+            const size_t off = seg0[i] * row, bytes = segn[i] * row, gpu = (h ? t->kv_half : 0) + off;
+            if (to_gpu) {
+                memcpy(st->map + so, (uint8_t *)(h ? vc : kc) + off, bytes);
+                copy(v, &t->kv, gpu, st, so, bytes);
+            } else {
+                copy(v, st, so, &t->kv, gpu, bytes);
+            }
+            so += bytes;
+        }
+    if (!to_gpu) barrier(v, PS_TRANSFER, AC_TRANSFER_WRITE, PS_HOST, AC_HOST_READ);
+    if (!submit(v)) { v->broken = 1; return; }
+    so = 0;
+    for (int i = 0; i < ns && !to_gpu; i++)
+        for (int h = 0; h < 2; h++) {
+            const size_t off = seg0[i] * row, bytes = segn[i] * row;
+            memcpy((uint8_t *)(h ? vc : kc) + off, st->map + so, bytes);
+            so += bytes;
+        }
+}
+
 /* ------------------------------------------------------------------ routed experts in VRAM */
 
 /* Slots of whole experts (gate, up, down in the GPU layout) in buffers of up to 1 GB. The
@@ -2060,7 +2516,7 @@ void vk_dense_set_moe(Vulkan *v, VkMoeFn fn, void *arg) {
 int vk_dense_forward(Vulkan *v, const float *x, int n, const float *rope_cs, const float *rope_swa, int pos0,
                      float *logits, float *x_last) {
     VDense *t = v ? v->dense : NULL;
-    if (!t || v->broken || n < 1 || n > t->B || pos0 + n > t->n_ctx || (t->hybrid && !t->moe)) return 0;
+    if (!t || v->broken || n < 1 || n > t->B || pos0 + n > t->n_ctx || ((t->hybrid || t->ik) && !t->moe)) return 0;
     static int passes;   /* PITHOS_VK_FAIL=N: the GPU "fails" at pass N, to test the CPU fallback */
     if (getenv("PITHOS_VK_FAIL") && ++passes == atoi(getenv("PITHOS_VK_FAIL"))) {
         v->broken = 1;
@@ -2068,6 +2524,7 @@ int vk_dense_forward(Vulkan *v, const float *x, int n, const float *rope_cs, con
         return 0;
     }
     if (t->hybrid) return hybrid_forward(v, x, n, rope_cs, pos0, logits, x_last);
+    if (t->ik) return ik_forward(v, x, n, pos0, logits);
     const Model *m = t->m;
     const int D = t->D, hd = t->hd, kvd = t->kvd, qkvw = D + 2 * kvd;
     const uint32_t nb = (uint32_t)(D / QK_K), un = (uint32_t)n;
@@ -2135,6 +2592,7 @@ int vk_dense_forward(Vulkan *v, const float *x, int n, const float *rope_cs, con
 void vk_dense_kv(Vulkan *v, uint16_t *kc, uint16_t *vc, int r0, int r1, int to_gpu) {
     VDense *t = v ? v->dense : NULL;
     if (!t || v->broken || r1 <= r0 || !t->n_attn) return;
+    if (t->ik) { ik_kv(v, kc, vc, r0, r1, to_gpu); return; }
     const size_t row = (size_t)t->kvd * 2, bytes = (size_t)(r1 - r0) * row, total = 2 * (size_t)t->n_attn * bytes;
     VBuf *st = to_gpu ? &v->up : &v->rb;
     if (!vbuf_reserve(v, st, total, to_gpu ? HOST_UPLOAD : HOST_READBACK)) return;

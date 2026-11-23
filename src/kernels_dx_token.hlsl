@@ -646,4 +646,241 @@ void moe_combine(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     }
     stu(C0.z + 4 * (t * D + i), acc);
 }
+
+// ---------------------------------------------------------------- Inkling 2 (Vulkan only)
+//
+// The slots of inkling2_loop run here (model.c's "Inkling 2" section says what each step is),
+// the routed experts on the CPU: after each slot's FFN input the GPU stops with h and the router
+// logits read back; the CPU's expert sum comes back through IN. CS is the CPU's conv state
+// ([slot][l_cache - 1][channels]), KV its cache layout (window slots in rings).
+
+float2 reduce2_256(uint li, float2 v) {
+    g2[li] = v;
+    GroupMemoryBarrierWithGroupSync();
+    [unroll] for (uint s = 128; s > 0; s >>= 1) {
+        if (li < s) g2[li] += g2[li + s];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    const float2 r = g2[0];
+    GroupMemoryBarrierWithGroupSync();
+    return r;
+}
+
+// depth attention: out = sum over the states of softmax(rms(state) . query / sqrt(dim)) rms(state);
+// the states are the block buffers set in mask (buffer b at blk + b * stride) and cur, row t of
+// each at + 4 t dim. Groups: queries, tokens.
+// C0: dim, cur, blk, stride   C1: mask, queries (SW, [nq][dim]), out, out bytes per query
+[numthreads(256, 1, 1)]
+void ik_mix(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint D = C0.x, t = gid.y, q = gid.x, mask = C1.x, qo = C1.y + 4 * q * D;
+    uint so[17];
+    uint ns = 0;
+    for (uint b = 0; b < 16; b++)
+        if (mask & (1u << b)) so[ns++] = C0.z + b * C0.w + 4 * t * D;
+    so[ns++] = C0.y + 4 * t * D;
+    float sc[17], inv[17];
+    float mx = -1e30;
+    for (uint s = 0; s < ns; s++) {
+        float ss = 0, dd = 0;
+        for (uint i = li; i < D; i += 256) {
+            const float v = ldu(so[s] + 4 * i);
+            ss += v * v;
+            dd += v * ldw(qo + 4 * i);
+        }
+        const float2 r = reduce2_256(li, float2(ss, dd));
+        inv[s] = rsqrt(r.x / D + 1e-6);
+        sc[s] = r.y * inv[s] * rsqrt(float(D));
+        mx = max(mx, sc[s]);
+    }
+    float sum = 0;
+    for (uint s2 = 0; s2 < ns; s2++) {
+        sc[s2] = exp(sc[s2] - mx);
+        sum += sc[s2];
+    }
+    for (uint i2 = li; i2 < D; i2 += 256) {
+        float acc = 0;
+        for (uint s3 = 0; s3 < ns; s3++) acc += sc[s3] / sum * inv[s3] * ldu(so[s3] + 4 * i2);
+        stu(C1.z + q * C1.w + 4 * (t * D + i2), acc);
+    }
+}
+
+// rmsnorm of rows, times the weight (NONE: none): floats at out (NONE: not), Q8_K at q (NONE: not).
+// In place is fine. Groups: tokens.  C0: dim, in, in row bytes, out   C1: out row bytes, q, weight, eps
+[numthreads(256, 1, 1)]
+void ik_norm(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint D = C0.x, t = gid.y, io = C0.y + t * C0.z, oo = C0.w + t * C1.x, nw = C1.z;
+    const uint qo = C1.y + t * (D / 256) * Q8_BYTES;
+    float ss = 0;
+    for (uint i = li; i < D; i += 256) {
+        const float v = ldu(io + 4 * i);
+        ss += v * v;
+    }
+    const float s = rsqrt(reduce_sum(li, ss) / D + asfloat(C1.w));
+    for (uint b0 = 0; b0 < D / 256; b0 += 8) {
+        float v[8];
+        [unroll] for (uint j = 0; j < 8; j++) {
+            const uint i2 = (b0 + j) * 256 + li;
+            v[j] = 0;
+            if (b0 + j < D / 256) {
+                v[j] = ldu(io + 4 * i2) * s * (nw != NONE ? ldw(nw + 4 * i2) : 1);
+                if (C0.w != NONE) stu(oo + 4 * i2, v[j]);
+            }
+        }
+        if (C1.y != NONE) quant_blocks8(li, v, min(8u, D / 256 - b0), qo + b0 * Q8_BYTES);
+    }
+}
+
+// a loop controller's update: x = x - tanh(forget) x + tanh(gain) msg.  Groups: 256 values, tokens.
+// C0: dim, x, gain, forget   C1: msg
+[numthreads(256, 1, 1)]
+void ik_ctl(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint D = C0.x, i = gid.y * D + gid.x * 256 + li;
+    if (gid.x * 256 + li >= D) return;
+    const float x = ldu(C0.y + 4 * i);
+    stu(C0.y + 4 * i, x - tanh(ldu(C0.w + 4 * i)) * x + tanh(ldu(C0.z + 4 * i)) * ldu(C1.x + 4 * i));
+}
+
+// dst = a + b over rows of dim floats (a from IN if C1.y, b NONE: none).  Groups: 256 values, tokens.
+// C0: dim, dst, a, b   C1: -, a in IN
+[numthreads(256, 1, 1)]
+void ik_add(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint D = C0.x, c = gid.x * 256 + li, i = gid.y * D + c;
+    if (c >= D) return;
+    const float a = C1.y ? asfloat(IN.Load(C0.z + 4 * i)) : ldu(C0.z + 4 * i);
+    stu(C0.y + 4 * i, a + (C0.w != NONE ? ldu(C0.w + 4 * i) : 0));
+}
+
+// causal short convolution with a residual, (x + conv(x)) * scale, in place, for the n tokens of
+// the chunk in order; the state keeps the last l_cache - 1 inputs (oldest first, stride apart);
+// dyn (NONE: none): per-head taps for the lags 0..l_cache-1 added.  Groups: 256 channels.
+// C0: channels, x, x row bytes, n   C1: weights (SW, [channels][l_cache]), state (CS), l_cache, dyn
+// C2: dyn row bytes, channels per head, scale, state stride (bytes)
+[numthreads(256, 1, 1)]
+void ik_conv(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint nc = C0.x, ch = gid.x * 256 + li, n = C0.w, lc = C1.z, so = C1.y + 4 * ch, ss = C2.w;
+    if (ch >= nc) return;
+    const uint w = C1.x + 4 * ch * lc;
+    const float scale = asfloat(C2.z);
+    float st[8];
+    [unroll] for (uint k = 0; k < 8; k++) st[k] = k + 1 < lc ? asfloat(CS.Load(so + k * ss)) : 0;
+    for (uint t = 0; t < n; t++) {
+        const uint xo = C0.y + t * C0.z + 4 * ch;
+        const float xin = ldu(xo);
+        float win[8];
+        [unroll] for (uint k1 = 0; k1 < 8; k1++) win[k1] = k1 + 1 < lc ? st[k1] : (k1 + 1 == lc ? xin : 0);
+        float acc = 0;
+        [unroll] for (uint k2 = 0; k2 < 8; k2++) if (k2 < lc) acc += ldw(w + 4 * k2) * win[k2];
+        if (C1.w != NONE) {
+            const uint tap = C1.w + t * C2.x + 4 * (ch / C2.y) * lc;
+            [unroll] for (uint lag = 0; lag < 8; lag++) if (lag < lc) acc += ldu(tap + 4 * lag) * win[lc - 1 - lag];
+        }
+        [unroll] for (uint m = 0; m < 7; m++) if (m + 2 < lc) st[m] = st[m + 1];
+        [unroll] for (uint e = 0; e < 8; e++) if (e + 2 == lc) st[e] = xin;
+        stu(xo, (xin + acc) * scale);
+    }
+    [unroll] for (uint k3 = 0; k3 < 8; k3++) if (k3 + 1 < lc) CS.Store(so + k3 * ss, asuint(st[k3]));
+}
+
+// per head: q (times its clip scale) and r (times its own) L2-clipped and times tau, back in place;
+// k L2-clipped and v RMS-normed (eps 1e-6) into the cache at the token's row (ring: pos % R).
+// Groups: n_head q heads, n_head r heads, n_kv_head k heads, n_kv_head v heads; tokens.
+// C0: q (rows n_head hd), r (rows n_head n_rel), k, v (rows kvd)   C1: k cache of the slot, v cache, ring R (0: none), pos0
+// C2: n_head | n_kv_head << 16, hd | n_rel << 16, q clip (SW), r clip (SW)   C3: qk clip, r clip, log alpha (0: no tau), log floor
+[numthreads(128, 1, 1)]
+void ik_prep(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint nh = C2.x & 0xffff, nkv = C2.x >> 16, hd = C2.y & 0xffff, nr = C2.y >> 16, t = gid.y, g = gid.x;
+    const uint kvd = nkv * hd, pos = C1.w + t;
+    const float alpha = asfloat(C3.z);
+    const float tau = alpha > 0 ? 1 + alpha * log(max(1.0, float(pos + 1) / float(C3.w))) : 1;
+    const uint kind = g < nh ? 0 : g < 2 * nh ? 1 : g < 2 * nh + nkv ? 2 : 3;
+    const uint h = kind == 0 ? g : kind == 1 ? g - nh : kind == 2 ? g - 2 * nh : g - 2 * nh - nkv;
+    const uint len = kind == 1 ? nr : hd;
+    const uint src = kind == 0 ? C0.x + 4 * (t * nh * hd + h * hd) : kind == 1 ? C0.y + 4 * (t * nh * nr + h * nr)
+                   : kind == 2 ? C0.z + 4 * (t * kvd + h * hd) : C0.w + 4 * (t * kvd + h * hd);
+    const uint cw = kind == 0 ? C2.z + 4 * h * hd : C2.w + 4 * h * nr;   // valid for every kind
+    float v = 0;
+    if (li < len) {
+        v = ldu(src + 4 * li);
+        if (kind < 2) v *= ldw(cw + 4 * li);
+    }
+    const float ss = reduce_sum128(li, v * v);
+    if (kind == 3) {
+        v *= rsqrt(ss / hd + 1e-6);
+    } else {
+        const float thr = asfloat(kind == 1 ? C3.y : C3.x);
+        v *= min(1.0, thr / (sqrt(ss) + 1e-6));
+        if (kind < 2) v *= tau;
+    }
+    if (kind < 2) {
+        if (li < len) stu(src + 4 * li, v);
+        return;
+    }
+    hs[li] = v;
+    GroupMemoryBarrierWithGroupSync();
+    const uint row = C1.z ? pos % C1.z : pos, base = (kind == 2 ? C1.x : C1.y) + 2 * (row * kvd + h * hd);
+    if (li < hd / 2) KV.Store(base + 4 * li, f16(hs[2 * li]) | (f16(hs[2 * li + 1]) << 16));
+}
+
+groupshared float ikb[1024];   // the relative-position bias of a head, by distance
+groupshared float ikr[64];
+
+// one q head of one token per group over its cache positions (ring rows: j % R), in tiles of 256
+// with a running softmax; scores q.k scale + bias[distance] (none past the extent), the sink logit
+// in the denominator; the output times sigmoid(gate).  Groups: q heads, tokens.
+// C0: hd | n_rel << 16, q (rows n_head hd), r (rows n_head n_rel), out (rows n_head hd)
+// C1: k cache of the slot, v cache, n_head | n_kv_head << 16, gate (rows n_head hd)
+// C2: pos0, window (0: none), ring R (0: none), sinks (rows n_head)   C3: scale, bias (SW, [extent][n_rel]), extent
+[numthreads(256, 1, 1)]
+void ik_attn(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint hd = C0.x & 0xffff, nr = C0.x >> 16, half = hd / 2, h = gid.x, t = gid.y;
+    const uint nh = C1.z & 0xffff, nkv = C1.z >> 16, kh = h / (nh / nkv), kvd = nkv * hd, qd = nh * hd;
+    const uint npos = C2.x + t + 1, j0 = C2.y && npos > C2.y ? npos - C2.y : 0, R = C2.z, ext = C3.z;
+    const uint kb = C1.x + 2 * kh * hd, vb = C1.y + 2 * kh * hd;
+    const float scale = asfloat(C3.x);
+    for (uint i = li; i < hd; i += 256) hs[i] = ldu(C0.y + 4 * (t * qd + h * hd + i));
+    if (li < nr) ikr[li] = ldu(C0.z + 4 * (t * nh * nr + h * nr + li));
+    GroupMemoryBarrierWithGroupSync();
+    const uint nd = min(npos - j0, ext);
+    for (uint d = li; d < nd; d += 256) {
+        float b = 0;
+        for (uint r = 0; r < nr; r++) b += ldw(C3.y + 4 * (d * nr + r)) * ikr[r];
+        ikb[d] = b;
+    }
+    GroupMemoryBarrierWithGroupSync();
+    const uint slices = 256 / half, p = li % half, sl = li / half;
+    float mx = ldu(C2.w + 4 * (t * nh + h)), sum = 1;   // the sink: exp(sink - mx) with mx = sink
+    float2 acc = 0;
+    for (uint base = j0; base < npos; base += 256) {
+        const uint j = min(base + li, npos - 1), dist = npos - 1 - j;
+        const uint ko = kb + 2 * (R ? j % R : j) * kvd;
+        float dd = 0;
+        for (uint q = 0; q < half; q++) {
+            const uint w = KV.Load(ko + 4 * q);
+            dd += f16tof32(w) * hs[2 * q] + f16tof32(w >> 16) * hs[2 * q + 1];
+        }
+        const float s = base + li < npos ? dd * scale + (dist < ext ? ikb[min(dist, 1023u)] : 0) : -1e30;
+        const float m2 = max(mx, reduce_max(li, s)), corr = exp(mx - m2);
+        const float e = base + li < npos ? exp(s - m2) : 0;
+        gp[li] = e;
+        sum = sum * corr + reduce_sum(li, e);
+        acc *= corr;
+        const uint cnt = min(256u, npos - base);
+        for (uint jv = sl; jv < cnt; jv += slices) {
+            const uint jj = base + jv;
+            const uint w2 = KV.Load(vb + 2 * (R ? jj % R : jj) * kvd + 4 * p);
+            acc += gp[jv] * float2(f16tof32(w2), f16tof32(w2 >> 16));
+        }
+        mx = m2;
+        GroupMemoryBarrierWithGroupSync();
+    }
+    g2[li] = acc;
+    GroupMemoryBarrierWithGroupSync();
+    if (sl == 0) {
+        for (uint s2 = 1; s2 < slices; s2++) acc += g2[s2 * half + p];
+        const float inv = 1 / sum;
+        const uint oo = 4 * (t * qd + h * hd + 2 * p);
+        stu(C0.w + oo, acc.x * inv / (1 + exp(-ldu(C1.w + oo))));
+        stu(C0.w + oo + 4, acc.y * inv / (1 + exp(-ldu(C1.w + oo + 4))));
+    }
+}
 #endif

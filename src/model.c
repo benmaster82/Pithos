@@ -1783,6 +1783,24 @@ static void vk_moe(void *arg, int layer, const float *h, const float *lg, const 
     memcpy(y, c->out, sizeof(float) * (size_t)n * D);
 }
 
+static void ik_moe(Context *c, const Layer *L, int ip, int n);
+static void softcap(const Model *m, float *l, size_t n);
+
+/* Inkling on the Vulkan GPU: the routed experts of physical layer `layer` over the rows h, from
+ * the GPU's router logits lg [n][n_expert]; their sum into y */
+static void vk_moe_ik(void *arg, int layer, const float *h, const float *lg, const float *pred, int n, float *y, float *s) {
+    (void)pred;
+    (void)s;
+    Context *c = (Context *)arg;
+    const Model *m = c->m;
+    memcpy(c->h, h, sizeof(float) * (size_t)n * m->dim);
+    memcpy(c->rlog, lg, sizeof(float) * (size_t)n * m->n_expert);
+    c->rlog_ready = 1;
+    ik_moe(c, &m->layers[layer], layer, n);
+    c->rlog_ready = 0;
+    memcpy(y, c->out, sizeof(float) * (size_t)n * m->dim);
+}
+
 /* the same on the Vulkan GPU */
 static void forward_vk(Context *c, const int *tokens, int n, float *logits) {
     const Model *m = c->m;
@@ -1800,12 +1818,14 @@ static void forward_vk(Context *c, const int *tokens, int n, float *logits) {
         token_row(c, tokens[t], c->x + (size_t)t * D);
         rope_tables(c, pos0 + t, rope + (size_t)t * hd, rope_swa + (size_t)t * hd);
     }
-    vk_dense_set_moe(c->vk, vk_moe, c);
+    vk_dense_set_moe(c->vk, m->ik ? vk_moe_ik : vk_moe, c);
     if (!vk_dense_forward(c->vk, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL,
                           logits ? c->tmp : NULL)) {
         memset(c->logits, 0, sizeof(float) * (size_t)m->n_vocab);   /* the GPU failed: the message says so */
         c->vk_dense = 0;
         c->gpu_lost = 1;
+    } else if (logits && m->ik) {
+        softcap(m, c->logits, (size_t)m->n_vocab);
     } else if (logits) {   /* the last residual row: ctx_hidden */
         rmsnorm(c->h, c->tmp, m->final_norm, D, m->eps);
         c->hidden_ok = 1;
@@ -2084,9 +2104,11 @@ static void ik_moe(Context *c, const Layer *L, int ip, int n) {
     const int D = m->dim, nbd = D / QK_K, E = m->n_expert, K = m->n_expert_used, F = m->ff_exp;
     const int FP = (F + QK_K - 1) / QK_K * QK_K, nbf = FP / QK_K;
     double t0 = time_sec();
-    job_clear(c);
-    job_add_f(c, &L->router, c->h, D, n, c->rlog, E);
-    job_run(c, CAT_ROUTER);
+    if (!c->rlog_ready) {   /* else the GPU's */
+        job_clear(c);
+        job_add_f(c, &L->router, c->h, D, n, c->rlog, E);
+        job_run(c, CAT_ROUTER);
+    }
 
     int cnt[MAX_EXPERT] = {0}, off[MAX_EXPERT + 1], fill[MAX_EXPERT];
     for (int t = 0; t < n; t++) {

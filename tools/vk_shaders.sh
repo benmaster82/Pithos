@@ -27,7 +27,7 @@ for e in mm_q4_K mm_q6_K mm_q8_0 mv_q4_K mv_q6_K mv_q8_0; do
     "$DXC" $OPT -D MM_INTEL -D MV_LANES=8 -D MV_LOG2=3 -D MV_GROUP=128 -D MV_SWAR -E $e -Vn g_vk_${e}_intel -Fh "$TMP/$e.h" src/kernels_dx.hlsl >/dev/null || { echo "[vk] shader compilation failed"; exit 1; }
     cat "$TMP/$e.h" >> "$TMP/out.h"
 done
-for e in resid_norm quant silu_quant shortconv attn_prep attention conv_chunk conv_state attn_chunk moe_resid delta_conv delta_rec qattn_prep qattn router moe_combine; do
+for e in resid_norm quant silu_quant shortconv attn_prep attention conv_chunk conv_state attn_chunk moe_resid delta_conv delta_rec qattn_prep qattn router moe_combine ik_mix ik_norm ik_ctl ik_add ik_conv ik_prep ik_attn; do
     "$DXC" $OPT -E $e -Vn g_vk_$e -Fh "$TMP/$e.h" src/kernels_dx_token.hlsl >/dev/null || { echo "[vk] shader compilation failed"; exit 1; }
     cat "$TMP/$e.h" >> "$TMP/out.h"
 done
