@@ -493,4 +493,50 @@ void mv_q8_0(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
     }
     reduce_store(li, r, t, sum);
 }
+
+#ifdef MV_NVFP4   // compiled on its own (tools/vk_shaders.cmd): the other kernels stay as they are
+// NVFP4 (Inkling's experts): a row is nb blocks of 64 E2M1 values, their 32 bytes each, then their
+// 4 E4M3 scales each (the row padded to 16 bytes); sub-block s of a block: values j and j + 8 in
+// the low and high nibbles of byte 8s + j. The activations are Q8_K rows: block p reads values
+// [64p, 64p + 64), four to a Q8_K block. Here nb counts the 64-value blocks.
+// E2M1 times 2: the magnitudes 0 1 2 3 4 6 8 12 as nibbles of one word, the sign in bit 3
+int e2m1(uint n) {
+    const int v = int((0xC8643210u >> (4 * (n & 7))) & 15);
+    return n & 8 ? -v : v;
+}
+
+float ue4m3_half(uint x) {      // the scale times 0.5 (0 and 0x7F: 0, as ggml)
+    x &= 255;
+    const uint e = (x >> 3) & 15, m = x & 7;
+    const float v = e ? ldexp(1.0 + m / 8.0, int(e) - 7) : ldexp(float(m), -9);
+    return x == 0 || x == 0x7F ? 0 : v * 0.5;
+}
+
+[numthreads(MV_GROUP, 1, 1)]
+void mv_nvfp4(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint r = gid.x * (MV_GROUP / MV_LANES) + (li >> MV_LOG2), t = gid.y;
+    float sum = 0;
+    if (r < rows) {
+        MV_BASES;
+        for (uint p = li & (MV_LANES - 1); p < nb; p += MV_LANES) {
+            const uint wq = (wbase + 32 * p) / 16, xb = xbase + (p >> 2) * Q8_BYTES, xq = (xb + Q8_QS + (p & 3) * 64) / 16;
+            const uint sc = W.Load(wbase + 32 * nb + 4 * p);
+            const uint4 q[2] = { W4[wq], W4[wq + 1] };
+            float acc = 0;
+            [unroll] for (uint s = 0; s < 4; s++) {
+                const uint4 x = X4[xq + s];
+                const uint w0 = q[s >> 1][(s & 1) * 2], w1 = q[s >> 1][(s & 1) * 2 + 1];
+                int d = 0;
+                [unroll] for (uint k = 0; k < 4; k++) {
+                    d += e2m1(w0 >> (8 * k)) * sx(x.x, k) + e2m1(w1 >> (8 * k)) * sx(x.y, k);
+                    d += e2m1(w0 >> (8 * k + 4)) * sx(x.z, k) + e2m1(w1 >> (8 * k + 4)) * sx(x.w, k);
+                }
+                acc += ue4m3_half(sc >> (8 * s)) * float(d);
+            }
+            sum += asfloat(X.Load(xb + Q8_D)) * acc;
+        }
+    }
+    reduce_store(li, r, t, sum);
+}
+#endif
 #endif

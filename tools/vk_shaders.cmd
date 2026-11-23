@@ -26,13 +26,17 @@ for %%e in (q4_K q6_K q8_0) do (
     type %TEMP%\pithos_vk_mvx_%%e.h >> %OUT%
     del %TEMP%\pithos_vk_mvx_%%e.h
 )
+rem NVFP4 (Inkling's experts in VRAM) on its own, so that the kernels above do not change
+"%DXC%" %OPT% -D MV_EXPERTS -D MV_NVFP4 -E mv_nvfp4 -Vn g_vk_mvx_nvfp4 -Fh %TEMP%\pithos_vk_mvx_nvfp4.h src\kernels_dx.hlsl >nul || goto fail
+type %TEMP%\pithos_vk_mvx_nvfp4.h >> %OUT%
+del %TEMP%\pithos_vk_mvx_nvfp4.h
 rem the matmul kernels again for Intel GPUs (see kernels_dx.hlsl)
 for %%e in (mm_q4_K mm_q6_K mm_q8_0 mv_q4_K mv_q6_K mv_q8_0) do (
     "%DXC%" %OPT% -D MM_INTEL -D MV_LANES=8 -D MV_LOG2=3 -D MV_GROUP=128 -D MV_SWAR -E %%e -Vn g_vk_%%e_intel -Fh %TEMP%\pithos_vk_%%e.h src\kernels_dx.hlsl >nul || goto fail
     type %TEMP%\pithos_vk_%%e.h >> %OUT%
     del %TEMP%\pithos_vk_%%e.h
 )
-for %%e in (resid_norm quant silu_quant shortconv attn_prep attention conv_chunk conv_state attn_chunk moe_resid delta_conv delta_rec qattn_prep qattn router moe_combine ik_mix ik_norm ik_ctl ik_add ik_conv ik_prep ik_attn) do (
+for %%e in (resid_norm quant silu_quant shortconv attn_prep attention conv_chunk conv_state attn_chunk moe_resid delta_conv delta_rec qattn_prep qattn router moe_combine ik_mix ik_norm ik_ctl ik_add ik_conv ik_prep ik_attn ik_situ) do (
     "%DXC%" %OPT% -E %%e -Vn g_vk_%%e -Fh %TEMP%\pithos_vk_%%e.h src\kernels_dx_token.hlsl >nul || goto fail
     type %TEMP%\pithos_vk_%%e.h >> %OUT%
     del %TEMP%\pithos_vk_%%e.h

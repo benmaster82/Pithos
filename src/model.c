@@ -657,6 +657,7 @@ struct Context {
     int *on_gpu, *ga_e, *ga_t;  /* [n_batch * K] GPU assignment bookkeeping */
     float *gy;                  /* [n_batch * K][dim] GPU expert outputs */
     int pred[64], pred_n, pred_layer;
+    int ik_step;                /* Inkling on Vulkan: the slots done in this pass (vk_moe_ik) */
     int rlog_ready;             /* moe_ffn: rlog already holds the router's logits (the GPU's) */
     const float *pred_lg;       /* predict_next_experts: the next router's logits (the GPU's), or NULL */
     uint32_t tok_counter;       /* tokens processed since creation (never reset) */
@@ -1793,8 +1794,27 @@ static void vk_moe_ik(void *arg, int layer, const float *h, const float *lg, con
     (void)s;
     Context *c = (Context *)arg;
     const Model *m = c->m;
-    memcpy(c->h, h, sizeof(float) * (size_t)n * m->dim);
-    memcpy(c->rlog, lg, sizeof(float) * (size_t)n * m->n_expert);
+    const int D = m->dim, E = m->n_expert, core = m->loop_end - m->loop_start, step = ++c->ik_step;
+    memcpy(c->h, h, sizeof(float) * (size_t)n * D);
+    memcpy(c->rlog, lg, sizeof(float) * (size_t)n * E);
+    if (c->pfq && n == 1 && step < m->n_slot) {
+        /* read ahead the experts the next slot's router gives this h (its input changes little), those
+         * neither in VRAM nor used lately, while this slot's experts and the next slot's attention run */
+        const int nx = step < m->loop_start ? step : step < m->loop_start + m->n_pass * core ? m->loop_start + (step - m->loop_start) % core
+                     : step - (m->n_pass - 1) * core;
+        const Layer *Ln = &m->layers[nx];
+        float sc[MAX_EXPERT];
+        int best[16];
+        for (int e = 0; e < E; e++)
+            sc[e] = 1.f / (1.f + expf(-KS.dot_f32((const float *)Ln->router.data + (size_t)e * D, h, D))) + (Ln->exp_bias ? Ln->exp_bias[e] : 0.f);
+        const int np = m->n_expert_used + 2 < 16 ? m->n_expert_used + 2 : 16;
+        top_k(sc, E, np, best);
+        prefetcher_clear(c->pfq);
+        for (int k = 0; k < np; k++) {
+            const uint32_t lu = c->last_used[(size_t)nx * E + best[k]];
+            if (!vk_expert_resident(c->vk, nx, best[k]) && (!lu || c->tok_counter - lu > 48)) prefetch_expert(c, Ln, best[k]);
+        }
+    }
     c->rlog_ready = 1;
     ik_moe(c, &m->layers[layer], layer, n);
     c->rlog_ready = 0;
@@ -1819,6 +1839,7 @@ static void forward_vk(Context *c, const int *tokens, int n, float *logits) {
         rope_tables(c, pos0 + t, rope + (size_t)t * hd, rope_swa + (size_t)t * hd);
     }
     vk_dense_set_moe(c->vk, m->ik ? vk_moe_ik : vk_moe, c);
+    c->ik_step = 0;
     if (!vk_dense_forward(c->vk, c->x, n, rope, m->swa_window > 0 ? rope_swa : NULL, pos0, logits ? c->logits : NULL,
                           logits ? c->tmp : NULL)) {
         memset(c->logits, 0, sizeof(float) * (size_t)m->n_vocab);   /* the GPU failed: the message says so */
@@ -2124,12 +2145,29 @@ static void ik_moe(Context *c, const Layer *L, int ip, int n) {
         for (int k = 0; k < K; k++) {
             w[k] = p[sel[k]];
             wsum += w[k];
-            cnt[sel[k]]++;
             if (ip < 64 && sel[k] < 64) c->stats.expert_hits[ip * 64 + sel[k]]++;
             c->last_used[(size_t)ip * E + sel[k]] = c->tok_counter;
+            if (c->vk_exp) vk_note_usage(c->vk, ip, sel[k]);
         }
         for (int k = 0; k < K; k++) w[k] = w[k] / (wsum + 1e-20f) * m->exp_scale;
     }
+    /* (token, expert) pairs whose expert is in VRAM run on the GPU (Vulkan, while the CPU computes
+     * the others); the next slot's FFN output adds their sum */
+    int ng = 0;   /* up to VK_MOE_MAX of them (prompt chunks have more): the others on the CPU */
+    const int gpu = c->vk_exp && vk_moe_ready(c->vk, n * K < VK_MOE_MAX ? n * K : VK_MOE_MAX);
+    float gw[VK_MOE_MAX], gs[VK_MOE_MAX];
+    for (int i = 0; i < n * K; i++) {
+        const int e = c->sel[i];
+        c->on_gpu[i] = gpu && ng < VK_MOE_MAX && vk_expert_resident(c->vk, ip, e);
+        if (!c->on_gpu[i]) { cnt[e]++; continue; }
+        c->ga_e[ng] = e;
+        c->ga_t[ng] = i / K;
+        gw[ng] = c->selw[i] * (L->ik_down_scale ? L->ik_down_scale[e] : 1.f);
+        gs[ng] = L->ik_gu_scale ? L->ik_gu_scale[e] : 1.f;
+        ng++;
+    }
+    if (ng && !vk_ik_moe_begin(c->vk, ip, c->ga_e, c->ga_t, gw, gs, ng)) c->gpu_lost = 1;   /* the pass fails */
+    c->stats.gpu_experts += (uint64_t)ng;
     off[0] = 0;
     for (int e = 0; e < E; e++) off[e + 1] = off[e] + cnt[e];
     memcpy(fill, off, sizeof(int) * E);
@@ -2137,6 +2175,7 @@ static void ik_moe(Context *c, const Layer *L, int ip, int n) {
     quantize_rows(c->h, n, D, c->hq);
     for (int t = 0; t < n; t++)
         for (int k = 0; k < K; k++) {
+            if (c->on_gpu[(size_t)t * K + k]) { c->tok_a[(size_t)t * K + k] = -1; continue; }
             const int e = c->sel[(size_t)t * K + k], a = fill[e]++;
             c->a_tok[a] = t;
             c->a_slot[a] = e;
@@ -2174,6 +2213,7 @@ static void ik_moe(Context *c, const Layer *L, int ip, int n) {
         memset(o, 0, sizeof(float) * D);
         for (int k = 0; k < K; k++) {
             const int a = c->tok_a[(size_t)t * K + k];
+            if (a < 0) continue;   /* on the GPU */
             const float w = c->selw[(size_t)t * K + k] * (L->ik_down_scale ? L->ik_down_scale[c->a_slot[a]] : 1.f);
             const float *eo = c->eo + (size_t)a * D;
             for (int i = 0; i < D; i++) o[i] += w * eo[i];

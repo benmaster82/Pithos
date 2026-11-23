@@ -66,6 +66,9 @@ int  vk_experts_on(const Vulkan *v);
 int  vk_expert_resident(const Vulkan *v, int layer, int expert);
 int  vk_moe_ready(const Vulkan *v, int n);
 int  vk_moe_begin(Vulkan *v, int layer, const int *a_expert, const int *a_tok, const float *a_w, int n);
+/* Inkling (the experts of its NVFP4 layers): the same with each assignment's [gate | up] scale a_gs, a_w
+ * already times the down scale; the next slot's FFN output takes their sum */
+int  vk_ik_moe_begin(Vulkan *v, int layer, const int *a_expert, const int *a_tok, const float *a_w, const float *a_gs, int n);
 void vk_note_usage(Vulkan *v, int layer, int expert);
 void vk_rebalance(Vulkan *v, int max_uploads);
 /* copy KV rows [r0, r1) / the convolution state (DeltaNet's included) between the host arrays and the GPU copy */

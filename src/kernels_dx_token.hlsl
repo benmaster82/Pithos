@@ -883,4 +883,19 @@ void ik_attn(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
         stu(C0.w + oo + 4, acc.y * inv / (1 + exp(-ldu(C1.w + oo + 4))));
     }
 }
+
+// Inkling's experts on the GPU: Q8_K of situ(g s, u s) = b tanh(g s / b) sigmoid(g s) lb tanh(u s / lb),
+// from [gate | up] rows of 2F floats and the assignment's scale s (IN), zeros past F (rows of FP / 256
+// blocks).  Groups: FP / 256 blocks, assignments.  C0: gate|up rows, F, q, b   C1: lb (0: none), scales (IN), FP
+[numthreads(256, 1, 1)]
+void ik_situ(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint a = gid.y, i = gid.x * 256 + li, F = C0.y, FP = C1.z;
+    const float s = asfloat(IN.Load(C1.y + 4 * a)), b = asfloat(C0.w), lb = asfloat(C1.x);
+    float v = 0;
+    if (i < F) {
+        const float g = ldu(C0.x + 4 * (a * 2 * F + i)) * s, u = ldu(C0.x + 4 * (a * 2 * F + F + i)) * s;
+        v = b * tanh(g / b) / (1 + exp(-g)) * (lb > 0 ? lb * tanh(u / lb) : u);
+    }
+    quant_block(li, v, C0.z + (a * (FP / 256) + gid.x) * Q8_BYTES);
+}
 #endif
