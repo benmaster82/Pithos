@@ -148,6 +148,77 @@ static void rows_q4_K(int K, const void *w, const block_q8_K *x, int xs, int nt,
     }
 }
 
+/* ------------------------------------------------------------------ NVFP4 */
+
+/* One 64-value block as two vectors of signed int8 weights in activation order (wa: values
+ * 0-31 = sub-blocks 0 and 1, wb: values 32-63), with the matching scales per 128-bit lane. */
+static inline void nvfp4_unpack(const block_nvfp4 *b, __m256i *wa, __m256i *wb, __m256 *sa, __m256 *sb) {
+    const __m256i table = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *)nvfp4_values));
+    const __m256i m4 = _mm256_set1_epi8(0xF);
+    const __m256i qb = _mm256_loadu_si256((const __m256i *)b->qs);
+    const __m256i lo = _mm256_and_si256(qb, m4), hi = _mm256_and_si256(_mm256_srli_epi16(qb, 4), m4);
+    /* per lane: sub-blocks 0|2 and 1|3, each its low then high nibbles */
+    const __m256i x = _mm256_unpacklo_epi64(lo, hi), y = _mm256_unpackhi_epi64(lo, hi);
+    *wa = _mm256_shuffle_epi8(table, _mm256_permute2x128_si256(x, y, 0x20));
+    *wb = _mm256_shuffle_epi8(table, _mm256_permute2x128_si256(x, y, 0x31));
+    *sa = _mm256_set_m128(_mm_set1_ps(nvfp4_scale[b->d[1]]), _mm_set1_ps(nvfp4_scale[b->d[0]]));
+    *sb = _mm256_set_m128(_mm_set1_ps(nvfp4_scale[b->d[3]]), _mm_set1_ps(nvfp4_scale[b->d[2]]));
+}
+
+/* int32 sums of 4-value groups of w*a (each 128-bit lane stays within one sub-block) */
+static inline __m256i nvfp4_dot(__m256i w, __m256i a) {
+    const __m256i p = _mm256_maddubs_epi16(_mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
+    return _mm256_madd_epi16(p, _mm256_set1_epi16(1));
+}
+
+static void rows_nvfp4(int K, const void *w, const block_q8_K *x, int xs, int nt, float *out, int os) {
+    const block_nvfp4 *b = (const block_nvfp4 *)w;
+    const int nb = K / QK_NVFP4;
+
+    if (nt == 1) {
+        __m256 acc = _mm256_setzero_ps();
+        for (int i0 = 0; i0 < nb; i0 += 4) {
+            const int i1 = nb - i0 < 4 ? nb : i0 + 4;
+            __m256 accb = _mm256_setzero_ps();
+            for (int i = i0; i < i1; i++) {
+                __m256i wa, wb;
+                __m256 sa, sb;
+                nvfp4_unpack(b + i, &wa, &wb, &sa, &sb);
+                const int8_t *a = x[i / 4].qs + (i % 4) * QK_NVFP4;
+                accb = _mm256_fmadd_ps(sa, _mm256_cvtepi32_ps(nvfp4_dot(wa, _mm256_loadu_si256((const __m256i *)a))), accb);
+                accb = _mm256_fmadd_ps(sb, _mm256_cvtepi32_ps(nvfp4_dot(wb, _mm256_loadu_si256((const __m256i *)(a + 32)))), accb);
+            }
+            acc = _mm256_fmadd_ps(_mm256_set1_ps(x[i0 / 4].d), accb, acc);
+        }
+        out[0] = hsum_ps(acc);
+        return;
+    }
+
+    /* multi-token: each weight block is unpacked once per group of MT_MAX tokens */
+    __m256 acc[MT_MAX], accb[MT_MAX];
+    for (int t0 = 0; t0 < nt; t0 += MT_MAX) {
+        const int tn = nt - t0 < MT_MAX ? nt - t0 : MT_MAX;
+        for (int t = 0; t < tn; t++) acc[t] = _mm256_setzero_ps();
+        for (int i0 = 0; i0 < nb; i0 += 4) {
+            const int i1 = nb - i0 < 4 ? nb : i0 + 4;
+            for (int t = 0; t < tn; t++) accb[t] = _mm256_setzero_ps();
+            for (int i = i0; i < i1; i++) {
+                __m256i wa, wb;
+                __m256 sa, sb;
+                nvfp4_unpack(b + i, &wa, &wb, &sa, &sb);
+                for (int t = 0; t < tn; t++) {
+                    const int8_t *a = x[(size_t)(t0 + t) * xs + i / 4].qs + (i % 4) * QK_NVFP4;
+                    accb[t] = _mm256_fmadd_ps(sa, _mm256_cvtepi32_ps(nvfp4_dot(wa, _mm256_loadu_si256((const __m256i *)a))), accb[t]);
+                    accb[t] = _mm256_fmadd_ps(sb, _mm256_cvtepi32_ps(nvfp4_dot(wb, _mm256_loadu_si256((const __m256i *)(a + 32)))), accb[t]);
+                }
+            }
+            for (int t = 0; t < tn; t++)
+                acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(x[(size_t)(t0 + t) * xs + i0 / 4].d), accb[t], acc[t]);
+        }
+        for (int t = 0; t < tn; t++) out[(size_t)(t0 + t) * os] = hsum_ps(acc[t]);
+    }
+}
+
 /* ------------------------------------------------------------------ Q5_K */
 
 static void rows_q5_K(int K, const void *w, const block_q8_K *x, int xs, int nt, float *out, int os) {
@@ -272,9 +343,10 @@ static void rows_q8_0(int K, const void *w, const block_q8_K *x, int xs, int nt,
     for (int t = 0; t < nt; t++) {
         const block_q8_K *y = x + (size_t)t * xs;
         __m256 acc = _mm256_setzero_ps();
-        for (int i = 0; i < K / QK_K; i++) {
+        for (int i = 0; i < (K + QK_K - 1) / QK_K; i++) {
+            const int nj = K / QK8_0 - i * 8 < 8 ? K / QK8_0 - i * 8 : 8;   /* the last Q8_K block may be partial */
             __m256 acc_b = _mm256_setzero_ps();
-            for (int j = 0; j < 8; j++) {
+            for (int j = 0; j < nj; j++) {
                 const block_q8_0 *bb = &b[i * 8 + j];
                 __m256i q = _mm256_loadu_si256((const __m256i *)bb->qs);
                 __m256i p = dot_i8_32(q, _mm256_loadu_si256((const __m256i *)(y[i].qs + 32 * j)));
@@ -462,6 +534,7 @@ void kernels_init_avx2(Kernels *k) {
     k->dot[GGML_Q6_K] = rows_q6_K;
     k->dot[GGML_Q8_0] = rows_q8_0;
     k->dot[GGML_Q4_0] = rows_q4_0;
+    k->dot[GGML_NVFP4] = rows_nvfp4;
     k->quantize_q8_K = quantize_q8_K;
     k->f16_to_f32_row = f16_to_f32_row;
     k->f32_to_f16_row = f32_to_f16_row;

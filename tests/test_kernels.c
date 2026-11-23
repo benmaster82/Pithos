@@ -11,17 +11,20 @@ static float frand(unsigned *s) { *s = *s * 1664525u + 1013904223u; return ((*s 
 
 static int check(const char *kname, const Kernels *k, const GGUFTensor *t) {
     const int K = (int)t->ne[0];
+    /* activation rows of whole Q8_K blocks, zero past K (NVFP4 rows need not fill the last block) */
+    const int nb = (K + QK_K - 1) / QK_K, KP = nb * QK_K;
     const size_t rb = row_bytes(t->type, K);
     const int nt = 5;
-    float *x = malloc(sizeof(float) * K * nt), *w = malloc(sizeof(float) * K), *xd = malloc(sizeof(float) * K * nt);
-    block_q8_K *xq = malloc(sizeof(block_q8_K) * (K / QK_K) * nt);
+    float *x = calloc((size_t)KP * nt, sizeof(float)), *w = malloc(sizeof(float) * K), *xd = malloc(sizeof(float) * KP * nt);
+    block_q8_K *xq = malloc(sizeof(block_q8_K) * nb * nt);
     unsigned s = 1234;
-    for (int i = 0; i < K * nt; i++) x[i] = frand(&s) * (i % 7 == 0 ? 3.f : 1.f);
-    for (int j = 0; j < nt; j++) k->quantize_q8_K(x + j * K, xq + j * (K / QK_K), K);
+    for (int j = 0; j < nt; j++)
+        for (int i = 0; i < K; i++) x[j * KP + i] = frand(&s) * (i % 7 == 0 ? 3.f : 1.f);
+    for (int j = 0; j < nt; j++) k->quantize_q8_K(x + j * KP, xq + j * nb, KP);
     /* dequantize the activations so we measure the weight kernel only */
     for (int j = 0; j < nt; j++)
-        for (int b = 0; b < K / QK_K; b++)
-            for (int i = 0; i < QK_K; i++) xd[j * K + b * QK_K + i] = xq[j * (K / QK_K) + b].d * xq[j * (K / QK_K) + b].qs[i];
+        for (int b = 0; b < nb; b++)
+            for (int i = 0; i < QK_K; i++) xd[j * KP + b * QK_K + i] = xq[j * nb + b].d * xq[j * nb + b].qs[i];
     double maxrel = 0;
     for (int r = 0; r < 8; r++) {
         int row = (int)((t->ne[1] * t->ne[2] - 1) * r / 7);
@@ -29,10 +32,10 @@ static int check(const char *kname, const Kernels *k, const GGUFTensor *t) {
         dequant_row(t->type, wr, w, K);
         float out[5];
         for (int n = 1; n <= nt; n += 4) {
-            k->dot[t->type](K, wr, xq, K / QK_K, n, out, 1);
+            k->dot[t->type](K, wr, xq, nb, n, out, 1);
             for (int j = 0; j < n; j++) {
                 double ref = 0, mag = 0;
-                for (int i = 0; i < K; i++) { ref += (double)w[i] * xd[j * K + i]; mag += fabs((double)w[i] * xd[j * K + i]); }
+                for (int i = 0; i < K; i++) { ref += (double)w[i] * xd[j * KP + i]; mag += fabs((double)w[i] * xd[j * KP + i]); }
                 double rel = fabs(out[j] - ref) / (mag + 1e-9);
                 if (rel > maxrel) maxrel = rel;
             }
@@ -40,7 +43,7 @@ static int check(const char *kname, const Kernels *k, const GGUFTensor *t) {
     }
     /* bsums sanity */
     int bad = 0;
-    for (int b = 0; b < K / QK_K; b++)
+    for (int b = 0; b < nb; b++)
         for (int g = 0; g < 16; g++) {
             int sum = 0;
             for (int i = 0; i < 16; i++) sum += xq[b].qs[g * 16 + i];
@@ -54,15 +57,21 @@ static int check(const char *kname, const Kernels *k, const GGUFTensor *t) {
 
 /* Random rows for every weight format (covers types the test model does not use):
  * random bytes with sane f16 block scales, wrapped in a fake tensor. */
-static int synth_check(const char *kname, const Kernels *k, uint32_t type) {
-    const int K = 2048, rows = 8;
+static int synth_check(const char *kname, const Kernels *k, uint32_t type, int K) {
+    const int rows = 8;
     const size_t rb = row_bytes(type, K);
     uint8_t *data = malloc(rb * rows);
     unsigned s = 99 + type;
     for (size_t i = 0; i < rb * rows; i++) { s = s * 1664525u + 1013904223u; data[i] = (uint8_t)(s >> 24); }
     const size_t bsz = type == GGML_Q8_0 ? sizeof(block_q8_0) : type == GGML_Q4_0 ? sizeof(block_q4_0)
-                     : type == GGML_Q4_K ? sizeof(block_q4_K) : type == GGML_Q5_K ? sizeof(block_q5_K) : sizeof(block_q6_K);
+                     : type == GGML_Q4_K ? sizeof(block_q4_K) : type == GGML_Q5_K ? sizeof(block_q5_K)
+                     : type == GGML_NVFP4 ? sizeof(block_nvfp4) : sizeof(block_q6_K);
     for (size_t off = 0; off + bsz <= rb * rows; off += bsz) {
+        if (type == GGML_NVFP4) {
+            /* E4M3 scales around 2^-6, with some zero sub-blocks */
+            for (int j = 0; j < 4; j++) data[off + j] = (uint8_t)(0x08 + (data[off + j] % 16) * (data[off + j] % 9 != 0));
+            continue;
+        }
         f16_t d = f32_to_f16(0.01f + 0.001f * (float)(off % 7)), dmin = f32_to_f16(0.005f);
         if (type == GGML_Q6_K) memcpy(data + off + bsz - 2, &d, 2);
         else memcpy(data + off, &d, 2);
@@ -97,17 +106,19 @@ int main(int argc, char **argv) {
 #endif
     if (strcmp(KS.name, "scalar") && strcmp(KS.name, "avx")) ks[nk++] = KS;
     const char *names[] = { "token_embd.weight", "blk.0.ffn_down.weight", "blk.0.ffn_gate.weight",
-                            "blk.2.ffn_gate_exps.weight", "blk.2.ffn_down_exps.weight", "blk.2.attn_v.weight" };
+                            "blk.2.ffn_gate_exps.weight", "blk.2.ffn_down_exps.weight", "blk.2.attn_v.weight",
+                            "blk.2.ffn_gate_up_exps.weight", "blk.21.ffn_gate_up_exps.weight", "blk.21.ffn_down_exps.weight" };
     int ok = 1;
     for (int ki = 0; ki < nk; ki++)
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
             const GGUFTensor *t = gguf_tensor(&g, names[i]);
             if (t && ks[ki].dot[t->type]) ok &= check(ks[ki].name, &ks[ki], t);
         }
-    const uint32_t types[] = { GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0, GGML_Q4_0 };
+    const uint32_t types[] = { GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0, GGML_Q4_0, GGML_NVFP4, GGML_NVFP4 };
+    const int sizes[] = { 2048, 2048, 2048, 2048, 2048, 2304, 1152 };
     for (int ki = 0; ki < nk; ki++)
         for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++)
-            if (ks[ki].dot[types[i]]) ok &= synth_check(ks[ki].name, &ks[ki], types[i]);
+            if (ks[ki].dot[types[i]]) ok &= synth_check(ks[ki].name, &ks[ki], types[i], sizes[i]);
     /* fp16 round trip */
     for (float f = -70000.f; f < 70000.f; f += 13.37f) {
         f16_t h = f32_to_f16(f);
@@ -117,27 +128,31 @@ int main(int argc, char **argv) {
     printf(ok ? "ALL OK\n" : "SOME FAILED\n");
     /* single-core throughput over a whole tensor (second pass = resident in RAM), per SIMD set;
      * MoE models use an expert tensor, dense ones the first FFN */
-    const char *bn[] = { "blk.2.ffn_gate_exps.weight", "blk.2.ffn_down_exps.weight", "blk.0.ffn_gate.weight", "blk.0.ffn_down.weight" };
+    const char *bn[] = { "blk.2.ffn_gate_exps.weight", "blk.2.ffn_down_exps.weight", "blk.2.ffn_gate_up_exps.weight",
+                         "blk.0.ffn_gate.weight", "blk.0.ffn_down.weight" };
+    const int moe = gguf_tensor(&g, bn[0]) || gguf_tensor(&g, bn[2]);
     for (int ki = 1; ki < nk; ki++)
-    for (size_t i = 0; i < 4; i++) {
+    for (size_t i = 0; i < 5; i++) {
         const GGUFTensor *t = gguf_tensor(&g, bn[i]);
-        if (!t || (i >= 2 && gguf_tensor(&g, bn[0])) || !ks[ki].dot[t->type]) continue;
+        if (!t || (i >= 3 && moe) || !ks[ki].dot[t->type]) continue;
         const Kernels KS = ks[ki];
         printf("[%s] ", KS.name);
         const int K = (int)t->ne[0];
         const int rows = (int)(t->ne[1] * t->ne[2]);
         const size_t rb = row_bytes(t->type, K);
-        block_q8_K *xq = malloc(sizeof(block_q8_K) * (K / QK_K) * 16);
-        float *x = malloc(sizeof(float) * K * 16), *out = malloc(sizeof(float) * 16);
+        const int nb = (K + QK_K - 1) / QK_K, KP = nb * QK_K;
+        block_q8_K *xq = malloc(sizeof(block_q8_K) * nb * 16);
+        float *x = calloc((size_t)KP * 16, sizeof(float)), *out = malloc(sizeof(float) * 16);
         unsigned s = 7;
-        for (int j = 0; j < K * 16; j++) x[j] = frand(&s);
-        for (int j = 0; j < 16; j++) KS.quantize_q8_K(x + j * K, xq + j * (K / QK_K), K);
+        for (int j = 0; j < 16; j++)
+            for (int i = 0; i < K; i++) x[j * KP + i] = frand(&s);
+        for (int j = 0; j < 16; j++) KS.quantize_q8_K(x + j * KP, xq + j * nb, KP);
         for (int nt = 1; nt <= 16; nt *= 4)
             for (int pass = 0; pass < 2; pass++) {
                 double t0 = time_sec();
                 float acc = 0;
                 for (int r = 0; r < rows; r++) {
-                    KS.dot[t->type](K, t->data + (size_t)r * rb, xq, K / QK_K, nt, out, 1);
+                    KS.dot[t->type](K, t->data + (size_t)r * rb, xq, nb, nt, out, 1);
                     acc += out[0];
                 }
                 double dt = time_sec() - t0;
@@ -151,7 +166,7 @@ int main(int argc, char **argv) {
             float acc = 0;
             for (int rep = 0; rep < reps; rep++)
                 for (int r = 0; r < hot; r++) {
-                    KS.dot[t->type](K, t->data + (size_t)r * rb, xq, K / QK_K, 1, out, 1);
+                    KS.dot[t->type](K, t->data + (size_t)r * rb, xq, nb, 1, out, 1);
                     acc += out[0];
                 }
             double dt = time_sec() - t0;

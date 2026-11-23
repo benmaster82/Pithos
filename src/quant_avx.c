@@ -204,9 +204,10 @@ static void rows_q8_0(int K, const void *w, const block_q8_K *x, int xs, int nt,
     for (int t = 0; t < nt; t++) {
         const block_q8_K *y = x + (size_t)t * xs;
         __m128 acc = _mm_setzero_ps();
-        for (int i = 0; i < K / QK_K; i++) {
+        for (int i = 0; i < (K + QK_K - 1) / QK_K; i++) {
+            const int nj = K / QK8_0 - i * 8 < 8 ? K / QK8_0 - i * 8 : 8;   /* the last Q8_K block may be partial */
             __m128 acc_b = _mm_setzero_ps();
-            for (int j = 0; j < 8; j++) {
+            for (int j = 0; j < nj; j++) {
                 const block_q8_0 *bb = &b[i * 8 + j];
                 const __m128i p = _mm_add_epi32(dot_i8_16(LD(bb->qs), LD(y[i].qs + 32 * j)),
                                                 dot_i8_16(LD(bb->qs + 16), LD(y[i].qs + 32 * j + 16)));

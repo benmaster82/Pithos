@@ -8,6 +8,7 @@ int ggml_block_size(uint32_t t) {
     switch (t) {
     case GGML_F32: case GGML_F16: case GGML_BF16: return 1;
     case GGML_Q4_0: case GGML_Q4_1: case GGML_Q5_0: case GGML_Q5_1: case GGML_Q8_0: case GGML_Q8_1: return 32;
+    case GGML_NVFP4: return 64;
     default: return 256;
     }
 }
@@ -28,6 +29,7 @@ int ggml_type_size(uint32_t t) {
     case GGML_Q5_K: return 176;
     case GGML_Q6_K: return 210;
     case GGML_Q8_K: return 292;
+    case GGML_NVFP4: return 36;
     default: return 0;
     }
 }
@@ -38,7 +40,7 @@ const char *ggml_type_name(uint32_t t) {
     case GGML_Q4_0: return "Q4_0"; case GGML_Q4_1: return "Q4_1"; case GGML_Q5_0: return "Q5_0";
     case GGML_Q5_1: return "Q5_1"; case GGML_Q8_0: return "Q8_0"; case GGML_Q2_K: return "Q2_K";
     case GGML_Q3_K: return "Q3_K"; case GGML_Q4_K: return "Q4_K"; case GGML_Q5_K: return "Q5_K";
-    case GGML_Q6_K: return "Q6_K"; case GGML_Q8_K: return "Q8_K";
+    case GGML_Q6_K: return "Q6_K"; case GGML_Q8_K: return "Q8_K"; case GGML_NVFP4: return "NVFP4";
     default: return "?";
     }
 }

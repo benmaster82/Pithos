@@ -56,7 +56,19 @@ size_t row_bytes(uint32_t type, int K) {
 
 int type_supported(uint32_t t) {
     return t == GGML_F32 || t == GGML_F16 || t == GGML_Q4_0 || t == GGML_Q8_0 ||
-           t == GGML_Q4_K || t == GGML_Q5_K || t == GGML_Q6_K;
+           t == GGML_Q4_K || t == GGML_Q5_K || t == GGML_Q6_K || t == GGML_NVFP4;
+}
+
+const int8_t nvfp4_values[16] = { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
+float nvfp4_scale[256];
+
+/* unsigned E4M3 (bias 7, subnormals; 0x7F, the NaN code, and the sign bit as in ggml), times 0.5 */
+static void init_nvfp4_scale(void) {
+    for (int x = 0; x < 256; x++) {
+        const int e = (x >> 3) & 0xF, m = x & 7;
+        const float v = e ? ldexpf(1.f + m / 8.f, e - 7) : ldexpf((float)m, -9);
+        nvfp4_scale[x] = x == 0 || x == 0x7F ? 0.f : v * 0.5f;
+    }
 }
 
 /* ------------------------------------------------------------------ dequantization */
@@ -151,6 +163,18 @@ void dequant_row(uint32_t type, const void *src, float *y, int K) {
                 sc += 8;
             }
         }
+    } break;
+    case GGML_NVFP4: {
+        const block_nvfp4 *b = (const block_nvfp4 *)src;
+        for (int i = 0; i < K / QK_NVFP4; i++)
+            for (int s = 0; s < 4; s++) {
+                const float d = nvfp4_scale[b[i].d[s]];
+                for (int j = 0; j < 8; j++) {
+                    y[j] = d * nvfp4_values[b[i].qs[8 * s + j] & 0xF];
+                    y[j + 8] = d * nvfp4_values[b[i].qs[8 * s + j] >> 4];
+                }
+                y += 16;
+            }
     } break;
     default:
         memset(y, 0, (size_t)K * 4);
@@ -270,12 +294,14 @@ static float dot_q6_K_1(int K, const block_q6_K *x, const block_q8_K *y) {
     return sumf;
 }
 
+/* K a multiple of 32: the last Q8_K block may be partial */
 static float dot_q8_0_1(int K, const block_q8_0 *x, const block_q8_K *y) {
     float sumf = 0;
-    for (int i = 0; i < K / QK_K; i++) {
+    for (int i = 0; i < (K + QK_K - 1) / QK_K; i++) {
         const block_q8_0 *b = x + i * 8;
+        const int nj = K / QK8_0 - i * 8 < 8 ? K / QK8_0 - i * 8 : 8;
         float s = 0;
-        for (int j = 0; j < 8; j++) {
+        for (int j = 0; j < nj; j++) {
             int si = 0;
             for (int l = 0; l < 32; l++) si += b[j].qs[l] * y[i].qs[j * 32 + l];
             s += f16_to_f32(b[j].d) * si;
@@ -302,6 +328,24 @@ static float dot_q4_0_1(int K, const block_q4_0 *x, const block_q8_K *y) {
     return sumf;
 }
 
+/* 64-value blocks against Q8_K: block i reads the activations at i*64, four to a Q8_K block */
+static float dot_nvfp4_1(int K, const block_nvfp4 *x, const block_q8_K *y) {
+    float sumf = 0;
+    for (int i = 0; i < K / QK_NVFP4; i++) {
+        const int8_t *a = y[i / 4].qs + (i % 4) * QK_NVFP4;
+        float s = 0;
+        for (int k = 0; k < 4; k++) {
+            int si = 0;
+            for (int j = 0; j < 8; j++)
+                si += nvfp4_values[x[i].qs[8 * k + j] & 0xF] * a[16 * k + j] +
+                      nvfp4_values[x[i].qs[8 * k + j] >> 4] * a[16 * k + j + 8];
+            s += nvfp4_scale[x[i].d[k]] * si;
+        }
+        sumf += s * y[i / 4].d;
+    }
+    return sumf;
+}
+
 #define DEF_ROWS(NAME, BT, FN)                                                              \
     static void NAME(int K, const void *w, const block_q8_K *x, int xs, int nt, float *out, \
                      int os) {                                                              \
@@ -312,6 +356,7 @@ DEF_ROWS(rows_q5_K_scalar, block_q5_K, dot_q5_K_1)
 DEF_ROWS(rows_q6_K_scalar, block_q6_K, dot_q6_K_1)
 DEF_ROWS(rows_q8_0_scalar, block_q8_0, dot_q8_0_1)
 DEF_ROWS(rows_q4_0_scalar, block_q4_0, dot_q4_0_1)
+DEF_ROWS(rows_nvfp4_scalar, block_nvfp4, dot_nvfp4_1)
 
 static void f16_to_f32_row_scalar(const f16_t *x, float *y, int n) {
     for (int i = 0; i < n; i++) y[i] = f16_to_f32(x[i]);
@@ -360,6 +405,7 @@ static void init_scalar(Kernels *k) {
     k->dot[GGML_Q6_K] = rows_q6_K_scalar;
     k->dot[GGML_Q8_0] = rows_q8_0_scalar;
     k->dot[GGML_Q4_0] = rows_q4_0_scalar;
+    k->dot[GGML_NVFP4] = rows_nvfp4_scalar;
     k->quantize_q8_K = quantize_q8_K_scalar;
     k->f16_to_f32_row = f16_to_f32_row_scalar;
     k->f32_to_f16_row = f32_to_f16_row_scalar;
@@ -371,6 +417,7 @@ static void init_scalar(Kernels *k) {
 }
 
 const char *quant_init(const char *force) {
+    init_nvfp4_scale();
     init_scalar(&K_scalar);
     KS = K_scalar;
     if (force && !strcmp(force, "scalar")) return KS.name;

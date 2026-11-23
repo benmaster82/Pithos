@@ -21,17 +21,28 @@ typedef struct { float d; int8_t qs[QK_K]; int16_t bsums[QK_K / 16]; } block_q8_
 typedef struct { f16_t d; int8_t qs[QK8_0]; } block_q8_0;                                          /* 34 B */
 typedef struct { f16_t d; uint8_t qs[QK8_0 / 2]; } block_q4_0;                                     /* 18 B */
 
+/* NVFP4: 64 E2M1 values in 4 sub-blocks of 16, each with an unsigned E4M3 scale; sub-block s
+ * holds its values j and j+8 in the low and high nibbles of qs[8s+j] */
+#define QK_NVFP4 64
+typedef struct { uint8_t d[4]; uint8_t qs[QK_NVFP4 / 2]; } block_nvfp4;                            /* 36 B */
+
+/* E2M1 values times 2, and the E4M3 scales times 0.5 (the product is the weight) */
+extern const int8_t nvfp4_values[16];
+extern float nvfp4_scale[256];
+
 float f16_to_f32(f16_t h);
 f16_t f32_to_f16(float f);
 
 /* Kernel: dot one weight row (K elements, format-specific) against nt activation
- * rows (Q8_K, consecutive rows `xstride` blocks apart), writing out[t*ostride]. */
+ * rows (Q8_K, consecutive rows `xstride` blocks apart), writing out[t*ostride].
+ * K is a multiple of 256, except for NVFP4 (a multiple of 64) and Q8_0 (a multiple of 32):
+ * the activation rows then end in a partial Q8_K block, zero-padded. */
 typedef void (*dot_rows_fn)(int K, const void *w, const block_q8_K *x, int xstride,
                             int nt, float *out, int ostride);
 
 typedef struct {
     const char *name;
-    dot_rows_fn dot[32];                 /* indexed by GGML type */
+    dot_rows_fn dot[48];                 /* indexed by GGML type */
     void (*quantize_q8_K)(const float *x, block_q8_K *y, int K);
     void (*f16_to_f32_row)(const f16_t *x, float *y, int n);
     void (*f32_to_f16_row)(const float *x, f16_t *y, int n);
