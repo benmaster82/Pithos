@@ -1,5 +1,6 @@
-/* model.h - LFM2 / LFM2-MoE / LFM3 hybrid (short-conv + GQA attention + sparse MoE) and
- * Qwen3.5 / 3.6 MoE (Gated DeltaNet + gated GQA attention + MoE with a shared expert) forward pass. */
+/* model.h - LFM2 / LFM2-MoE / LFM3 hybrid (short-conv + GQA attention + sparse MoE),
+ * Qwen3.5 / 3.6 MoE (Gated DeltaNet + gated GQA attention + MoE with a shared expert) and
+ * Inkling 2 (looped MoE transformer, relative-position attention, depth attention) forward pass. */
 #ifndef PITHOS_MODEL_H
 #define PITHOS_MODEL_H
 
@@ -46,7 +47,23 @@ typedef struct {
     /* shared expert (Qwen3.5), added with the weight sigmoid(sh_inp . h); no data: none */
     Mat sh_gate, sh_up, sh_down;
     const float *sh_inp;            /* [dim] */
+    /* Inkling 2: gate_exps holds the fused [gate | up] experts; r of the relative-position bias
+     * [n_head * n_rel], the output gate [n_head * head_dim], the sink logits [n_head] and, on the
+     * full-attention layers, the input-dependent K / V conv taps [n_kv_head * l_cache] (F32) */
+    Mat ik_rel, ik_gate, ik_sink, ik_kdyn, ik_vdyn;
+    const float *ik_rel_bias;                   /* [extent][n_rel] */
+    const float *ik_q_clip, *ik_rel_clip;       /* [n_head][head_dim], [n_head][n_rel] */
+    const float *ik_k_conv, *ik_v_conv, *ik_o_conv, *ik_f_conv;    /* [channels][l_cache] */
+    const float *ik_q_norm, *ik_k_norm, *ik_v_norm;                /* full-attention layers; SWA: attn_norm */
+    const float *ik_attn_query, *ik_ffn_query;  /* depth-attention queries [1 or 3][dim] (NULL on layer 0), [dim] */
+    const float *ik_gu_scale, *ik_down_scale;   /* per-expert output scales [n_expert], or NULL */
 } Layer;
+
+/* Inkling 2: what a core layer gets from the previous pass (controllers of its q, k, v and FFN inputs) */
+typedef struct {
+    const float *msg_query;         /* [4][dim] */
+    Mat down[4], gain[4], forget[4];    /* [gate_rank][2 * dim], [dim][gate_rank] x 2, F32 */
+} IkLoop;
 
 typedef struct {
     GGUF gguf;
@@ -64,6 +81,14 @@ typedef struct {
     int q_gate;                     /* attn_q gives per head [q | gate]: output * sigmoid(gate) (Qwen3.5) */
     int ssm_conv_k, ssm_kh, ssm_vh, ssm_d;  /* DeltaNet: conv taps, K and V heads, head size */
     int ff_shexp;                   /* shared expert size, 0: none */
+    /* Inkling 2 (inkling2_loop): the layers [loop_start, loop_end) run n_pass times; every run of a
+     * layer is a cache slot of its own (the layers, then the core again per extra pass) */
+    int ik, n_slot, loop_start, loop_end, n_pass, gate_rank, res_block, n_rel, rel_extent, log_floor;
+    int ik_ch;                      /* conv state channels per slot: K, V, attention out, FFN out */
+    float qk_clip, rel_clip, log_alpha, situ_beta, situ_lb, exp_scale, softcap;
+    const float *embd_norm, *out_query;     /* [dim]: norm of the token embeddings, depth query of the output */
+    IkLoop *ik_loop;                /* [loop_end - loop_start] */
+    void **owned; int n_owned;      /* tensors converted at load (BF16 -> F32) */
     Mat embed, output;
     const float *final_norm;
     Layer *layers;

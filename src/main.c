@@ -1011,9 +1011,14 @@ static int real_main(int argc, char **argv) {
     if (n_swa) snprintf(swa, sizeof(swa), ", %d of them sliding-window %d", n_swa, m.swa_window);
     if (m.n_delta) snprintf(rec, sizeof(rec), "%d DeltaNet", m.n_delta);
     else snprintf(rec, sizeof(rec), "%d conv", m.n_conv);
-    fprintf(stderr, "model: %s | %d layers (%d attn%s, %s) | dim %d%s | vocab %d | %.2f GB | ~%.0f MB/token | %.2f s\n",
-            m.arch, m.n_layer, m.n_attn, swa, rec, m.dim, moe, m.n_vocab,
-            m.gguf.mf.size / 1073741824.0, m.bytes_per_token / 1048576.0, time_sec() - t0);
+    if (m.ik)   /* every layer attends; the loop core runs again */
+        fprintf(stderr, "model: %s | %d layers (%d sliding-window %d), %d-%d run %d times: %d per token | dim %d%s | vocab %d | %.2f GB | ~%.0f MB/token | %.2f s\n",
+                m.arch, m.n_layer, n_swa, m.swa_window, m.loop_start, m.loop_end - 1, m.n_pass, m.n_slot, m.dim, moe, m.n_vocab,
+                m.gguf.mf.size / 1073741824.0, m.bytes_per_token / 1048576.0, time_sec() - t0);
+    else
+        fprintf(stderr, "model: %s | %d layers (%d attn%s, %s) | dim %d%s | vocab %d | %.2f GB | ~%.0f MB/token | %.2f s\n",
+                m.arch, m.n_layer, m.n_attn, swa, rec, m.dim, moe, m.n_vocab,
+                m.gguf.mf.size / 1073741824.0, m.bytes_per_token / 1048576.0, time_sec() - t0);
 
     if (a.tokenize) {
         int n;
@@ -1032,6 +1037,11 @@ static int real_main(int argc, char **argv) {
         fprintf(stderr, "mlock: %s\n", ok ? "ok" : "failed (continuing without it)");
     }
 
+    if (m.ik && (a.gpu_auto || a.gpu_use)) {
+        fprintf(stderr, "GPU: none, Inkling 2 runs on the CPU only for now\n");
+        a.gpu_auto = 0;
+        a.gpu_use = 0;
+    }
     /* OpenCL alone on a GPU that takes the prompt in tiles: larger batches fill them (gpu_prompt_batch) */
     {
         const int cl_only = a.gpu_auto ? m.n_expert > 0 : a.gpu_use == USE_CL;

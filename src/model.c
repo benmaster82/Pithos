@@ -60,10 +60,39 @@ static int load_mat(Model *m, Mat *mat, const char *name, int required, char *er
     mat->rows = (int)t->ne[1];
     mat->row_bytes = row_bytes(t->type, mat->cols);
     mat->expert_stride = mat->row_bytes * (size_t)mat->rows;
-    if (t->type != GGML_F32 && t->type != GGML_F16 && (mat->cols % QK_K) != 0) {
-        snprintf(err, errlen, "tensor %s: row length %d not a multiple of 256", name, mat->cols);
+    /* Inkling's 1152-long expert rows: NVFP4 and Q8_0 rows may end in a partial Q8_K block */
+    const int blk = !m->ik ? QK_K : t->type == GGML_NVFP4 ? QK_NVFP4 : t->type == GGML_Q8_0 ? QK8_0 : QK_K;
+    if (t->type != GGML_F32 && t->type != GGML_F16 && (mat->cols % blk) != 0) {
+        snprintf(err, errlen, "tensor %s: row length %d not a multiple of %d", name, mat->cols, blk);
         return -1;
     }
+    return 1;
+}
+
+/* an F32 or BF16 matrix as F32: BF16 is converted into memory the model owns */
+static int load_mat_f32(Model *m, Mat *mat, const char *name, char *err, int errlen) {
+    const GGUFTensor *t = gguf_tensor(&m->gguf, name);
+    if (!t) { snprintf(err, errlen, "missing tensor %s", name); return 0; }
+    if (t->type == GGML_F32) return load_mat(m, mat, name, 1, err, errlen);
+    if (t->type != GGML_BF16 || t->ne[2] * t->ne[3] != 1) { snprintf(err, errlen, "tensor %s: expected BF16 or F32", name); return 0; }
+    const size_t n = (size_t)t->ne[0] * (size_t)t->ne[1];
+    float *f = (float *)malloc(sizeof(float) * n);
+    void **o = (void **)realloc(m->owned, sizeof(void *) * (size_t)(m->n_owned + 1));
+    if (!f || !o) { free(f); snprintf(err, errlen, "out of memory"); return 0; }
+    m->owned = o;
+    m->owned[m->n_owned++] = f;
+    const uint16_t *s = (const uint16_t *)t->data;
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t u = (uint32_t)s[i] << 16;
+        memcpy(f + i, &u, 4);
+    }
+    memset(mat, 0, sizeof(*mat));
+    mat->type = GGML_F32;
+    mat->data = (const uint8_t *)f;
+    mat->cols = (int)t->ne[0];
+    mat->rows = (int)t->ne[1];
+    mat->row_bytes = sizeof(float) * (size_t)mat->cols;
+    mat->expert_stride = mat->row_bytes * (size_t)mat->rows;
     return 1;
 }
 
@@ -204,6 +233,173 @@ fail:
     return 0;
 }
 
+/* Inkling 2 Mini (inkling2_loop, the layout of llama.cpp's mainline converter); m->gguf is open */
+static int load_inkling2(Model *m, char *err, int errlen) {
+    GGUF *g = &m->gguf;
+    m->ik = 1;
+#define KEY(s) "inkling2_loop." s
+    const GGUFKV *nh = gguf_find(g, KEY("attention.head_count")), *nkv = gguf_find(g, KEY("attention.head_count_kv"));
+    const GGUFKV *swa = gguf_find(g, KEY("attention.sliding_window_pattern"));
+    m->n_layer = (int)gguf_get_int(g, KEY("block_count"), 0);
+    m->dim = (int)gguf_get_int(g, KEY("embedding_length"), 0);
+    m->n_head = nh && nh->type == GGUF_T_ARRAY ? (int)gguf_arr_int(nh, 0) : (int)gguf_get_int(g, KEY("attention.head_count"), 0);
+    m->n_kv_head = nkv && nkv->type == GGUF_T_ARRAY ? (int)gguf_arr_int(nkv, 0) : (int)gguf_get_int(g, KEY("attention.head_count_kv"), 0);
+    m->head_dim = (int)gguf_get_int(g, KEY("attention.key_length"), 0);
+    m->ff_exp = (int)gguf_get_int(g, KEY("expert_feed_forward_length"), 0);
+    m->n_expert = (int)gguf_get_int(g, KEY("expert_count"), 0);
+    m->n_expert_used = (int)gguf_get_int(g, KEY("expert_used_count"), 0);
+    m->n_ctx_train = (int)gguf_get_int(g, KEY("context_length"), 4096);
+    m->eps = (float)gguf_get_float(g, KEY("attention.layer_norm_rms_epsilon"), 1e-6);
+    m->swa_window = (int)gguf_get_int(g, KEY("attention.sliding_window"), 0);
+    m->l_cache = (int)gguf_get_int(g, KEY("shortconv.l_cache"), 0);
+    m->res_block = (int)gguf_get_int(g, KEY("attn_res.block_size"), 0);
+    m->n_rel = (int)gguf_get_int(g, KEY("attention.relative_length"), 0);
+    m->rel_extent = (int)gguf_get_int(g, KEY("attention.relative_extent"), 0);
+    m->qk_clip = (float)gguf_get_float(g, KEY("attention.qk_clip"), 0);
+    m->rel_clip = (float)gguf_get_float(g, KEY("attention.relative_clip"), 0);
+    m->log_floor = (int)gguf_get_int(g, KEY("attention.log_scale_floor"), 0);
+    m->log_alpha = (float)gguf_get_float(g, KEY("attention.log_scale_alpha"), 0);
+    m->exp_scale = (float)gguf_get_float(g, KEY("expert_weights_scale"), 1);
+    m->situ_beta = (float)gguf_get_float(g, KEY("activation.situ_beta"), 0);
+    m->situ_lb = (float)gguf_get_float(g, KEY("activation.situ_linear_beta"), 0);
+    m->softcap = (float)gguf_get_float(g, KEY("final_logit_softcapping"), 0);
+    m->loop_start = (int)gguf_get_int(g, KEY("loop.start"), 0);
+    m->loop_end = (int)gguf_get_int(g, KEY("loop.end"), 0);
+    m->n_pass = (int)gguf_get_int(g, KEY("loop.count"), 0);
+    m->gate_rank = (int)gguf_get_int(g, KEY("loop.gate_rank"), 0);
+    const int varying = (int)gguf_get_int(g, KEY("loop.varying"), 0);
+    const int vocab_padded = (int)gguf_get_int(g, KEY("vocab_size"), 0);
+    const int vocab = (int)gguf_get_int(g, KEY("vocab_size_unpadded"), 0);
+#undef KEY
+    m->gating = 2;      /* sigmoid router with a selection bias, the top k renormalized, times exp_scale */
+    m->norm_topk = 1;
+    m->add_bos = (int)gguf_get_int(g, "tokenizer.ggml.add_bos_token", 0);
+    const int nblk = m->res_block > 0 ? m->n_layer / m->res_block : 0;
+    if (m->n_layer <= 0 || m->n_layer > 64 || m->dim <= 0 || m->dim % QK_K || m->dim > 8192 || m->n_head <= 0 ||
+        m->n_kv_head <= 0 || m->n_head % m->n_kv_head || m->head_dim <= 0 || m->head_dim > 256 || m->n_expert <= 0 ||
+        m->n_expert > MAX_EXPERT || m->n_expert_used <= 0 || m->n_expert_used > 8 || m->ff_exp <= 0 || m->ff_exp % QK_NVFP4 ||
+        m->swa_window <= 0 || m->l_cache < 2 || m->l_cache > 8 || m->res_block <= 0 || m->n_layer % m->res_block || nblk > 8 ||
+        m->n_rel <= 0 || m->n_rel > 64 || m->rel_extent <= 0 || m->log_floor <= 0 || !(m->qk_clip > 0) || !(m->rel_clip > 0) ||
+        !(m->situ_beta > 0) || m->loop_start <= 0 || m->loop_start >= m->loop_end || m->loop_end > m->n_layer ||
+        m->loop_start % m->res_block || m->loop_end % m->res_block || m->n_pass < 2 || varying || m->gate_rank <= 0 ||
+        !swa || swa->type != GGUF_T_ARRAY || swa->arr_len != (uint64_t)m->n_layer || vocab <= 0 || vocab > vocab_padded) {
+        snprintf(err, errlen, "inkling2_loop: unsupported hyperparameters");
+        return 0;
+    }
+    for (int l = 0; l < m->n_layer; l++)
+        if ((nh && nh->type == GGUF_T_ARRAY && gguf_arr_int(nh, (uint64_t)l) != m->n_head) ||
+            (nkv && nkv->type == GGUF_T_ARRAY && gguf_arr_int(nkv, (uint64_t)l) != m->n_kv_head)) {
+            snprintf(err, errlen, "inkling2_loop: layers with different head counts");
+            return 0;
+        }
+    m->n_slot = m->n_layer + (m->n_pass - 1) * (m->loop_end - m->loop_start);
+    m->n_attn = m->n_slot;          /* a KV cache per slot */
+    const int D = m->dim, hd = m->head_dim, kvd = m->n_kv_head * hd, qd = m->n_head * hd, lc = m->l_cache;
+    m->ik_ch = 2 * kvd + 2 * D;
+
+    REQ(load_mat(m, &m->embed, "token_embd.weight", 1, err, errlen));
+    REQ(load_mat(m, &m->output, "output.weight", 1, err, errlen));
+    if (m->embed.rows != vocab_padded || m->output.rows != vocab_padded || m->embed.cols != D || m->output.cols != D) {
+        snprintf(err, errlen, "inkling2_loop: embedding or output of unexpected shape");
+        return 0;
+    }
+    m->n_vocab = vocab;
+    m->output.rows = vocab;         /* the rows past the vocabulary are padding */
+    REQP(m->embd_norm = load_f32(m, "token_embd_norm.weight", D, 1, err, errlen));
+    REQP(m->final_norm = load_f32(m, "output_norm.weight", D, 1, err, errlen));
+    REQP(m->out_query = load_f32(m, "output_res_query.weight", D, 1, err, errlen));
+
+    m->layers = (Layer *)calloc((size_t)m->n_layer, sizeof(Layer));
+    char nm[128];
+#define T(s) (snprintf(nm, sizeof(nm), "blk.%d." s, l), nm)
+    for (int l = 0; l < m->n_layer; l++) {
+        Layer *L = &m->layers[l];
+        L->is_attn = L->is_moe = 1;
+        L->is_swa = gguf_arr_int(swa, (uint64_t)l) != 0;
+        L->attn_idx = l;
+        const int extent = L->is_swa ? m->swa_window : m->rel_extent;
+        REQ(load_mat(m, &L->wq, T("attn_q.weight"), 1, err, errlen));
+        REQ(load_mat(m, &L->wk, T("attn_k.weight"), 1, err, errlen));
+        REQ(load_mat(m, &L->wv, T("attn_v.weight"), 1, err, errlen));
+        REQ(load_mat(m, &L->wo, T("attn_output.weight"), 1, err, errlen));
+        REQ(load_mat(m, &L->ik_gate, T("attn_gate.weight"), 1, err, errlen));
+        REQ(load_mat(m, &L->ik_rel, T("attn_rel.weight"), 1, err, errlen));
+        REQ(load_mat_f32(m, &L->ik_sink, T("attn_sink_proj.weight"), err, errlen));
+        REQP(L->ik_q_clip = load_f32(m, T("attn_q_clip.weight"), qd, 1, err, errlen));
+        REQP(L->ik_rel_bias = load_f32(m, T("attn_rel_bias.weight"), m->n_rel * extent, 1, err, errlen));
+        REQP(L->ik_rel_clip = load_f32(m, T("attn_rel_clip.weight"), m->n_rel * m->n_head, 1, err, errlen));
+        REQP(L->ik_k_conv = load_f32(m, T("attn_k_conv.weight"), lc * kvd, 1, err, errlen));
+        REQP(L->ik_v_conv = load_f32(m, T("attn_v_conv.weight"), lc * kvd, 1, err, errlen));
+        REQP(L->ik_o_conv = load_f32(m, T("attn_post_conv.weight"), lc * D, 1, err, errlen));
+        REQP(L->ik_f_conv = load_f32(m, T("ffn_post_conv.weight"), lc * D, 1, err, errlen));
+        if (L->is_swa) {
+            REQP(L->attn_norm = load_f32(m, T("attn_norm.weight"), D, 1, err, errlen));
+        } else {
+            REQP(L->ik_q_norm = load_f32(m, T("attn_q_inp_norm.weight"), D, 1, err, errlen));
+            REQP(L->ik_k_norm = load_f32(m, T("attn_k_inp_norm.weight"), D, 1, err, errlen));
+            REQP(L->ik_v_norm = load_f32(m, T("attn_v_inp_norm.weight"), D, 1, err, errlen));
+            REQ(load_mat_f32(m, &L->ik_kdyn, T("attn_k_conv_proj.weight"), err, errlen));
+            REQ(load_mat_f32(m, &L->ik_vdyn, T("attn_v_conv_proj.weight"), err, errlen));
+            if (L->ik_kdyn.rows != lc * m->n_kv_head || L->ik_vdyn.rows != lc * m->n_kv_head || L->ik_kdyn.cols != D) {
+                snprintf(err, errlen, "layer %d: conv taps of unexpected shape", l);
+                return 0;
+            }
+        }
+        if (l > 0) REQP(L->ik_attn_query = load_f32(m, T("attn_res_query.weight"), D * (L->is_swa ? 1 : 3), 1, err, errlen));
+        REQP(L->ik_ffn_query = load_f32(m, T("ffn_res_query.weight"), D, 1, err, errlen));
+        REQP(L->ffn_norm = load_f32(m, T("ffn_norm.weight"), D, 1, err, errlen));
+        REQ(load_mat(m, &L->router, T("ffn_gate_inp.weight"), 1, err, errlen));
+        L->exp_bias = load_f32(m, T("exp_probs_b.bias"), m->n_expert, 0, err, errlen);
+        REQ(load_mat(m, &L->gate_exps, T("ffn_gate_up_exps.weight"), 1, err, errlen));
+        REQ(load_mat(m, &L->down_exps, T("ffn_down_exps.weight"), 1, err, errlen));
+        L->ik_gu_scale = load_f32(m, T("ffn_gate_up_exps.scale"), m->n_expert, 0, err, errlen);
+        L->ik_down_scale = load_f32(m, T("ffn_down_exps.scale"), m->n_expert, 0, err, errlen);
+        if (L->wq.rows != qd || L->wk.rows != kvd || L->wv.rows != kvd || L->wo.cols != qd || L->wo.rows != D ||
+            L->ik_gate.rows != qd || L->ik_rel.rows != m->n_rel * m->n_head || L->ik_sink.rows != m->n_head ||
+            L->ik_sink.cols != D || L->router.type != GGML_F32 || L->router.rows != m->n_expert ||
+            L->gate_exps.rows != 2 * m->ff_exp || L->gate_exps.cols != D || L->down_exps.cols != m->ff_exp ||
+            L->down_exps.rows != D) {
+            snprintf(err, errlen, "layer %d: tensors of unexpected shape", l);
+            return 0;
+        }
+    }
+    m->ik_loop = (IkLoop *)calloc((size_t)(m->loop_end - m->loop_start), sizeof(IkLoop));
+    static const char *ctl[4] = { "q", "k", "v", "ffn" };
+    for (int l = m->loop_start; l < m->loop_end; l++) {
+        IkLoop *lp = &m->ik_loop[l - m->loop_start];
+        REQP(lp->msg_query = load_f32(m, T("loop_msg_query.weight"), 4 * D, 1, err, errlen));
+        for (int k = 0; k < 4; k++) {
+            char base[64];
+            snprintf(base, sizeof(base), "blk.%d.loop_%s_ctrl_", l, ctl[k]);
+            snprintf(nm, sizeof(nm), "%sdown.weight", base);
+            REQ(load_mat(m, &lp->down[k], nm, 1, err, errlen));
+            snprintf(nm, sizeof(nm), "%sgain.weight", base);
+            REQ(load_mat(m, &lp->gain[k], nm, 1, err, errlen));
+            snprintf(nm, sizeof(nm), "%sforget.weight", base);
+            REQ(load_mat(m, &lp->forget[k], nm, 1, err, errlen));
+            if (lp->down[k].type != GGML_F32 || lp->down[k].rows != m->gate_rank || lp->down[k].cols != 2 * D ||
+                lp->gain[k].type != GGML_F32 || lp->gain[k].rows != D || lp->gain[k].cols != m->gate_rank ||
+                lp->forget[k].type != GGML_F32 || lp->forget[k].rows != D || lp->forget[k].cols != m->gate_rank) {
+                snprintf(err, errlen, "layer %d: loop controller of unexpected shape", l);
+                return 0;
+            }
+        }
+    }
+#undef T
+    /* every layer once, the core again for each extra pass */
+    uint64_t b = (uint64_t)m->output.row_bytes * m->n_vocab;
+    for (int s = 0; s < m->n_slot; s++) {
+        const Layer *L = &m->layers[s < m->n_layer ? s : m->loop_start + (s - m->n_layer) % (m->loop_end - m->loop_start)];
+        b += (uint64_t)L->wq.expert_stride + L->wk.expert_stride + L->wv.expert_stride + L->wo.expert_stride +
+             L->ik_gate.expert_stride + L->ik_rel.expert_stride +
+             (uint64_t)m->n_expert_used * (L->gate_exps.expert_stride + L->down_exps.expert_stride);
+    }
+    m->bytes_per_token = b;
+    return 1;
+fail:
+    return 0;
+}
+
 int model_load(Model *m, const char *path, char *err, int errlen) {
     memset(m, 0, sizeof(*m));
     if (!gguf_open(&m->gguf, path, err, errlen)) return 0;
@@ -217,8 +413,12 @@ int model_load(Model *m, const char *path, char *err, int errlen) {
         if (load_qwen35(m, err, errlen)) return 1;
         goto fail;
     }
+    if (!strcmp(m->arch, "inkling2_loop")) {
+        if (load_inkling2(m, err, errlen)) return 1;
+        goto fail;
+    }
     if (strcmp(m->arch, "lfm2") && strcmp(m->arch, "lfm2moe") && strcmp(m->arch, "lfm3")) {
-        snprintf(err, errlen, "unsupported architecture '%s' (need lfm2 / lfm2moe / lfm3 / qwen35moe)", m->arch);
+        snprintf(err, errlen, "unsupported architecture '%s' (need lfm2 / lfm2moe / lfm3 / qwen35moe / inkling2_loop)", m->arch);
         goto fail;
     }
     char key[128];
@@ -412,6 +612,9 @@ fail:
 }
 
 void model_free(Model *m) {
+    for (int i = 0; i < m->n_owned; i++) free(m->owned[i]);
+    free(m->owned);
+    free(m->ik_loop);
     free(m->layers);
     gguf_close(&m->gguf);
     memset(m, 0, sizeof(*m));
@@ -477,6 +680,14 @@ struct Context {
     int *a_tok, *a_slot, *tok_a;
     block_q8_K *xg; float *eg, *eu; block_q8_K *eq; float *eo;
     float *scores;   /* [n_threads][n_ctx] */
+    /* Inkling 2 scratch, n_batch rows each (ik_layers): the prelude output, two buffers per depth
+     * block (the core's alternate between passes), the previous pass's output, the messages
+     * [4][rows][dim], the attention inputs [3][rows][dim], projections, controllers, experts */
+    struct {
+        float *arena, *pre, *blk[16], *bank_out, *msg, *in, *q, *k, *v, *r, *g, *s, *kd, *vd;
+        float *z, *cg, *gain, *forget, *gu, *act, *tab, *mix;
+        block_q8_K *qin, *eq;
+    } ik;
     /* matmul scheduling */
     MatJob jobs[MAX_JOBS]; int njobs;
     int *task_job, *task_r0, *task_r1; int ntasks;
@@ -507,6 +718,7 @@ Context *ctx_create(Model *m, ThreadPool *pool, int n_ctx, int n_batch) {
     const int vd = m->ssm_vh * m->ssm_d, qkv = 2 * m->ssm_kh * m->ssm_d + vd;
     c->delta_off = (size_t)(m->n_conv ? m->n_conv : 1) * (m->l_cache - 1) * D;
     c->delta_size = m->n_delta ? (size_t)(m->ssm_conv_k - 1) * qkv + (size_t)vd * m->ssm_d : 0;
+    if (m->ik) c->delta_off = (size_t)m->n_slot * (m->l_cache - 1) * m->ik_ch;   /* the conv inputs of every slot */
     c->conv = (float *)amalloc(sizeof(float) * (c->delta_off + (size_t)m->n_delta * c->delta_size));
     for (int i = 0; i < m->n_rot / 2; i++) {
         c->inv_freq[i] = (float)pow((double)m->rope_base, -2.0 * i / m->n_rot);
@@ -558,6 +770,31 @@ Context *ctx_create(Model *m, ThreadPool *pool, int n_ctx, int n_batch) {
     c->task_job = (int *)malloc(sizeof(int) * MAX_TASKS);
     c->task_r0 = (int *)malloc(sizeof(int) * MAX_TASKS);
     c->task_r1 = (int *)malloc(sizeof(int) * MAX_TASKS);
+    if (m->ik) {
+        const size_t BD = (size_t)B * D, F = (size_t)m->ff_exp, FP = (F + QK_K - 1) / QK_K * QK_K, BK = (size_t)B * k;
+        const int nblk = 2 * (m->n_layer / m->res_block), lc = m->l_cache;
+        const size_t ext = (size_t)(m->rel_extent > m->swa_window ? m->rel_extent : m->swa_window) + 1;
+        const size_t sz[] = { BD, BD * nblk, BD, 4 * BD, 3 * BD, (size_t)B * qd, (size_t)B * kvd, (size_t)B * kvd,
+                              (size_t)B * m->n_head * m->n_rel, (size_t)B * qd, (size_t)B * m->n_head,
+                              (size_t)B * lc * m->n_kv_head, (size_t)B * lc * m->n_kv_head, 2 * BD,
+                              (size_t)B * m->gate_rank, BD, BD, BK * 2 * F, BK * FP, (size_t)c->n_threads * ext, BD };
+        size_t tot = 0;
+        for (size_t i = 0; i < sizeof(sz) / sizeof(sz[0]); i++) tot += (sz[i] + 15) / 16 * 16;
+        float *p = c->ik.arena = (float *)amalloc(sizeof(float) * tot);
+        if (p) {
+            float **dst[] = { &c->ik.pre, NULL, &c->ik.bank_out, &c->ik.msg, &c->ik.in, &c->ik.q, &c->ik.k, &c->ik.v,
+                              &c->ik.r, &c->ik.g, &c->ik.s, &c->ik.kd, &c->ik.vd, &c->ik.z, &c->ik.cg, &c->ik.gain,
+                              &c->ik.forget, &c->ik.gu, &c->ik.act, &c->ik.tab, &c->ik.mix };
+            for (size_t i = 0; i < sizeof(sz) / sizeof(sz[0]); i++) {
+                if (dst[i]) *dst[i] = p;
+                else for (int b = 0; b < nblk; b++) c->ik.blk[b] = p + (size_t)b * BD;
+                p += (sz[i] + 15) / 16 * 16;
+            }
+        }
+        c->ik.qin = (block_q8_K *)amalloc(sizeof(block_q8_K) * 3 * B * nbd);
+        c->ik.eq = (block_q8_K *)amalloc(sizeof(block_q8_K) * BK * (FP / QK_K));
+        if (!c->ik.arena || !c->ik.qin || !c->ik.eq) { ctx_free(c); return NULL; }
+    }
     if (!c->kc || !c->vc || !c->scores || !c->eo) { ctx_free(c); return NULL; }
     return c;
 }
@@ -567,7 +804,8 @@ void ctx_free(Context *c) {
     if (c->pfq) prefetcher_destroy(c->pfq);
     void *a[] = { c->kc, c->vc, c->conv, c->x, c->h, c->big, c->tmp, c->out, c->gate, c->rope, c->logits, c->hq, c->tq,
                   c->fg, c->fu, c->fq, c->rlog, c->selw, c->sel, c->a_tok, c->a_slot, c->tok_a, c->xg,
-                  c->eg, c->eu, c->eq, c->eo, c->scores, c->gy, c->on_gpu, c->ga_e, c->ga_t, c->qg };
+                  c->eg, c->eu, c->eq, c->eo, c->scores, c->gy, c->on_gpu, c->ga_e, c->ga_t, c->qg,
+                  c->ik.arena, c->ik.qin, c->ik.eq };
     for (size_t i = 0; i < sizeof(a) / sizeof(a[0]); i++) aligned_free(a[i]);
     free(c->task_job); free(c->task_r0); free(c->task_r1); free(c->last_used);
     free(c);
@@ -1156,7 +1394,8 @@ static void top_k(const float *sc, int n, int k, int *out) {
 
 static void prefetch_expert(Context *c, const Layer *L, int e) {
     prefetcher_push(c->pfq, L->gate_exps.data + (size_t)e * L->gate_exps.expert_stride, L->gate_exps.expert_stride);
-    prefetcher_push(c->pfq, L->up_exps.data + (size_t)e * L->up_exps.expert_stride, L->up_exps.expert_stride);
+    if (L->up_exps.data)   /* Inkling: gate and up in one tensor */
+        prefetcher_push(c->pfq, L->up_exps.data + (size_t)e * L->up_exps.expert_stride, L->up_exps.expert_stride);
     prefetcher_push(c->pfq, L->down_exps.data + (size_t)e * L->down_exps.expert_stride, L->down_exps.expert_stride);
 }
 
@@ -1590,12 +1829,420 @@ static void forward_token_gpu(Context *c, int token, float *all_logits) {
     c->conv_cpu_ok = 0;
 }
 
+/* ------------------------------------------------------------------ Inkling 2 */
+
+/* Inkling 2 Mini (inkling2_loop), as llama.cpp's src/models/inkling2.cpp and inkling2-loop.cpp:
+ *
+ * Depth attention (mix): the outputs of the earlier blocks and the current state, each RMS-normed,
+ * averaged with softmax(state . query / sqrt(dim)) weights; it gives the attention inputs (one
+ * query on SWA layers, one each for q, k, v on full-attention ones), the FFN input and the output.
+ * The first layer of each block of res_block layers saves its input as a block and starts a new
+ * residual stream from its attention output.
+ *
+ * Attention: no RoPE. q and k L2-clipped (q after a per-channel scale), v RMS-normed, scores
+ * q.k / sqrt(hd) plus a relative-position bias r . bias[distance] (r [n_rel] per head, clipped;
+ * distances past the extent: no bias), a sink logit per query (sink_proj . input) in the softmax
+ * denominator; on the full-attention layers q and r are scaled by tau = 1 + alpha log(max(1,
+ * (pos + 1) / floor)). The output times sigmoid(gate . input). Short causal convolutions with a
+ * residual, (x + conv(x)) / sqrt(l_cache + 1), on K, V, the attention output and the FFN output;
+ * the full-attention layers' K and V also get input-dependent taps per head (then / sqrt(2 l_cache + 1)).
+ *
+ * MoE: sigmoid router plus a selection bias, top k, weights renormalized then times exp_scale;
+ * fused [gate | up] experts, each output times its expert's scale; situ(g, u) = b tanh(g / b)
+ * sigmoid(g) lb tanh(u / lb). Logits softcapped.
+ *
+ * Loop: the layers [loop_start, loop_end) run n_pass times, every pass from the prelude output.
+ * Passes after the first get messages: depth attention over the previous pass's blocks after
+ * its first core block and its output, four queries per layer; each one enters the q, k, v or
+ * FFN input as x - tanh(forget) x + tanh(gain) message, gain and forget low-rank in [x, message]
+ * (both RMS-normed). Every run of a layer has its own KV cache and conv state (slot). */
+
+static void ik_rms(float *o, const float *x, int n) {
+    double ss = 0;
+    for (int i = 0; i < n; i++) ss += (double)x[i] * x[i];
+    const float s = (float)(1.0 / sqrt(ss / n + 1e-6));
+    for (int i = 0; i < n; i++) o[i] = x[i] * s;
+}
+
+/* scale a vector down to an L2 norm of at most thr */
+static void ik_clip(float *v, int n, float thr) {
+    double ss = 0;
+    for (int i = 0; i < n; i++) ss += (double)v[i] * v[i];
+    const float f = thr / (float)(sqrt(ss) + 1e-6);
+    if (f < 1.f)
+        for (int i = 0; i < n; i++) v[i] *= f;
+}
+
+static int ik_phys(const Model *m, int slot) {
+    return slot < m->n_layer ? slot : m->loop_start + (slot - m->n_layer) % (m->loop_end - m->loop_start);
+}
+
+typedef struct {
+    Context *c;
+    float *const *blk;
+    int nb, nq;
+    const float *cur, *query;
+    float *out;
+    size_t ts, qs;          /* out of token t, query q: out + t * ts + q * qs */
+} IkMixArgs;
+
+static void ik_mix_task(void *ctx, int t, int tid) {
+    (void)tid;
+    const IkMixArgs *a = (const IkMixArgs *)ctx;
+    const int D = a->c->m->dim;
+    const float *st[17];
+    float inv[17];
+    int ns = 0;
+    for (int b = 0; b < a->nb; b++) st[ns++] = a->blk[b] + (size_t)t * D;
+    st[ns++] = a->cur + (size_t)t * D;
+    for (int s = 0; s < ns; s++) {
+        double ss = 0;
+        for (int i = 0; i < D; i++) ss += (double)st[s][i] * st[s][i];
+        inv[s] = (float)(1.0 / sqrt(ss / D + 1e-6));
+    }
+    for (int q = 0; q < a->nq; q++) {
+        float p[17], mx = -1e30f, sum = 0;
+        for (int s = 0; s < ns; s++) {
+            p[s] = inv[s] * KS.dot_f32(st[s], a->query + (size_t)q * D, D) / sqrtf((float)D);
+            if (p[s] > mx) mx = p[s];
+        }
+        for (int s = 0; s < ns; s++) { p[s] = expf(p[s] - mx); sum += p[s]; }
+        float *o = a->out + (size_t)t * a->ts + (size_t)q * a->qs;
+        for (int i = 0; i < D; i++) o[i] = 0;
+        for (int s = 0; s < ns; s++) {
+            const float w = p[s] / sum * inv[s];
+            for (int i = 0; i < D; i++) o[i] += w * st[s][i];
+        }
+    }
+}
+
+static void ik_mix(Context *c, float *const *blk, int nb, const float *cur, const float *query, int nq, int n,
+                   float *out, size_t ts, size_t qs) {
+    IkMixArgs a = { c, blk, nb, nq, cur, query, out, ts, qs };
+    if (n == 1) ik_mix_task(&a, 0, 0);
+    else pool_run(c->pool, ik_mix_task, &a, n);
+}
+
+/* x[n][dim] = x - tanh(forget) x + tanh(gain) msg, controller k of the layer */
+static void ik_control(Context *c, const IkLoop *lp, int k, float *x, const float *msg, int n) {
+    const int D = c->m->dim, R = c->m->gate_rank;
+    float *z = c->ik.z;
+    for (int t = 0; t < n; t++) {
+        ik_rms(z + (size_t)t * 2 * D, x + (size_t)t * D, D);
+        ik_rms(z + (size_t)t * 2 * D + D, msg + (size_t)t * D, D);
+    }
+    job_clear(c);
+    job_add_f(c, &lp->down[k], z, 2 * D, n, c->ik.cg, R);
+    job_run(c, CAT_ATTN);
+    job_clear(c);
+    job_add_f(c, &lp->gain[k], c->ik.cg, R, n, c->ik.gain, D);
+    job_add_f(c, &lp->forget[k], c->ik.cg, R, n, c->ik.forget, D);
+    job_run(c, CAT_ATTN);
+    for (size_t i = 0; i < (size_t)n * D; i++)
+        x[i] = x[i] - tanhf(c->ik.forget[i]) * x[i] + tanhf(c->ik.gain[i]) * msg[i];
+}
+
+/* causal short conv with a residual over x[n][nch] (in place), the slot's state from channel choff;
+ * dyn[n][nh][l_cache]: per-head taps added for the lags 0..l_cache-1, or NULL */
+static void ik_conv(Context *c, int slot, float *x, int nch, int choff, const float *w, const float *dyn, int nh, int n) {
+    const Model *m = c->m;
+    const int lc = m->l_cache, hs = nch / nh;
+    float *st = c->conv + (size_t)slot * (lc - 1) * m->ik_ch + choff;   /* [lc-1][ik_ch], oldest first */
+    const float sc = 1.f / sqrtf((float)((dyn ? 2 : 1) * lc + 1));
+    for (int t = 0; t < n; t++) {
+        float *xt = x + (size_t)t * nch;
+        const float *dt = dyn ? dyn + (size_t)t * nh * lc : NULL;
+        for (int ch = 0; ch < nch; ch++) {
+            float win[8];   /* oldest first, the current input last */
+            for (int k = 0; k < lc - 1; k++) win[k] = st[(size_t)k * m->ik_ch + ch];
+            win[lc - 1] = xt[ch];
+            float acc = 0;
+            for (int k = 0; k < lc; k++) acc += w[(size_t)ch * lc + k] * win[k];
+            if (dt) {
+                const float *tap = dt + (size_t)(ch / hs) * lc;
+                for (int lag = 0; lag < lc; lag++) acc += tap[lag] * win[lc - 1 - lag];
+            }
+            for (int k = 0; k < lc - 2; k++) st[(size_t)k * m->ik_ch + ch] = st[(size_t)(k + 1) * m->ik_ch + ch];
+            st[(size_t)(lc - 2) * m->ik_ch + ch] = win[lc - 1];
+            xt[ch] = (win[lc - 1] + acc) * sc;
+        }
+    }
+}
+
+typedef struct {
+    Context *c;
+    const Layer *L;
+    int slot, n, pos0;
+} IkAttnArgs;
+
+static void ik_attn_task(void *ctx, int task, int tid) {
+    const IkAttnArgs *a = (const IkAttnArgs *)ctx;
+    Context *c = a->c;
+    const Model *m = c->m;
+    const int hd = m->head_dim, nh = m->n_head, kvd = m->n_kv_head * hd, qd = nh * hd, R = m->n_rel;
+    const int t = task / nh, h = task % nh, kvh = h / (nh / m->n_kv_head);
+    const float *q = c->ik.q + (size_t)t * qd + (size_t)h * hd;
+    const float *r = c->ik.r + (size_t)t * nh * R + (size_t)h * R;
+    const float sink = c->ik.s[(size_t)t * nh + h];
+    const int npos = a->pos0 + t + 1;
+    const int j0 = a->L->is_swa && npos > m->swa_window ? npos - m->swa_window : 0;
+    const int extent = a->L->is_swa ? m->swa_window : m->rel_extent;
+    const size_t lbase = (size_t)a->slot * c->n_ctx * kvd;
+    const f16_t *kc = c->kc + lbase + (size_t)kvh * hd, *vc = c->vc + lbase + (size_t)kvh * hd;
+    float *s = c->scores + (size_t)tid * c->n_ctx;
+    /* the bias by distance, up to the farthest position seen */
+    float *tab = c->ik.tab + (size_t)tid * ((m->rel_extent > m->swa_window ? m->rel_extent : m->swa_window) + 1);
+    const int nd = npos - j0 < extent ? npos - j0 : extent;
+    for (int d = 0; d < nd; d++) {
+        const float *b = a->L->ik_rel_bias + (size_t)d * R;
+        float acc = 0;
+        for (int i = 0; i < R; i++) acc += b[i] * r[i];
+        tab[d] = acc;
+    }
+    const float scale = 1.f / sqrtf((float)hd);
+    float mx = sink;
+    for (int j = j0; j < npos; j++) {
+        const int d = npos - 1 - j;
+        const float v = KS.dot_f16_f32(kc + (size_t)j * kvd, q, hd) * scale + (d < extent ? tab[d] : 0.f);
+        s[j - j0] = v;
+        if (v > mx) mx = v;
+    }
+    const float sum = KS.exp_sum(s, npos - j0, mx) + expf(sink - mx);
+    const float inv = 1.f / sum;
+    float acc[256];
+    memset(acc, 0, sizeof(float) * hd);
+    for (int j = j0; j < npos; j++) KS.axpy_f16(s[j - j0] * inv, vc + (size_t)j * kvd, acc, hd);
+    memcpy(c->tmp + (size_t)t * qd + (size_t)h * hd, acc, sizeof(float) * hd);
+}
+
+/* the MoE of physical layer ip over the n rows of c->h, into c->out */
+static void ik_moe(Context *c, const Layer *L, int ip, int n) {
+    const Model *m = c->m;
+    const int D = m->dim, nbd = D / QK_K, E = m->n_expert, K = m->n_expert_used, F = m->ff_exp;
+    const int FP = (F + QK_K - 1) / QK_K * QK_K, nbf = FP / QK_K;
+    double t0 = time_sec();
+    job_clear(c);
+    job_add_f(c, &L->router, c->h, D, n, c->rlog, E);
+    job_run(c, CAT_ROUTER);
+
+    int cnt[MAX_EXPERT] = {0}, off[MAX_EXPERT + 1], fill[MAX_EXPERT];
+    for (int t = 0; t < n; t++) {
+        const float *lg = c->rlog + (size_t)t * E;
+        float p[MAX_EXPERT], sc[MAX_EXPERT];
+        for (int e = 0; e < E; e++) {
+            p[e] = 1.f / (1.f + expf(-lg[e]));
+            sc[e] = p[e] + (L->exp_bias ? L->exp_bias[e] : 0.f);
+        }
+        int *sel = c->sel + (size_t)t * K;
+        float *w = c->selw + (size_t)t * K, wsum = 0;
+        top_k(sc, E, K, sel);
+        for (int k = 0; k < K; k++) {
+            w[k] = p[sel[k]];
+            wsum += w[k];
+            cnt[sel[k]]++;
+            if (ip < 64 && sel[k] < 64) c->stats.expert_hits[ip * 64 + sel[k]]++;
+            c->last_used[(size_t)ip * E + sel[k]] = c->tok_counter;
+        }
+        for (int k = 0; k < K; k++) w[k] = w[k] / (wsum + 1e-20f) * m->exp_scale;
+    }
+    off[0] = 0;
+    for (int e = 0; e < E; e++) off[e + 1] = off[e] + cnt[e];
+    memcpy(fill, off, sizeof(int) * E);
+    /* assignments grouped by expert: their token (a_tok), their expert (a_slot) */
+    quantize_rows(c->h, n, D, c->hq);
+    for (int t = 0; t < n; t++)
+        for (int k = 0; k < K; k++) {
+            const int e = c->sel[(size_t)t * K + k], a = fill[e]++;
+            c->a_tok[a] = t;
+            c->a_slot[a] = e;
+            c->tok_a[(size_t)t * K + k] = a;
+            memcpy(c->xg + (size_t)a * nbd, c->hq + (size_t)t * nbd, sizeof(block_q8_K) * nbd);
+        }
+    c->stats.t_moe_route += time_sec() - t0;
+
+    job_clear(c);
+    for (int e = 0; e < E; e++)
+        if (cnt[e])
+            job_add_q(c, &L->gate_exps, L->gate_exps.data + (size_t)e * L->gate_exps.expert_stride, c->xg + (size_t)off[e] * nbd,
+                      nbd, cnt[e], c->ik.gu + (size_t)off[e] * 2 * F, 2 * F);
+    job_run(c, CAT_EXP_GU);
+    const int na = off[E];
+    for (int a = 0; a < na; a++) {
+        const float s = L->ik_gu_scale ? L->ik_gu_scale[c->a_slot[a]] : 1.f;
+        const float *g = c->ik.gu + (size_t)a * 2 * F, *u = g + F;
+        float *o = c->ik.act + (size_t)a * FP;
+        for (int i = 0; i < F; i++) {
+            const float gi = g[i] * s, ui = u[i] * s;
+            o[i] = m->situ_beta * tanhf(gi / m->situ_beta) / (1.f + expf(-gi)) * (m->situ_lb > 0 ? m->situ_lb * tanhf(ui / m->situ_lb) : ui);
+        }
+        for (int i = F; i < FP; i++) o[i] = 0;
+    }
+    quantize_rows(c->ik.act, na, FP, c->ik.eq);
+    job_clear(c);
+    for (int e = 0; e < E; e++)
+        if (cnt[e])
+            job_add_q(c, &L->down_exps, L->down_exps.data + (size_t)e * L->down_exps.expert_stride, c->ik.eq + (size_t)off[e] * nbf,
+                      nbf, cnt[e], c->eo + (size_t)off[e] * D, D);
+    job_run(c, CAT_EXP_DOWN);
+    for (int t = 0; t < n; t++) {
+        float *o = c->out + (size_t)t * D;
+        memset(o, 0, sizeof(float) * D);
+        for (int k = 0; k < K; k++) {
+            const int a = c->tok_a[(size_t)t * K + k];
+            const float w = c->selw[(size_t)t * K + k] * (L->ik_down_scale ? L->ik_down_scale[c->a_slot[a]] : 1.f);
+            const float *eo = c->eo + (size_t)a * D;
+            for (int i = 0; i < D; i++) o[i] += w * eo[i];
+        }
+    }
+}
+
+/* one run of physical layer ip as cache slot `slot` over the n rows of c->x; msg: the pass's
+ * messages [4][n][dim] (NULL in the first pass and outside the core). The first layer of a
+ * depth block saves its input into buf and appends it to blk. */
+static void ik_layer(Context *c, int slot, int ip, int n, float **blk, int *nblk, float *buf, const float *msg,
+                     const IkLoop *lp) {
+    const Model *m = c->m;
+    const Layer *L = &m->layers[ip];
+    const int D = m->dim, nbd = D / QK_K, hd = m->head_dim, nh = m->n_head, nkv = m->n_kv_head;
+    const int kvd = nkv * hd, qd = nh * hd, R = m->n_rel, lc = m->l_cache, swa = L->is_swa;
+    const size_t BD = (size_t)n * D;
+    float *x = c->x, *in = c->ik.in;
+    if (c->pfq && n >= 8 && slot + 1 < m->n_slot) {
+        /* prompt batches touch nearly every expert: stream those of the next run */
+        const Layer *Ln = &m->layers[ik_phys(m, slot + 1)];
+        prefetcher_clear(c->pfq);
+        for (int e = 0; e < m->n_expert; e++) prefetch_expert(c, Ln, e);
+    }
+
+    /* the attention inputs in[3][n][dim] */
+    const int ninp = swa && !msg ? 1 : 3;
+    if (L->ik_attn_query) ik_mix(c, blk, *nblk, x, L->ik_attn_query, swa ? 1 : 3, n, in, D, BD);
+    else memcpy(in, x, sizeof(float) * BD);
+    for (int j = 1; j < ninp; j++)
+        if (swa || !L->ik_attn_query) memcpy(in + j * BD, in, sizeof(float) * BD);
+    if (msg)
+        for (int j = 0; j < 3; j++) ik_control(c, lp, j, in + j * BD, msg + j * BD, n);
+    for (int t = 0; t < n; t++)
+        for (int j = 0; j < ninp; j++) {
+            float *v = in + j * BD + (size_t)t * D;
+            rmsnorm(v, v, swa ? L->attn_norm : j == 0 ? L->ik_q_norm : j == 1 ? L->ik_k_norm : L->ik_v_norm, D, m->eps);
+        }
+    const float *qin = in, *kin = ninp > 1 ? in + BD : in, *vin = ninp > 1 ? in + 2 * BD : in;
+    block_q8_K *qq = c->ik.qin, *kq = ninp > 1 ? qq + (size_t)n * nbd : qq, *vq = ninp > 1 ? qq + (size_t)2 * n * nbd : qq;
+    for (int j = 0; j < ninp; j++) quantize_rows(in + j * BD, n, D, qq + (size_t)j * n * nbd);
+
+    job_clear(c);
+    job_add_q(c, &L->wq, NULL, qq, nbd, n, c->ik.q, qd);
+    job_add_q(c, &L->wk, NULL, kq, nbd, n, c->ik.k, kvd);
+    job_add_q(c, &L->wv, NULL, vq, nbd, n, c->ik.v, kvd);
+    job_add_q(c, &L->ik_rel, NULL, qq, nbd, n, c->ik.r, nh * R);
+    job_add_q(c, &L->ik_gate, NULL, qq, nbd, n, c->ik.g, qd);
+    job_add_f(c, &L->ik_sink, qin, D, n, c->ik.s, nh);
+    if (!swa) {
+        job_add_f(c, &L->ik_kdyn, kin, D, n, c->ik.kd, lc * nkv);
+        job_add_f(c, &L->ik_vdyn, vin, D, n, c->ik.vd, lc * nkv);
+    }
+    job_run(c, CAT_ATTN);
+
+    double t0 = time_sec();
+    ik_conv(c, slot, c->ik.k, kvd, 0, L->ik_k_conv, swa ? NULL : c->ik.kd, nkv, n);
+    ik_conv(c, slot, c->ik.v, kvd, kvd, L->ik_v_conv, swa ? NULL : c->ik.vd, nkv, n);
+    const size_t lbase = (size_t)slot * c->n_ctx * kvd;
+    for (int t = 0; t < n; t++) {
+        const int pos = c->pos + t;
+        const float tau = swa ? 1.f : 1.f + m->log_alpha * logf(fmaxf(1.f, (float)(pos + 1) / (float)m->log_floor));
+        float *q = c->ik.q + (size_t)t * qd, *k = c->ik.k + (size_t)t * kvd, *v = c->ik.v + (size_t)t * kvd;
+        float *r = c->ik.r + (size_t)t * nh * R;
+        for (int i = 0; i < qd; i++) q[i] *= L->ik_q_clip[i];
+        for (int i = 0; i < nh * R; i++) r[i] *= L->ik_rel_clip[i];
+        for (int h = 0; h < nh; h++) {
+            ik_clip(q + (size_t)h * hd, hd, m->qk_clip);
+            ik_clip(r + (size_t)h * R, R, m->rel_clip);
+            for (int i = 0; i < hd; i++) q[(size_t)h * hd + i] *= tau;
+            for (int i = 0; i < R; i++) r[(size_t)h * R + i] *= tau;
+        }
+        for (int h = 0; h < nkv; h++) {
+            ik_clip(k + (size_t)h * hd, hd, m->qk_clip);
+            double ss = 0;
+            float *vh = v + (size_t)h * hd;
+            for (int i = 0; i < hd; i++) ss += (double)vh[i] * vh[i];
+            const float s = (float)(1.0 / sqrt(ss / hd + m->eps));
+            for (int i = 0; i < hd; i++) vh[i] *= s;
+        }
+        KS.f32_to_f16_row(k, c->kc + lbase + (size_t)pos * kvd, kvd);
+        KS.f32_to_f16_row(v, c->vc + lbase + (size_t)pos * kvd, kvd);
+    }
+    IkAttnArgs aa = { c, L, slot, n, c->pos };
+    pool_run(c->pool, ik_attn_task, &aa, n * nh);
+    for (size_t i = 0; i < (size_t)n * qd; i++) c->tmp[i] /= 1.f + expf(-c->ik.g[i]);
+    c->stats.t_attn += time_sec() - t0;
+    quantize_rows(c->tmp, n, qd, c->tq);
+    job_clear(c);
+    job_add_q(c, &L->wo, NULL, c->tq, qd / QK_K, n, c->out, D);
+    job_run(c, CAT_ATTN);
+    ik_conv(c, slot, c->out, D, 2 * kvd, L->ik_o_conv, NULL, 1, n);
+
+    /* a block's first layer: its input joins the blocks, the attention output starts the stream */
+    if (ip % m->res_block == 0) {
+        memcpy(buf, x, sizeof(float) * BD);
+        blk[(*nblk)++] = buf;
+        memcpy(x, c->out, sizeof(float) * BD);
+    } else {
+        for (size_t i = 0; i < BD; i++) x[i] += c->out[i];
+    }
+
+    ik_mix(c, blk, *nblk, x, L->ik_ffn_query, 1, n, c->h, D, 0);
+    if (msg) ik_control(c, lp, 3, c->h, msg + 3 * BD, n);
+    for (int t = 0; t < n; t++) rmsnorm(c->h + (size_t)t * D, c->h + (size_t)t * D, L->ffn_norm, D, m->eps);
+    ik_moe(c, L, ip, n);
+    ik_conv(c, slot, c->out, D, 2 * kvd + D, L->ik_f_conv, NULL, 1, n);
+    for (size_t i = 0; i < BD; i++) x[i] += c->out[i];
+}
+
+/* every slot over the n token embeddings of c->x; c->x then holds the output's depth mix */
+static void ik_layers(Context *c, int n) {
+    const Model *m = c->m;
+    const int D = m->dim, s0 = m->loop_start, s1 = m->loop_end, rb = m->res_block;
+    const size_t BD = (size_t)n * D;
+    float *x = c->x, *blk[16];
+    int nblk = 0;
+    for (int t = 0; t < n; t++) rmsnorm(x + (size_t)t * D, x + (size_t)t * D, m->embd_norm, D, m->eps);
+    /* the buffer of the block starting at layer ip: two for the core blocks, by pass */
+#define BUF(ip, pass) c->ik.blk[2 * ((ip) / rb) + ((ip) >= s0 && (ip) < s1 ? (pass) & 1 : 0)]
+    for (int l = 0; l < s0; l++) ik_layer(c, l, l, n, blk, &nblk, BUF(l, 0), NULL, NULL);
+    memcpy(c->ik.pre, x, sizeof(float) * BD);
+    const int npre = nblk;
+    float *bank[16];
+    int nbank = 0;
+    for (int pass = 0; pass < m->n_pass; pass++) {
+        if (pass > 0) {
+            /* the previous pass's blocks after its first core block, and its output */
+            nbank = 0;
+            for (int b = npre + 1; b < nblk; b++) bank[nbank++] = blk[b];
+            memcpy(c->ik.bank_out, x, sizeof(float) * BD);
+            memcpy(x, c->ik.pre, sizeof(float) * BD);
+            nblk = npre;
+        }
+        for (int ip = s0; ip < s1; ip++) {
+            const int slot = pass == 0 ? ip : m->n_layer + (pass - 1) * (s1 - s0) + (ip - s0);
+            const IkLoop *lp = &m->ik_loop[ip - s0];
+            if (pass > 0) ik_mix(c, bank, nbank, c->ik.bank_out, lp->msg_query, 4, n, c->ik.msg, D, BD);
+            ik_layer(c, slot, ip, n, blk, &nblk, BUF(ip, pass), pass > 0 ? c->ik.msg : NULL, lp);
+        }
+    }
+    for (int l = s1; l < m->n_layer; l++) ik_layer(c, l, l, n, blk, &nblk, BUF(l, 0), NULL, NULL);
+#undef BUF
+    ik_mix(c, blk, nblk, x, m->out_query, 1, n, c->ik.mix, D, 0);
+    memcpy(x, c->ik.mix, sizeof(float) * BD);
+}
+
 /* ------------------------------------------------------------------ layers */
 
 /* every layer on the CPU over the n rows of c->x, at positions c->pos.. */
 static void run_layers(Context *c, int n) {
     const Model *m = c->m;
     const int D = m->dim;
+    if (m->ik) { ik_layers(c, n); return; }
     for (int l = 0; l < m->n_layer; l++) {
         const Layer *L = &m->layers[l];
         if (c->pfq && n >= 8 && l + 1 < m->n_layer && m->layers[l + 1].is_moe) {
@@ -1624,6 +2271,12 @@ static void run_layers(Context *c, int n) {
 }
 
 /* ------------------------------------------------------------------ forward */
+
+/* Inkling: logits = cap tanh(logits / cap) */
+static void softcap(const Model *m, float *l, size_t n) {
+    if (!(m->softcap > 0)) return;
+    for (size_t i = 0; i < n; i++) l[i] = m->softcap * tanhf(l[i] / m->softcap);
+}
 
 static void forward_chunk(Context *c, const int *tokens, int n, int want_logits, float *all_logits) {
     const Model *m = c->m;
@@ -1668,6 +2321,7 @@ static void forward_chunk(Context *c, const int *tokens, int n, int want_logits,
             job_add_q(c, &m->output, NULL, c->hq, D / QK_K, n, all_logits, m->n_vocab);
         }
         job_run(c, CAT_LOGITS);
+        softcap(m, all_logits, (size_t)n * m->n_vocab);
         memcpy(c->logits, all_logits + (size_t)(n - 1) * m->n_vocab, sizeof(float) * m->n_vocab);
     } else if (want_logits) {
         const float *xl = c->x + (size_t)(n - 1) * D;
@@ -1681,6 +2335,7 @@ static void forward_chunk(Context *c, const int *tokens, int n, int want_logits,
             job_add_q(c, &m->output, NULL, c->hq, D / QK_K, 1, c->logits, m->n_vocab);
         }
         job_run(c, CAT_LOGITS);
+        softcap(m, c->logits, (size_t)m->n_vocab);
     }
 }
 
