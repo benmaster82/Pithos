@@ -1787,6 +1787,36 @@ static void vk_moe(void *arg, int layer, const float *h, const float *lg, const 
 static void ik_moe(Context *c, const Layer *L, int ip, int n);
 static void softcap(const Model *m, float *l, size_t n);
 
+/* Inkling: the physical layer of the step-th slot run (prelude, the passes of the core, coda), -1 past the last */
+static int ik_phys_at(const Model *m, int step) {
+    const int core = m->loop_end - m->loop_start;
+    if (step >= m->n_slot) return -1;
+    return step < m->loop_start ? step : step < m->loop_start + m->n_pass * core ? m->loop_start + (step - m->loop_start) % core
+                                                                                : step - (m->n_pass - 1) * core;
+}
+
+/* Inkling, one token: read ahead the experts the router of the step-th slot run gives the current FFN
+ * input h (the next slot's input changes little), those neither in VRAM nor used lately, while this
+ * slot's experts and the next slot's attention run. The model is larger than the RAM of many
+ * machines: the less used experts come from the disk. */
+static void ik_readahead(Context *c, int step, const float *h) {
+    const Model *m = c->m;
+    const int D = m->dim, E = m->n_expert, nx = ik_phys_at(m, step);
+    if (!c->pfq || nx < 0) return;
+    const Layer *Ln = &m->layers[nx];
+    float sc[MAX_EXPERT];
+    int best[16];
+    for (int e = 0; e < E; e++)
+        sc[e] = 1.f / (1.f + expf(-KS.dot_f32((const float *)Ln->router.data + (size_t)e * D, h, D))) + (Ln->exp_bias ? Ln->exp_bias[e] : 0.f);
+    const int np = m->n_expert_used + 2 < 16 ? m->n_expert_used + 2 : 16;
+    top_k(sc, E, np, best);
+    prefetcher_clear(c->pfq);
+    for (int k = 0; k < np; k++) {
+        const uint32_t lu = c->last_used[(size_t)nx * E + best[k]];
+        if (!(c->vk_exp && vk_expert_resident(c->vk, nx, best[k])) && (!lu || c->tok_counter - lu > 48)) prefetch_expert(c, Ln, best[k]);
+    }
+}
+
 /* Inkling on the Vulkan GPU: the routed experts of physical layer `layer` over the rows h, from
  * the GPU's router logits lg [n][n_expert]; their sum into y */
 static void vk_moe_ik(void *arg, int layer, const float *h, const float *lg, const float *pred, int n, float *y, float *s) {
@@ -1794,27 +1824,10 @@ static void vk_moe_ik(void *arg, int layer, const float *h, const float *lg, con
     (void)s;
     Context *c = (Context *)arg;
     const Model *m = c->m;
-    const int D = m->dim, E = m->n_expert, core = m->loop_end - m->loop_start, step = ++c->ik_step;
+    const int D = m->dim, E = m->n_expert, step = ++c->ik_step;
     memcpy(c->h, h, sizeof(float) * (size_t)n * D);
     memcpy(c->rlog, lg, sizeof(float) * (size_t)n * E);
-    if (c->pfq && n == 1 && step < m->n_slot) {
-        /* read ahead the experts the next slot's router gives this h (its input changes little), those
-         * neither in VRAM nor used lately, while this slot's experts and the next slot's attention run */
-        const int nx = step < m->loop_start ? step : step < m->loop_start + m->n_pass * core ? m->loop_start + (step - m->loop_start) % core
-                     : step - (m->n_pass - 1) * core;
-        const Layer *Ln = &m->layers[nx];
-        float sc[MAX_EXPERT];
-        int best[16];
-        for (int e = 0; e < E; e++)
-            sc[e] = 1.f / (1.f + expf(-KS.dot_f32((const float *)Ln->router.data + (size_t)e * D, h, D))) + (Ln->exp_bias ? Ln->exp_bias[e] : 0.f);
-        const int np = m->n_expert_used + 2 < 16 ? m->n_expert_used + 2 : 16;
-        top_k(sc, E, np, best);
-        prefetcher_clear(c->pfq);
-        for (int k = 0; k < np; k++) {
-            const uint32_t lu = c->last_used[(size_t)nx * E + best[k]];
-            if (!vk_expert_resident(c->vk, nx, best[k]) && (!lu || c->tok_counter - lu > 48)) prefetch_expert(c, Ln, best[k]);
-        }
-    }
+    if (n == 1) ik_readahead(c, step, h);
     c->rlog_ready = 1;
     ik_moe(c, &m->layers[layer], layer, n);
     c->rlog_ready = 0;
@@ -2318,6 +2331,12 @@ static void ik_layer(Context *c, int slot, int ip, int n, float **blk, int *nblk
     ik_mix(c, blk, *nblk, x, L->ik_ffn_query, 1, n, c->h, D, 0);
     if (msg) ik_control(c, lp, 3, c->h, msg + 3 * BD, n);
     for (int t = 0; t < n; t++) rmsnorm(c->h + (size_t)t * D, c->h + (size_t)t * D, L->ffn_norm, D, m->eps);
+    if (n == 1) {   /* the step of this slot's run, then the next one's experts */
+        const int core = m->loop_end - m->loop_start;
+        const int step = slot < m->loop_start ? slot : slot < m->loop_end ? slot : slot < m->n_layer ? slot + (m->n_pass - 1) * core
+                       : m->loop_start + (1 + (slot - m->n_layer) / core) * core + (slot - m->n_layer) % core;
+        ik_readahead(c, step + 1, c->h);
+    }
     ik_moe(c, L, ip, n);
     ik_conv(c, slot, c->out, D, 2 * kvd + D, L->ik_f_conv, NULL, 1, n);
     for (size_t i = 0; i < BD; i++) x[i] += c->out[i];
