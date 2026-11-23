@@ -24,13 +24,15 @@ struct Tokenizer {
     int *special; int n_special;            /* control/user tokens, longest first */
     int bos, eos;
     int qwen;                               /* tokenizer.ggml.pre "qwen35": its regex, merges always applied */
+    int o200k;                              /* "inkling2": the GPT-4o regex (words split by case) */
 };
 
 /* ------------------------------------------------------------------ unicode helpers */
 
 static int uni_flags(uint32_t c) {
     if (c < 128) {
-        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return UNI_LETTER;
+        if (c >= 'a' && c <= 'z') return UNI_LETTER | UNI_LOWER;
+        if (c >= 'A' && c <= 'Z') return UNI_LETTER | UNI_UPPER;
         if (c >= '0' && c <= '9') return UNI_NUMBER;
         if (c == ' ' || (c >= 9 && c <= 13)) return UNI_SPACE;
         return 0;
@@ -240,6 +242,7 @@ Tokenizer *tok_load(const GGUF *g, char *err, int errlen) {
     uint64_t pl = 0;
     const char *pre = gguf_get_str(g, "tokenizer.ggml.pre", &pl);
     t->qwen = pre && pl == 6 && !memcmp(pre, "qwen35", 6);
+    t->o200k = pre && pl == 8 && !memcmp(pre, "inkling2", 8);
     return t;
 }
 
@@ -298,7 +301,11 @@ static int bpe_word(const Tokenizer *t, const unsigned char *s, int n, int *out,
  * (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|
  *  ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
  * qwen35: the same with [\p{L}\p{M}]+ for the letters, single digits \p{N} and the marks out of
- * the punctuation runs,  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]* */
+ * the punctuation runs,  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+ * inkling2 (GPT-4o): words split by case, contractions part of the word, no lone contraction:
+ * [^\r\n\p{L}\p{N}]?U*L+C?|[^\r\n\p{L}\p{N}]?U+L*C?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|
+ * \s*[\r\n]+|\s+(?!\S)|\s+   with U = [\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}], L = [\p{Ll}\p{Lm}\p{Lo}\p{M}],
+ * C = (?i:'s|'t|'re|'ve|'m|'ll|'d) */
 static int encode_plain(const Tokenizer *t, const unsigned char *s, int n, int *out, int max_out, int count) {
     if (n <= 0) return count;
     const int letter = t->qwen ? UNI_LETTER | UNI_MARK : UNI_LETTER, max_digits = t->qwen ? 1 : 3;
@@ -321,11 +328,44 @@ static int encode_plain(const Tokenizer *t, const unsigned char *s, int n, int *
     off[nc] = n;
 #define CP(k) ((k) < nc ? cp[k] : 0xFFFFFFFFu)
 #define FL(k) ((k) < nc ? fl[k] : 0)
+#define UP(k) ((FL(k) & (UNI_LETTER | UNI_MARK)) && !(FL(k) & UNI_LOWER))
+#define LO(k) ((FL(k) & (UNI_LETTER | UNI_MARK)) && !(FL(k) & UNI_UPPER))
     int pos = 0;
     while (pos < nc) {
         int start = pos;
         uint32_t c = cp[pos];
         int f = fl[pos];
+        if (t->o200k) {
+            /* the two word alternatives, each with the optional leading character first */
+            const int lead = !(c == '\r' || c == '\n' || (f & (UNI_LETTER | UNI_NUMBER)));
+            int e = -1;
+            for (int alt = 0; alt < 2 && e < 0; alt++)
+                for (int pre = lead; pre >= 0 && e < 0; pre--) {
+                    const int w = pos + pre;
+                    int a = w;
+                    while (UP(a)) a++;
+                    if (alt == 0) {
+                        /* U* gives back characters until L+ can start (Lm, Lo and M are both) */
+                        for (int b = a; b >= w && e < 0; b--)
+                            if (LO(b)) { e = b; while (LO(e)) e++; }
+                    } else if (a > w) {
+                        e = a;
+                        while (LO(e)) e++;
+                    }
+                }
+            if (e >= 0) {
+                pos = e;
+                if (CP(pos) == '\'') {
+                    uint32_t c1 = CP(pos + 1), c2 = CP(pos + 2);
+                    if (c1 < 128 && c1 >= 'A' && c1 <= 'Z') c1 += 32;
+                    if (c2 < 128 && c2 >= 'A' && c2 <= 'Z') c2 += 32;
+                    if (c1 == 's' || c1 == 't' || c1 == 'm' || c1 == 'd') pos += 2;
+                    else if ((c1 == 'r' && c2 == 'e') || (c1 == 'v' && c2 == 'e') || (c1 == 'l' && c2 == 'l')) pos += 3;
+                }
+                goto emit;
+            }
+            goto numbers;
+        }
         /* contractions */
         if (c == '\'' && pos + 1 < nc) {
             uint32_t c1 = CP(pos + 1);
@@ -345,19 +385,20 @@ static int encode_plain(const Tokenizer *t, const unsigned char *s, int n, int *
                 goto emit;
             }
         }
+    numbers:
         /* \p{N}{1,3} (qwen35: \p{N}) */
         if (f & UNI_NUMBER) {
             int k = 0;
             while (k < max_digits && (FL(pos) & UNI_NUMBER)) { pos++; k++; }
             goto emit;
         }
-        /*  ?[^\s\p{L}\p{N}]+[\r\n]* */
+        /*  ?[^\s\p{L}\p{N}]+[\r\n]* (inkling2: [\r\n/]*) */
         {
             int p2 = (c == ' ') ? pos + 1 : pos;
             if (p2 < nc && !(FL(p2) & not_punct)) {
                 pos = p2;
                 while (pos < nc && !(FL(pos) & not_punct)) pos++;
-                while (CP(pos) == '\r' || CP(pos) == '\n') pos++;
+                while (CP(pos) == '\r' || CP(pos) == '\n' || (t->o200k && CP(pos) == '/')) pos++;
                 goto emit;
             }
         }
@@ -379,6 +420,8 @@ static int encode_plain(const Tokenizer *t, const unsigned char *s, int n, int *
     }
 #undef CP
 #undef FL
+#undef UP
+#undef LO
     free(cp);
     free(off);
     free(fl);

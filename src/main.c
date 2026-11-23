@@ -553,6 +553,7 @@ typedef struct {
     Sampler smp;
     Args *a;
     int tok_im_end, tok_eot, tok_think_end, tok_think_start;
+    int ik, tok_ik_think, tok_ik_text;  /* Inkling 2: its reasoning and text blocks */
     float *audio_emb;           /* [n_audio][dim] embeddings of --audio, fed in place of <|audio|> */
     int n_audio, tok_audio, audio_pending;
     double t_prompt, t_gen;
@@ -610,7 +611,19 @@ static char *generate(Engine *e, int in_think, int *last) {
         const char *piece = tok_piece(e->tk, tok, &pl);
         str_add(&out, piece, pl);
         if (e->a->ids) printf("[%d]", tok);
-        if (tok == e->tok_think_start && n == 0 && !thinking) {
+        if (e->ik && tok_is_control(e->tk, tok)) {
+            /* Inkling: a reasoning block, then the text block of the answer */
+            if (tok == e->tok_ik_think && !thinking) {
+                thinking = 1;
+                color("\x1b[90m");
+                if (!e->a->show_think) { out_str("[thinking..."); color("\x1b[0m"); }
+            } else if (tok == e->tok_ik_text && thinking) {
+                thinking = 0;
+                skip_ws = 1;
+                if (e->a->show_think) { color("\x1b[0m"); out_str("\n\n"); }
+                else { color("\x1b[90m"); out_str(" done]\n\n"); color("\x1b[0m"); }
+            }
+        } else if (tok == e->tok_think_start && n == 0 && !thinking) {
             /* the model opens its reasoning itself (after audio, whose template does not): as if prefilled */
             thinking = 1;
             color("[90m");
@@ -640,7 +653,7 @@ static char *generate(Engine *e, int in_think, int *last) {
         }
         logits = ctx_forward(e->ctx, &tok, 1);
         if (!logits) break;
-        if (thinking && !forced && e->a->think_budget > 0 && ++n_think >= e->a->think_budget)
+        if (!e->ik && thinking && !forced && e->a->think_budget > 0 && ++n_think >= e->a->think_budget)
             forced = encode(e->tk, think_close(), &nforced);
     }
     free(forced);
@@ -714,8 +727,42 @@ static char *trim_dup(const char *s) {
     return r;
 }
 
+/* One chat turn of Inkling 2: its blocks, no generation prompt (the model opens its blocks), the
+ * reasoning setting as the thinking effort level. The answer stays in the context as written
+ * (the template keeps the reasoning it is given back), closed by <|content_model_end_sampling|>. */
+static int chat_turn_inkling(Engine *e, const char *user, int first) {
+    const int lost0 = ctx_lost(e->ctx);
+    Str p = { 0 };
+    if (first && e->a->system && *e->a->system) {
+        str_add(&p, "<|message_system|><|content_text|>", -1);
+        str_add(&p, e->a->system, -1);
+        str_add(&p, "<|end_message|>", -1);
+    }
+    if (first) {
+        str_add(&p, "<|message_system|><|content_text|>Thinking effort level: ", -1);
+        str_add(&p, ik_effort(e->a->think_budget), -1);
+        str_add(&p, "<|end_message|>", -1);
+    }
+    str_add(&p, "<|message_user|><|content_text|>", -1);
+    str_add(&p, user, -1);
+    str_add(&p, "<|end_message|>", -1);
+    double tp0 = e->t_prompt, tg0 = e->t_gen;
+    int np0 = e->n_prompt, ng0 = e->n_gen;
+    const int ok0 = feed_text(e, p.s);
+    free(p.s);
+    if (!ok0) return 0;
+    int last;
+    char *gen = generate(e, 0, &last);
+    free(gen);
+    if (ctx_lost(e->ctx) != lost0) return 0;
+    print_stats(e, e->t_prompt - tp0, e->n_prompt - np0, e->t_gen - tg0, e->n_gen - ng0);
+    const int eos = tok_eos(e->tk);
+    return feed(e, &eos, 1);
+}
+
 /* One chat turn. Returns 0 if the context overflowed or was lost with a failing GPU (ctx_lost). */
 static int chat_turn(Engine *e, const char *user, int first) {
+    if (e->ik) return chat_turn_inkling(e, user, first);
     const int lost0 = ctx_lost(e->ctx);
     Str p = { 0 };
     const int fam = chat_family(e->m);
@@ -1002,6 +1049,14 @@ static int real_main(int argc, char **argv) {
         if (!(a.sp_set & SP_REPEAT)) a.sp.repeat_penalty = 1.0f;
         if (!(a.sp_set & SP_PRESENCE)) a.sp.presence_penalty = 1.5f;
     }
+    if (chat_family(&m) == CHAT_INKLING) {
+        /* Inkling 2's model card: temperature 1.0 and no truncation */
+        if (!(a.sp_set & SP_TEMP)) a.sp.temp = 1.0f;
+        if (!(a.sp_set & SP_TOP_K)) a.sp.top_k = 0;
+        if (!(a.sp_set & SP_TOP_P)) a.sp.top_p = 1.0f;
+        if (!(a.sp_set & SP_MIN_P)) a.sp.min_p = 0.0f;
+        if (!(a.sp_set & SP_REPEAT)) a.sp.repeat_penalty = 1.0f;
+    }
     Tokenizer *tk = tok_load(&m.gguf, err, sizeof(err));
     if (!tk) { fprintf(stderr, "error: %s\n", err); return 1; }
     char moe[64] = "", swa[48] = "", rec[32];
@@ -1104,6 +1159,9 @@ static int real_main(int argc, char **argv) {
     e.tok_eot = tok_find(tk, "<|endoftext|>");
     e.tok_think_end = tok_find(tk, "</think>");
     e.tok_think_start = tok_find(tk, "<think>");
+    e.ik = chat_family(&m) == CHAT_INKLING;
+    e.tok_ik_think = tok_find(tk, "<|content_thinking|>");
+    e.tok_ik_text = tok_find(tk, "<|content_text|>");
     sampler_init(&e.smp, &a.sp, m.n_vocab);
     {
         int sp[4];

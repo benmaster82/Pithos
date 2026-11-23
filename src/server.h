@@ -37,8 +37,11 @@ enum { THINK_FULL = -1, THINK_OFF = 0 };
 int think_parse(const char *s, int *budget);
 /* The text that closes the reasoning when the budget runs out. */
 const char *think_close(void);
-/* The chat template family of a model: LFM2 / LFM2.5, LFM3 (XML tool calls), Qwen3.5 / 3.6. */
-enum { CHAT_LFM2, CHAT_LFM3, CHAT_QWEN };
+/* The chat template family of a model: LFM2 / LFM2.5, LFM3 (XML tool calls), Qwen3.5 / 3.6,
+ * Inkling 2 (blocks closed by <|end_message|>, JSON tool calls, a thinking effort level). */
+enum { CHAT_LFM2, CHAT_LFM3, CHAT_QWEN, CHAT_INKLING };
+/* Inkling's "Thinking effort level" for a reasoning setting (THINK_OFF / THINK_FULL / tokens): "0", "0.2", "0.7", "0.9" */
+const char *ik_effort(int budget);
 int chat_family(const Model *m);
 /* The assistant turn opening with the reasoning off / on, for a chat_family. */
 const char *think_off_prompt(int family);

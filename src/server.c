@@ -68,6 +68,8 @@ typedef struct {
     int qwen;                   /* Qwen3.5 / 3.6 template (render_chat_qwen), XML tool calls as LFM3 */
     int reasons;                /* template_reasons: 0 for LFM3-Audio (no reasoning blocks) */
     int t_audio, t_think_start, t_audio_out, t_text_end, t_mixed_start, t_audio_start;
+    /* Inkling 2: its blocks' header, content kinds and end (render_chat_inkling, on_token) */
+    int ik, t_ik_head, t_ik_think, t_ik_text, t_ik_tool, t_ik_end;
     /* Audio of the request being rendered, under the lock (audio_begin / audio_end): render_content
      * turns input_audio parts into clips and toks_text each <|audio|> into the clip's token ids
      * -1, -2... (ctx_set_embeds); prompts with them are not reused (the ids repeat). Only the thread
@@ -85,6 +87,7 @@ typedef struct {
 static Server S;
 static PITHOS_THREAD_LOCAL int t_collect;   /* this thread renders an audio request (audio_begin) */
 static PITHOS_THREAD_LOCAL int t_voice;     /* this thread renders a request answered in speech (handle_chat) */
+static PITHOS_THREAD_LOCAL const char *t_effort;   /* Inkling: the thinking effort level of the request being rendered */
 
 /* ------------------------------------------------------------------ connection */
 
@@ -902,11 +905,218 @@ static int render_chat_qwen(const Json *messages, const Json *tools, int preserv
     return ok;
 }
 
+/* ------------------------------------------------------------------ chat template (Inkling 2) */
+
+/* JSON with the separators "," and ":" (tojson(separators=(",", ":"))), keys sorted if sort
+ * (sort_keys=true: by code point, the byte order of UTF-8) */
+static void json_write_compact(Buf *b, const Json *j, int sort) {
+    if (j->t != J_ARR && j->t != J_OBJ) { json_write(b, j); return; }
+    const Json *stack[64], **kids = j->n <= 64 ? stack : (const Json **)malloc(sizeof(Json *) * (size_t)j->n);
+    int n = 0;
+    for (const Json *c = j->child; c; c = c->next) kids[n++] = c;
+    if (sort && j->t == J_OBJ)
+        for (int i = 1; i < n; i++)
+            for (int k = i; k > 0 && strcmp(kids[k - 1]->key, kids[k]->key) > 0; k--) {
+                const Json *t = kids[k]; kids[k] = kids[k - 1]; kids[k - 1] = t;
+            }
+    buf_add(b, j->t == J_ARR ? "[" : "{", 1);
+    for (int i = 0; i < n; i++) {
+        if (i) buf_add(b, ",", 1);
+        if (j->t == J_OBJ) { buf_json_str(b, kids[i]->key, -1); buf_add(b, ":", 1); }
+        json_write_compact(b, kids[i], sort);
+    }
+    buf_add(b, j->t == J_ARR ? "]" : "}", 1);
+    if (kids != stack) free((void *)kids);
+}
+
+const char *ik_effort(int budget) {
+    return budget == THINK_OFF ? "0" : budget > 0 && budget <= 512 ? "0.2" : budget > 0 && budget <= 2048 ? "0.7" : "0.9";
+}
+
+/* The request's effort level: "reasoning_effort" by the template's names (or a number), else
+ * from the reasoning setting */
+static const char *ik_effort_req(const Json *body, int budget, char *buf, int len) {
+    static const char *names[][2] = { {"none", "0"}, {"minimal", "0.1"}, {"low", "0.2"}, {"medium", "0.7"},
+                                      {"high", "0.9"}, {"xhigh", "0.99"}, {"max", "0.99"} };
+    const Json *e = json_get(body, "reasoning_effort");
+    if (!e) e = json_get(json_get(body, "reasoning"), "effort");
+    if (e && e->t == J_NUM && e->num >= 0 && e->num <= 0.99) {
+        if (e->num == 0) return "0";
+        snprintf(buf, (size_t)len, "%g", e->num);
+        return buf;
+    }
+    for (size_t i = 0; e && e->t == J_STR && i < sizeof(names) / sizeof(names[0]); i++)
+        if (!strcmp(e->s, names[i][0])) return names[i][1];
+    return ik_effort(budget);
+}
+
+/* The tool calls of an assistant message, as the template writes them */
+static int ik_tool_calls(Buf *b, const Json *calls, char *err, int errlen) {
+    for (const Json *tc = calls && calls->t == J_ARR ? calls->child : NULL; tc; tc = tc->next) {
+        const Json *fn = json_get(tc, "function");
+        if (!fn) fn = tc;
+        const char *name = json_str(json_get(fn, "name"), NULL);
+        if (!name) { snprintf(err, (size_t)errlen, "tool call function name must be a string"); return 0; }
+        const Json *args = json_get(fn, "arguments");
+        Json *parsed = NULL;
+        if (args && args->t == J_STR) {   /* OpenAI clients send arguments as a JSON-encoded string */
+            parsed = args->len ? json_parse(args->s, args->len, err, errlen) : NULL;
+            if (args->len && !parsed) { snprintf(err, (size_t)errlen, "tool call arguments are not valid JSON"); return 0; }
+            args = parsed;
+        }
+        if (args && args->t != J_OBJ && args->t != J_NULL) {
+            json_free(parsed);
+            snprintf(err, (size_t)errlen, "tool call arguments must be an object");
+            return 0;
+        }
+        buf_add(b, "<|message_model|>", -1);
+        buf_add(b, name, -1);
+        buf_add(b, "<|content_invoke_tool_json|>{\"name\":", -1);
+        buf_json_str(b, name, -1);
+        buf_add(b, ",\"args\":{", -1);
+        /* the arguments by key (dictsort), each value as compact JSON in its own key order */
+        const Json *kids[256];
+        int n = 0;
+        for (const Json *a = args && args->t == J_OBJ ? args->child : NULL; a && n < 256; a = a->next) kids[n++] = a;
+        for (int i = 1; i < n; i++)
+            for (int k = i; k > 0 && strcmp(kids[k - 1]->key, kids[k]->key) > 0; k--) {
+                const Json *t = kids[k]; kids[k] = kids[k - 1]; kids[k - 1] = t;
+            }
+        for (int i = 0; i < n; i++) {
+            if (i) buf_add(b, ",", 1);
+            buf_json_str(b, kids[i]->key, -1);
+            buf_add(b, ":", 1);
+            json_write_compact(b, kids[i], 0);
+        }
+        buf_add(b, "}}<|end_message|>", -1);
+        json_free(parsed);
+    }
+    return 1;
+}
+
+/* One message as Inkling's template renders it: a block per content part, the reasoning first,
+ * the tool calls last, an assistant turn closed by <|content_model_end_sampling|>. all: the
+ * conversation (a tool result's header names the tool of its tool_call_id). */
+static int render_message_inkling(Buf *b, const Json *m, const Json *all, char *err, int errlen) {
+    const char *role = json_str(json_get(m, "role"), "");
+    const int asst = !strcmp(role, "assistant");
+    Buf head = { 0 };
+    buf_add(&head, asst ? "<|message_model|>" : !strcmp(role, "user") ? "<|message_user|>" : !strcmp(role, "system") ? "<|message_system|>"
+                   : "<|message_tool|>", -1);
+    const char *name = json_str(json_get(m, "name"), NULL);
+    if (!strcmp(role, "tool") && !(name && *name)) {
+        const char *id = json_str(json_get(m, "tool_call_id"), NULL);
+        for (const Json *p = all->child; p && id; p = p->next) {
+            if (strcmp(json_str(json_get(p, "role"), ""), "assistant")) continue;
+            const Json *calls = json_get(p, "tool_calls");
+            for (const Json *tc = calls && calls->t == J_ARR ? calls->child : NULL; tc; tc = tc->next)
+                if (!strcmp(json_str(json_get(tc, "id"), ""), id)) name = json_str(json_get(json_get(tc, "function"), "name"), name);
+        }
+    }
+    if ((asst || !strcmp(role, "tool")) && name && *name) buf_add(&head, name, -1);
+    const Json *th = json_get(m, "reasoning_content");
+    if (!th || th->t != J_STR) th = json_get(m, "reasoning");
+    const Json *content = json_get(m, "content"), *calls = json_get(m, "tool_calls");
+    const int has_th = asst && th && th->t == J_STR && th->len > 0;
+    if (has_th) {
+        buf_add(b, head.s, head.n);
+        buf_add(b, "<|content_thinking|>", -1);
+        buf_add(b, th->s, th->len);
+        buf_add(b, "<|end_message|>", -1);
+    }
+    int ok = 1;
+    if (content && content->t == J_STR) {
+        if (content->len || !(asst && (truthy(calls) || has_th))) {
+            buf_add(b, head.s, head.n);
+            buf_add(b, "<|content_text|>", -1);
+            buf_add(b, content->s, content->len);
+            buf_add(b, "<|end_message|>", -1);
+        }
+    } else if (content && content->t == J_ARR) {
+        for (const Json *it = content->child; it && ok; it = it->next) {
+            const char *type = it->t == J_OBJ ? json_str(json_get(it, "type"), NULL) : NULL;
+            if (it->t != J_STR && type && strcmp(type, "text") && strcmp(type, "input_text")) {
+                snprintf(err, (size_t)errlen, "%s content is not supported for this model in Pithos", type);
+                ok = 0;
+                break;
+            }
+            buf_add(b, head.s, head.n);
+            buf_add(b, "<|content_text|>", -1);
+            if (it->t == J_STR) buf_add(b, it->s, it->len);
+            else buf_add(b, json_str(json_get(it, "text"), ""), -1);
+            buf_add(b, "<|end_message|>", -1);
+        }
+    }
+    if (ok && asst && truthy(calls)) ok = ik_tool_calls(b, calls, err, errlen);
+    if (asst) buf_add(b, "<|content_model_end_sampling|>", -1);
+    buf_free(&head);
+    return ok;
+}
+
+/* render_chat for Inkling's template: no BOS and no generation prompt (the model opens its first
+ * block itself); the tools declared in a system block; the thinking effort as a system message
+ * before the first message that is not a system one. */
+static int render_chat_inkling(const Json *messages, const Json *tools, Toks *out, int **bounds, int *nbounds, Buf *text,
+                               char *err, int errlen) {
+    int nb = 0, cap = messages->n + 2, ok = 1, effort = 0;
+    *bounds = (int *)malloc(sizeof(int) * (size_t)cap);
+    Buf seg = { 0 };
+    if (tools && tools->t == J_ARR && tools->n > 0) {
+        buf_add(&seg, "<|message_system|>tool_declare<|content_xml|>[", -1);
+        for (const Json *t = tools->child; t; t = t->next) {
+            const Json *fn = json_get(t, "function");
+            if (!fn) fn = t;
+            const Json *desc = json_get(fn, "description"), *params = json_get(fn, "parameters");
+            const char *type = json_str(json_get(t, "type"), "function");
+            if (t != tools->child) buf_add(&seg, ",", 1);
+            buf_add(&seg, "{\"description\":", -1);
+            buf_json_str(&seg, desc && desc->t == J_STR ? desc->s : "", desc && desc->t == J_STR ? desc->len : 0);
+            buf_add(&seg, ",\"name\":", -1);
+            buf_json_str(&seg, json_str(json_get(fn, "name"), ""), -1);
+            buf_add(&seg, ",\"parameters\":", -1);
+            if (truthy(params)) json_write_compact(&seg, params, 1);
+            else buf_add(&seg, "{}", 2);
+            buf_add(&seg, ",\"type\":", -1);
+            buf_json_str(&seg, *type ? type : "function", -1);
+            buf_add(&seg, "}", 1);
+        }
+        buf_add(&seg, "]<|end_message|>", -1);
+        push_segment(out, text, &seg, bounds, &nb, &cap);
+    }
+    int idx = 0;
+    for (const Json *m = messages->child; m && ok; m = m->next, idx++) {
+        const char *role = json_str(json_get(m, "role"), NULL);
+        if (!role || (strcmp(role, "user") && strcmp(role, "assistant") && strcmp(role, "system") && strcmp(role, "tool"))) {
+            snprintf(err, (size_t)errlen, "message %d: unknown role %s", idx, role ? role : "(none)");
+            ok = 0;
+            break;
+        }
+        seg.n = 0;
+        if (!effort && strcmp(role, "system")) {
+            buf_printf(&seg, "<|message_system|><|content_text|>Thinking effort level: %s<|end_message|>", t_effort ? t_effort : "0.9");
+            effort = 1;
+        }
+        ok = render_message_inkling(&seg, m, messages, err, errlen);
+        if (ok) push_segment(out, text, &seg, bounds, &nb, &cap);
+    }
+    seg.n = 0;
+    if (!effort) {
+        buf_printf(&seg, "<|message_system|><|content_text|>Thinking effort level: %s<|end_message|>", t_effort ? t_effort : "0.9");
+        push_segment(out, text, &seg, bounds, &nb, &cap);
+        seg.n = 0;
+    }
+    push_segment(out, text, &seg, bounds, &nb, &cap);   /* the last bound: where the answer starts */
+    *nbounds = nb;
+    buf_free(&seg);
+    return ok;
+}
+
 /* Renders the conversation into tokens; bounds[] receives the token position where each
  * message starts (the last one is the start of the generation prompt). */
 static int render_chat(const Json *messages, const Json *tools, int preserve_thinking, int think, Toks *out,
                        int **bounds, int *nbounds, Buf *text, char *err, int errlen) {
     if (S.qwen) return render_chat_qwen(messages, tools, preserve_thinking, think, out, bounds, nbounds, text, err, errlen);
+    if (S.ik) return render_chat_inkling(messages, tools, out, bounds, nbounds, text, err, errlen);
     const Json *msg = messages->child;
     Buf sys = { 0 }, seg = { 0 };
     int nb = 0, cap = messages->n + 2;
@@ -1274,6 +1484,33 @@ static int parse_tool_call_xml(const char *s, int n, const Json *tools, Buf *out
     return 1;
 }
 
+/* Inkling: {"name":"f","args":{...}} (the text between <|content_invoke_tool_json|> and
+ * <|end_message|>) -> one OpenAI tool_calls element appended to `out`; name: the block header's */
+static int parse_tool_call_inkling(const char *s, int n, const char *name, Buf *out, int *count) {
+    char err[64];
+    Json *j = json_parse(s, n, err, sizeof(err));
+    const Json *args = json_get(j, "args");
+    const char *fn = json_str(json_get(j, "name"), name);
+    if (!j || !fn || !*fn || (args && args->t != J_OBJ)) { json_free(j); return 0; }
+    Buf a = { 0 };
+    if (args) json_write(&a, args);
+    else buf_add(&a, "{}", 2);
+    char id[32];
+    memcpy(id, "call_", 5);
+    random_id(id + 5, 24);
+    const int k = *count;
+    if (k) buf_add(out, ",", 1);
+    buf_printf(out, "{\"index\":%d,\"id\":\"%s\",\"type\":\"function\",\"function\":{\"name\":", k, id);
+    buf_json_str(out, fn, -1);
+    buf_add(out, ",\"arguments\":", -1);
+    buf_json_str(out, a.s, a.n);
+    buf_add(out, "}}", 2);
+    buf_free(&a);
+    json_free(j);
+    *count = k + 1;
+    return 1;
+}
+
 /* ------------------------------------------------------------------ generation */
 
 int think_parse(const char *s, int *budget) {
@@ -1291,16 +1528,17 @@ int think_parse(const char *s, int *budget) {
  * inside the block avoids most of that (measured: 13 of 30 GSM8K answers reasoned, then 3).
  * LFM2.5 has no switch in its template; the plain empty block works best for it. Qwen: its template's. */
 const char *think_off_prompt(int family) {
-    return family == CHAT_QWEN ? "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    return family == CHAT_INKLING ? "" : family == CHAT_QWEN ? "<|im_start|>assistant\n<think>\n\n</think>\n\n"
            : family == CHAT_LFM3 ? "<|im_start|>assistant\n<think>\n</think>\n" : "<|im_start|>assistant\n<think></think>";
 }
 
 const char *think_on_prompt(int family) {
-    return family == CHAT_QWEN ? "<|im_start|>assistant\n<think>\n" : "<|im_start|>assistant\n<think>";
+    return family == CHAT_INKLING ? "" : family == CHAT_QWEN ? "<|im_start|>assistant\n<think>\n" : "<|im_start|>assistant\n<think>";
 }
 
 int chat_family(const Model *m) {
-    return !strcmp(m->arch, "qwen35moe") ? CHAT_QWEN : !strcmp(m->arch, "lfm3") ? CHAT_LFM3 : CHAT_LFM2;
+    return !strcmp(m->arch, "qwen35moe") ? CHAT_QWEN : !strcmp(m->arch, "lfm3") ? CHAT_LFM3
+           : !strcmp(m->arch, "inkling2_loop") ? CHAT_INKLING : CHAT_LFM2;
 }
 
 int template_reasons(const Model *m) {
@@ -1317,7 +1555,7 @@ const char *think_close(void) {
            "</think>\n\n";
 }
 
-enum { ST_THINK, ST_CONTENT, ST_TOOL };
+enum { ST_THINK, ST_CONTENT, ST_TOOL, ST_HEAD };   /* ST_HEAD: Inkling, after a block header (a tool's name) */
 enum { FIN_NONE, FIN_STOP, FIN_LENGTH, FIN_TOOLS, FIN_ABORT };
 
 typedef struct {
@@ -1337,6 +1575,7 @@ typedef struct {
     int think_budget, n_think;  /* THINK_FULL / THINK_OFF / tokens; reasoning tokens so far */
     double t_prompt, t_gen;
     const Json *tools;          /* the request's tools: the types of their parameters (XML calls) */
+    char tname[128];            /* Inkling: the tool named by the current block's header */
 } Gen;
 
 static const char *finish_name(int f) {
@@ -1440,8 +1679,41 @@ static void flush_text(Gen *g, int final) {
     }
 }
 
+/* Inkling's block tokens; 0 when tok is none of them */
+static int on_token_inkling(Gen *g, int tok) {
+    if (tok == S.t_ik_head) {
+        g->state = ST_HEAD;
+        g->toolraw.n = 0;
+    } else if (tok == S.t_ik_think) {
+        g->state = ST_THINK;
+    } else if (tok == S.t_ik_text) {
+        g->state = ST_CONTENT;
+    } else if (tok == S.t_ik_tool) {
+        const char *s = g->toolraw.s ? g->toolraw.s : "";
+        int n = g->toolraw.n;
+        trim_view(&s, &n);
+        snprintf(g->tname, sizeof(g->tname), "%.*s", n, s);
+        g->toolraw.n = 0;
+        g->state = ST_TOOL;
+    } else if (tok == S.t_ik_end) {
+        if (g->state == ST_TOOL) {
+            const int before = g->calls.n;
+            if (!parse_tool_call_inkling(g->toolraw.s ? g->toolraw.s : "", g->toolraw.n, g->tname, &g->calls, &g->ncalls)) {
+                g->calls.n = before;
+                buf_add(&g->content, g->toolraw.s ? g->toolraw.s : "", g->toolraw.n);   /* not parseable: keep it visible */
+            }
+        }
+        g->state = ST_CONTENT;   /* between blocks: stray text is content */
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
 /* Appends a token's text to the right channel. Returns 1 when generation must stop. */
 static int on_token(Gen *g, int tok) {
+    if (g->chat && S.ik && on_token_inkling(g, tok)) return 0;
+    if (S.ik) goto text;
     if (g->chat && tok == S.t_think_start && g->state == ST_CONTENT && !g->content.n && !g->ncalls) {
         g->state = ST_THINK;   /* the model opens its reasoning itself (after audio) */
         return 0;
@@ -1483,11 +1755,12 @@ static int on_token(Gen *g, int tok) {
         g->state = ST_CONTENT;
         return 0;
     }
+text:
     if (tok_is_control(S.tk, tok)) return 0;
     int pl;
     const char *piece = tok_piece(S.tk, tok, &pl);
     if (g->state == ST_THINK) { buf_add(&g->reasoning, piece, pl); return 0; }
-    if (g->state == ST_TOOL) { buf_add(&g->toolraw, piece, pl); return 0; }
+    if (g->state == ST_TOOL || g->state == ST_HEAD) { buf_add(&g->toolraw, piece, pl); return 0; }
     if (g->skip_ws) {
         while (pl > 0 && (*piece == '\n' || *piece == ' ' || *piece == '\r' || *piece == '\t')) { piece++; pl--; }
         if (pl == 0) return 0;
@@ -1569,7 +1842,7 @@ static void generate(Gen *g, float *lg, const Toks *prompt) {
         if (ctx_pos(S.ctx) + 1 >= ctx_n_ctx(S.ctx)) break;
         lg = pcache_feed(S.pc, &tok, 1);
         if (!lg) break;
-        if (g->state == ST_THINK && g->think_budget > 0 && ++g->n_think >= g->think_budget) {
+        if (!S.ik && g->state == ST_THINK && g->think_budget > 0 && ++g->n_think >= g->think_budget) {
             /* reasoning budget spent: close the reasoning ourselves, the model continues with the answer */
             Toks close = { 0 };
             toks_text(&close, think_close(), -1);
@@ -1588,7 +1861,7 @@ static void generate(Gen *g, float *lg, const Toks *prompt) {
     }
     if (g->state == ST_TOOL) {
         /* unterminated tool call block: show it as text */
-        buf_add(&g->content, S.lfm3 || S.qwen ? "<tool_call>" : "<|tool_call_start|>", -1);
+        if (!S.ik) buf_add(&g->content, S.lfm3 || S.qwen ? "<tool_call>" : "<|tool_call_start|>", -1);
         buf_add(&g->content, g->toolraw.s ? g->toolraw.s : "", g->toolraw.n);
     }
     if (g->finish == FIN_STOP && g->ncalls) g->finish = FIN_TOOLS;
@@ -1889,6 +2162,13 @@ static void handle_chat(Conn *c, const Json *body) {
         g.state = ST_CONTENT;
         g.skip_ws = 1; /* the answer usually starts with a newline after the empty block */
     }
+    char effort[16];
+    if (S.ik) {   /* the model opens its blocks itself; the reasoning setting is its effort level */
+        t_effort = ik_effort_req(body, g.think_budget, effort, sizeof(effort));
+        g.think_budget = THINK_FULL;
+        g.state = ST_CONTENT;
+        g.skip_ws = 0;
+    }
     const Json *mods = json_get(body, "modalities");
     int voice = 0;
     for (const Json *mo = mods && mods->t == J_ARR ? mods->child : NULL; mo; mo = mo->next)
@@ -1915,6 +2195,7 @@ static void handle_chat(Conn *c, const Json *body) {
     int rendered = render_chat(messages, json_get(body, "tools"), preserve, g.think_budget != THINK_OFF, &t, &bounds, &nb,
                                NULL, err, sizeof(err));
     t_voice = 0;
+    t_effort = NULL;
     if (rendered && S.clip_err[0]) { snprintf(err, sizeof(err), "%s", S.clip_err); rendered = 0; }
     if (!rendered || t.n >= ctx_n_ctx(S.ctx)) {
         if (rendered) {
@@ -1983,7 +2264,8 @@ static void handle_chat(Conn *c, const Json *body) {
         /* the answer as the next request will send it back */
         Json *msg = json_parse(mj.s, mj.n, NULL, 0);
         int ok = msg != NULL;
-        if (ok && S.qwen) ok = render_assistant_qwen(&a, msg, preserve, err, sizeof(err));
+        if (ok && S.ik) ok = render_message_inkling(&a, msg, messages, err, sizeof(err));
+        else if (ok && S.qwen) ok = render_assistant_qwen(&a, msg, preserve, err, sizeof(err));
         else if (ok && S.lfm3) ok = render_assistant_lfm3(&a, msg, preserve, err, sizeof(err));
         else if (ok) ok = render_assistant(&a, g.reasoning.s, g.reasoning.n, g.content.s, g.content.n, preserve,
                                            json_get(msg, "tool_calls"), err, sizeof(err));
@@ -2122,8 +2404,12 @@ static void handle_apply_template(Conn *c, const Json *body) {
     Buf text = { 0 };
     int *bounds = NULL, nb = 0;
     int preserve = json_bool(json_get(json_get(body, "chat_template_kwargs"), "preserve_thinking"), 0);
-    if (!render_chat(messages, json_get(body, "tools"), preserve, request_think(body) != THINK_OFF, &t, &bounds, &nb,
-                     &text, err, sizeof(err))) {
+    char effort[16];
+    t_effort = ik_effort_req(body, request_think(body), effort, sizeof(effort));
+    const int rendered = render_chat(messages, json_get(body, "tools"), preserve, request_think(body) != THINK_OFF, &t, &bounds,
+                                     &nb, &text, err, sizeof(err));
+    t_effort = NULL;
+    if (!rendered) {
         send_error(c, 400, "invalid_request_error", err);
     } else {
         Buf b = { 0 };
@@ -2637,6 +2923,12 @@ void server_attach(const ServerConfig *cfg, Model *m, Context *ctx, Tokenizer *t
     S.reasons = template_reasons(m);
     S.t_tc_start = tok_find(tk, S.lfm3 || S.qwen ? "<tool_call>" : "<|tool_call_start|>");
     S.t_tc_end = tok_find(tk, S.lfm3 || S.qwen ? "</tool_call>" : "<|tool_call_end|>");
+    S.ik = chat_family(m) == CHAT_INKLING;
+    S.t_ik_head = tok_find(tk, "<|message_model|>");
+    S.t_ik_think = tok_find(tk, "<|content_thinking|>");
+    S.t_ik_text = tok_find(tk, "<|content_text|>");
+    S.t_ik_tool = tok_find(tk, "<|content_invoke_tool_json|>");
+    S.t_ik_end = tok_find(tk, "<|end_message|>");
     S.rng = (uint64_t)time(NULL) * 0x9E3779B97F4A7C15ull | 1;
 }
 
