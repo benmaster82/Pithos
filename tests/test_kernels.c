@@ -147,6 +147,33 @@ int main(int argc, char **argv) {
             ok &= worst <= 1.01;
             free(data);
         }
+    /* rows in Vulkan's nibble layout (mv_iq), decoded back here: the same values as dequant_row */
+    const uint32_t nt4[] = { GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ2_S, GGML_IQ3_XXS };
+    for (int ki = 1; ki < nk; ki++)
+        for (size_t i = 0; ks[ki].row_to_iq4 && i < sizeof(nt4) / sizeof(nt4[0]); i++) {
+            const int K = 2304;
+            const size_t rb = row_bytes(nt4[i], K), bsz = (size_t)ggml_type_size(nt4[i]);
+            uint8_t *data = malloc(rb), nib[1152], scb[144];
+            float dd[9], ref[2304];
+            unsigned s = 11 + nt4[i];
+            for (size_t j = 0; j < rb; j++) { s = s * 1664525u + 1013904223u; data[j] = (uint8_t)(s >> 24); }
+            for (size_t off = 0; off < rb; off += bsz) {
+                f16_t d = f32_to_f16(0.01f + 0.001f * (float)(off % 7));
+                memcpy(data + off, &d, 2);
+            }
+            int good = ks[ki].row_to_iq4(nt4[i], data, K, nib, scb, dd);
+            dequant_row(nt4[i], data, ref, K);
+            double worst = 0;
+            for (int j = 0; good && j < K; j++) {
+                const int b = j / QK_K, two = scb[b * 16] >> 7, c = (nib[j / 2] >> (4 * (j & 1))) & 15, m = c & 7;
+                const int mag = two ? (m == 0 ? 8 : m == 1 ? 25 : 43) : 8 * m + (m == 7 ? 6 : 4);
+                const double v = dd[b] * (scb[j / 16] & 31) * (c & 8 ? -mag : mag);
+                if (fabs(v - ref[j]) > worst) worst = fabs(v - ref[j]);
+            }
+            printf("%-7s to the mv_iq layout %-7s max diff %.2e %s\n", ks[ki].name, ggml_type_name(nt4[i]), worst, good && worst < 1e-6 ? "OK" : "FAIL");
+            ok &= good && worst < 1e-6;
+            free(data);
+        }
     /* fp16 round trip */
     for (float f = -70000.f; f < 70000.f; f += 13.37f) {
         f16_t h = f32_to_f16(f);

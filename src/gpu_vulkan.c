@@ -407,6 +407,7 @@ static VkInstance vk_instance(VkApi *vk) {
 
 enum { K_Q4_K, K_Q6_K, K_Q8_0, N_KERNELS };
 #define K_NVFP4 N_KERNELS   /* experts in VRAM only (pso_nvx): no batch or plain matrix-vector kernel */
+#define K_IQ (N_KERNELS + 1)   /* the same for IQ2 / IQ3_XXS experts, as nibbles (pso_iqx) */
 enum { T_RESID, T_QUANT, T_SILU, T_CONV, T_PREP, T_ATTN, T_CONV_CHUNK, T_CONV_STATE, T_ATTN_CHUNK,
        T_MOE_RESID, T_DCONV, T_DREC, T_QPREP, T_QATTN, T_ROUTER, T_COMBINE,
        T_IK_MIX, T_IK_NORM, T_IK_CTL, T_IK_ADD, T_IK_CONV, T_IK_PREP, T_IK_ATTN, T_IK_SITU, N_TOKEN_KERNELS };   /* kernels_dx_token.hlsl */
@@ -468,6 +469,7 @@ struct Vulkan {
     VkPipeline pso[N_KERNELS], pso_mv[N_KERNELS], pso_tok[N_TOKEN_KERNELS];
     VkPipeline pso_mvx[N_KERNELS];  /* pso_mv for the routed experts in VRAM (MV_EXPERTS) */
     VkPipeline pso_nvx;             /* the same for NVFP4 (Inkling's experts) */
+    VkPipeline pso_iqx;             /* and for its IQ2 / IQ3_XXS experts */
     int mv_rows;                    /* rows per group of the pso_mv kernels: 8, or 16 with the Intel build */
     int broken;
     /* PITHOS_VK_PROF=1: GPU time per tag of the decode passes, printed by vk_destroy */
@@ -756,7 +758,7 @@ static int create_pipelines(Vulkan *v) {
     VkDescriptorPoolCreateInfo cpi = {ST_DESCRIPTOR_POOL_CREATE_INFO, NULL, 0, SET_CACHE / 2, 2, cps};
     if (v->vk.CreateDescriptorPool(v->dev, &cpi, NULL, &v->cpool) != VK_SUCCESS) return 0;
 
-    static const struct { const unsigned char *code; size_t size; const char *entry; } k[3 * N_KERNELS + N_TOKEN_KERNELS + 1] = {
+    static const struct { const unsigned char *code; size_t size; const char *entry; } k[3 * N_KERNELS + N_TOKEN_KERNELS + 2] = {
         {g_vk_mm_q4_K, sizeof(g_vk_mm_q4_K), "mm_q4_K"}, {g_vk_mm_q6_K, sizeof(g_vk_mm_q6_K), "mm_q6_K"},
         {g_vk_mm_q8_0, sizeof(g_vk_mm_q8_0), "mm_q8_0"},
         {g_vk_mv_q4_K, sizeof(g_vk_mv_q4_K), "mv_q4_K"}, {g_vk_mv_q6_K, sizeof(g_vk_mv_q6_K), "mv_q6_K"},
@@ -776,7 +778,7 @@ static int create_pipelines(Vulkan *v) {
         {g_vk_ik_attn, sizeof(g_vk_ik_attn), "ik_attn"}, {g_vk_ik_situ, sizeof(g_vk_ik_situ), "ik_situ"},
         {g_vk_mvx_q4_K, sizeof(g_vk_mvx_q4_K), "mv_q4_K"}, {g_vk_mvx_q6_K, sizeof(g_vk_mvx_q6_K), "mv_q6_K"},
         {g_vk_mvx_q8_0, sizeof(g_vk_mvx_q8_0), "mv_q8_0"},
-        {g_vk_mvx_nvfp4, sizeof(g_vk_mvx_nvfp4), "mv_nvfp4"},
+        {g_vk_mvx_nvfp4, sizeof(g_vk_mvx_nvfp4), "mv_nvfp4"}, {g_vk_mvx_iq, sizeof(g_vk_mvx_iq), "mv_iq"},
     };
     /* Intel: the matmul kernels built for its GPUs (kernels_dx.hlsl); PITHOS_VK_INTEL=0: the common ones */
     static const struct { const unsigned char *code; size_t size; } intel_k[2 * N_KERNELS] = {
@@ -788,7 +790,7 @@ static int create_pipelines(Vulkan *v) {
     const char *env = getenv("PITHOS_VK_INTEL");
     const int intel = v->props.vendorID == 0x8086 && !(env && env[0] == '0');
     v->mv_rows = intel ? 16 : 8;
-    for (int i = 0; i < 3 * N_KERNELS + N_TOKEN_KERNELS + 1; i++) {
+    for (int i = 0; i < 3 * N_KERNELS + N_TOKEN_KERNELS + 2; i++) {
         const int own = intel && i < 2 * N_KERNELS;
         const unsigned char *code = own ? intel_k[i].code : k[i].code;
         const size_t size = own ? intel_k[i].size : k[i].size;
@@ -805,7 +807,8 @@ static int create_pipelines(Vulkan *v) {
                                           v->layout, 0, -1};
         VkPipeline *dst = i < N_KERNELS ? &v->pso[i] : i < 2 * N_KERNELS ? &v->pso_mv[i - N_KERNELS]
                         : i < 2 * N_KERNELS + N_TOKEN_KERNELS ? &v->pso_tok[i - 2 * N_KERNELS]
-                        : i < 3 * N_KERNELS + N_TOKEN_KERNELS ? &v->pso_mvx[i - 2 * N_KERNELS - N_TOKEN_KERNELS] : &v->pso_nvx;
+                        : i < 3 * N_KERNELS + N_TOKEN_KERNELS ? &v->pso_mvx[i - 2 * N_KERNELS - N_TOKEN_KERNELS]
+                        : i == 3 * N_KERNELS + N_TOKEN_KERNELS ? &v->pso_nvx : &v->pso_iqx;
         r = v->vk.CreateComputePipelines(v->dev, 0, 1, &ci, NULL, dst);
         v->vk.DestroyShaderModule(v->dev, mod, NULL);
         if (r != VK_SUCCESS) return 0;
@@ -885,6 +888,23 @@ static int vmat_init_nvfp4(VMat *x, const Mat *w, const uint8_t *host) {
     return 1;
 }
 
+/* IQ2 / IQ3_XXS rows as nibbles (mv_iq): 144 bytes and a float per 256 values, the row padded to 16 */
+static int vmat_init_iq(VMat *x, const Mat *w, const uint8_t *host) {
+    if (!host || !KS.row_to_iq4 || w->cols % QK_K ||
+        !(w->type == GGML_IQ2_XXS || w->type == GGML_IQ2_XS || w->type == GGML_IQ2_S || w->type == GGML_IQ3_XXS))
+        return 0;
+    memset(x, 0, sizeof(*x));
+    const size_t nb = (size_t)(w->cols / QK_K);
+    x->host = host;
+    x->requant = w->type;
+    x->kernel = K_IQ;
+    x->rows = w->rows;
+    x->K = w->cols;
+    x->row_bytes = w->row_bytes;
+    x->gpu_row = (nb * 148 + 15) & ~(size_t)15;
+    return 1;
+}
+
 /* file layout -> GPU layout of rows [r0, r1) of a matrix */
 static void pack_rows(const VMat *x, int r0, int r1, uint8_t *dst) {
     if (x->kernel == K_NVFP4) {
@@ -901,6 +921,14 @@ static void pack_rows(const VMat *x, int r0, int r1, uint8_t *dst) {
     }
     const uint8_t *src = x->host + (size_t)r0 * x->row_bytes;
     const size_t nblk = (size_t)(r1 - r0) * (size_t)(x->K / QK_K);
+    if (x->kernel == K_IQ) {
+        const size_t nb = (size_t)(x->K / QK_K);
+        for (int r = r0; r < r1; r++, dst += x->gpu_row) {
+            memset(dst + nb * 148, 0, x->gpu_row - nb * 148);
+            KS.row_to_iq4(x->requant, x->host + (size_t)r * x->row_bytes, x->K, dst, dst + nb * 128, (float *)(dst + nb * 144));
+        }
+        return;
+    }
     if (x->requant) {   /* the SIMD conversion: the cache swaps experts while tokens are generated */
         int8_t *qs = (int8_t *)malloc((size_t)x->K);
         f16_t *d = (f16_t *)malloc(sizeof(f16_t) * (size_t)(x->K / QK8_0));
@@ -1140,6 +1168,7 @@ void vk_destroy(Vulkan *v) {
         for (int k = 0; k < N_TOKEN_KERNELS; k++)
             if (v->pso_tok[k]) v->vk.DestroyPipeline(v->dev, v->pso_tok[k], NULL);
         if (v->pso_nvx) v->vk.DestroyPipeline(v->dev, v->pso_nvx, NULL);
+        if (v->pso_iqx) v->vk.DestroyPipeline(v->dev, v->pso_iqx, NULL);
         if (v->cpool) v->vk.DestroyDescriptorPool(v->dev, v->cpool, NULL);
         if (v->layout) v->vk.DestroyPipelineLayout(v->dev, v->layout, NULL);
         if (v->dsl) v->vk.DestroyDescriptorSetLayout(v->dev, v->dsl, NULL);
@@ -2421,7 +2450,8 @@ static int xp_init(Vulkan *v, const Model *m, size_t used, double *mb) {
         size_t o = 0;
         if (t->ik) {   /* Inkling: down in NVFP4, [gate | up] in NVFP4 or converted to Q8_0 (the IQ quants); the
                         * other layers' experts stay on the CPU (tm rows 0) */
-            if (!(vmat_init_nvfp4(&p->tm[l * 3], ws[0], ws[0]->data) || vmat_init_requant(&p->tm[l * 3], ws[0], ws[0]->data)) ||
+            if (!(vmat_init_nvfp4(&p->tm[l * 3], ws[0], ws[0]->data) || vmat_init_iq(&p->tm[l * 3], ws[0], ws[0]->data) ||
+                  vmat_init_requant(&p->tm[l * 3], ws[0], ws[0]->data)) ||
                 !vmat_init_nvfp4(&p->tm[l * 3 + 2], ws[2], ws[2]->data)) {
                 memset(&p->tm[l * 3], 0, 3 * sizeof(VMat));
                 continue;
@@ -2499,7 +2529,7 @@ static int mvx(Vulkan *v, const VMat *x, Bind w, Bind tab, int rows, Bind o, Bin
     const int nv = x->kernel == K_NVFP4;   /* its nb: 64-value blocks */
     const uint32_t c[6] = {(uint32_t)rows, (uint32_t)(x->K / (nv ? QK_NVFP4 : QK_K)), (uint32_t)n, (uint32_t)x->gpu_row, xrow, (uint32_t)orow};
     const Bind none = {NULL, 0};
-    return dispatch(v, nv ? v->pso_nvx : v->pso_mvx[x->kernel], c, 6, o, in, none, w, tab, (uint32_t)(rows + 7) / 8, (uint32_t)n, 0);
+    return dispatch(v, nv ? v->pso_nvx : x->kernel == K_IQ ? v->pso_iqx : v->pso_mvx[x->kernel], c, 6, o, in, none, w, tab, (uint32_t)(rows + 7) / 8, (uint32_t)n, 0);
 }
 
 int vk_moe_begin(Vulkan *v, int layer, const int *a_expert, const int *a_tok, const float *a_w, int n) {

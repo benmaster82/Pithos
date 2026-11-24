@@ -64,6 +64,9 @@ typedef struct {
     float (*exp_sum)(float *s, int n, float mx);                  /* s = exp(s - mx), returns sum */
     /* one row of a supported type (K a multiple of 256) as Q8_0: K int8 values and an f16 scale per 32 */
     void (*row_to_q8_0)(uint32_t type, const void *row, int K, int8_t *qs, f16_t *d);
+    /* an IQ2_XXS/XS/S or IQ3_XXS row in Vulkan's nibble layout (mv_iq in kernels_dx.hlsl): K/2 nibble
+     * bytes, K/16 scale bytes, K/256 floats; 0 for other types (NULL without SIMD) */
+    int (*row_to_iq4)(uint32_t type, const void *row, int K, uint8_t *nib, uint8_t *sc, float *d);
 } Kernels;
 
 extern Kernels K_scalar;

@@ -30,6 +30,10 @@ rem NVFP4 (Inkling's experts in VRAM) on its own, so that the kernels above do n
 "%DXC%" %OPT% -D MV_EXPERTS -D MV_NVFP4 -E mv_nvfp4 -Vn g_vk_mvx_nvfp4 -Fh %TEMP%\pithos_vk_mvx_nvfp4.h src\kernels_dx.hlsl >nul || goto fail
 type %TEMP%\pithos_vk_mvx_nvfp4.h >> %OUT%
 del %TEMP%\pithos_vk_mvx_nvfp4.h
+rem IQ2 / IQ3_XXS as nibbles (Inkling's smaller files), on its own as well
+"%DXC%" %OPT% -D MV_EXPERTS -D MV_IQ -E mv_iq -Vn g_vk_mvx_iq -Fh %TEMP%\pithos_vk_mvx_iq.h src\kernels_dx.hlsl >nul || goto fail
+type %TEMP%\pithos_vk_mvx_iq.h >> %OUT%
+del %TEMP%\pithos_vk_mvx_iq.h
 rem the matmul kernels again for Intel GPUs (see kernels_dx.hlsl)
 for %%e in (mm_q4_K mm_q6_K mm_q8_0 mv_q4_K mv_q6_K mv_q8_0) do (
     "%DXC%" %OPT% -D MM_INTEL -D MV_LANES=8 -D MV_LOG2=3 -D MV_GROUP=128 -D MV_SWAR -E %%e -Vn g_vk_%%e_intel -Fh %TEMP%\pithos_vk_%%e.h src\kernels_dx.hlsl >nul || goto fail
