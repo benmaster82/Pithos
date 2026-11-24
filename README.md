@@ -146,7 +146,7 @@ Three models are validated, and Qwen3.6 and Inkling 2 Mini are experimental. Cho
 | [LFM2.5-8B-A1B](#lfm25-8b-a1b-the-middle-ground) (MoE) | 4.8 GiB | 8 GB | a larger model on the CPU: it fits in RAM and generates as fast as LFM3-1.7B there |
 | [LFM3-1.7B](#lfm3-17b-small-and-fast) (dense) | 1.0 GiB | 4 GB | modest hardware, the fastest with a GPU (the whole model in VRAM), the Xbox One |
 | [Qwen3.6-35B-A3B](#qwen36-35b-a3b-experimental) (MoE, experimental) | 19.1 GiB | 16 GB | the largest; it runs from disk when it does not fit in RAM, best with a GPU |
-| [Inkling 2 Mini](#inkling-2-mini-experimental) (looped MoE, experimental) | 15.5 GiB | 16 GB | strong at coding and agents for its size; slower per token (each token runs 48 layers) |
+| [Inkling 2 Mini](#inkling-2-mini-experimental) (looped MoE, experimental) | 10.9 GiB | 16 GB | strong at coding and agents for its size; each token runs 48 layers |
 
 For speech, [LFM3-Audio-2B](#lfm3-audio-2b-speech-input-and-output-experimental) (experimental,
 1.2 GiB with its audio projector, 4 GB of RAM) transcribes, translates, speaks and holds voice
@@ -411,6 +411,10 @@ format the model was trained in. It reasons before it answers (its "thinking eff
 `--reasoning` or `reasoning_effort`) and calls tools in JSON, with the same chat, server, Pandora and
 terminal agent as the other models. Images are not supported yet.
 
+Pithos takes Unsloth's 3-bit file (UD-IQ3_XXS, 10.9 GiB), which fits in 16 GB of RAM with
+everything else; its experts mix the IQ3_XXS and IQ2 formats with NVFP4 ones. The 4-bit file
+(UD-Q4_K_M, 15.5 GiB) also runs: on 16 GB its less used experts come from the disk.
+
 With Vulkan (the default for this model on a discrete NVIDIA GPU) every layer runs on the GPU and the
 routed experts on the CPU, the most used of them also in the VRAM that is left (about 450, 1.9 GB on a
 4 GB GPU), computed by the GPU while the CPU computes the others. The window layers keep only their
@@ -418,29 +422,27 @@ last positions, so the KV cache takes about 32 KB per token.
 
 | Inkling 2 Mini on the reference laptop (6-core CPU, 16 GB, 4 GB laptop GPU), warm | Prompt | Generation |
 |---|---:|---:|
-| llama.cpp (master of 2026-11-22), CPU only, cold | 0.8 tok/s | 2.4 tok/s |
-| Pithos, CPU only (`--gpu off`) | 4.2 tok/s | 3.2–3.4 tok/s |
-| **Pithos, Vulkan (default here)** | **7.1 tok/s** | **4.6–5.2 tok/s** |
+| llama.cpp (b12670), CUDA, experts on the CPU, UD-IQ3_XXS | 5.5–6.1 tok/s | 4.0–4.6 tok/s |
+| Pithos, CPU only (`--gpu off`), UD-IQ3_XXS | 11 tok/s | 4.6–5.5 tok/s |
+| Pithos, Vulkan, UD-Q4_K_M | 6.0 tok/s | 8.1–8.4 tok/s |
+| **Pithos, Vulkan (default here), UD-IQ3_XXS** | **17–19 tok/s** | **9.6–9.7 tok/s** |
 
-Each token reads about 1.8 GB of experts, three times as much as Qwen3.6, and the 15.5 GiB file does
-not fit in 16 GB of RAM with everything else: the less used experts come from the disk, which sets
-the speed of generation (with every expert in RAM the GPU path reaches about 6.3 tok/s). Pithos reads
-ahead the experts it expects the next layer to use. Checked against llama.cpp on the same file and
-tokens: perplexity 2.013 (llama.cpp 2.043) over 3 × 256 tokens, 6.808 (6.785) over 1,536 tokens, the same
-most likely token 97% of the time; the tokenizer gives the same ids as Hugging Face's, and the chat
-template the same text as the model's own.
+A 249-token prompt, then 128 tokens. Each token reads about 1.3 GB of experts, twice as much as
+Qwen3.6. Checked against llama.cpp on the same files and tokens (3 × 256 tokens): the same
+most likely token 97% of the time (KL divergence 0.011 on both files); the tokenizer gives the same
+ids as Hugging Face's, and the chat template the same text as the model's own.
 
 | | |
 |---|---|
-| File | `Inkling-2-Mini-UD-Q4_K_M.gguf` from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), folder `Mainline_Support` (the llama.cpp layout; there it is named `.gguf_file`) |
-| Size | 16,610,544,608 bytes (15.5 GiB): keep about 17 GB free on the disk |
-| SHA-256 | `78fcedcf93c5d1bfe83e225513b71392bb52259be0eaa5f8899c856a2e5834ae` |
-| Download | `bash build.sh --download-model=inkling-2-mini` |
+| File | `Inkling-2-Mini-UD-IQ3_XXS.gguf` from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), folder `Mainline_Support` (the llama.cpp layout; there it is named `.gguf_file`) |
+| Size | 11,663,310,784 bytes (10.9 GiB): keep about 12 GB free on the disk |
+| SHA-256 | `fd9ccedae17c1bb89744612fbb46730b5275f2a342133d0419776bd1ae311657` |
+| Download | `bash build.sh --download-model=inkling-2-mini` (`inkling-2-mini-q4`: the 4-bit file) |
 | License | Apache 2.0 (see the model card) |
 
 ```
-build/pithos -m models/Inkling-2-Mini-UD-Q4_K_M.gguf -i
-build/pithos -m models/Inkling-2-Mini-UD-Q4_K_M.gguf --server --open
+build/pithos -m models/Inkling-2-Mini-UD-IQ3_XXS.gguf -i
+build/pithos -m models/Inkling-2-Mini-UD-IQ3_XXS.gguf --server --open
 ```
 
 ## Results
