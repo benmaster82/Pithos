@@ -170,6 +170,10 @@ run on the CPU, and they set the speed of generation.
   where every expert fits in VRAM.
 
 ## Done
+- v0.8.5: Inkling 2 Mini (experimental), on the CPU and with Vulkan (every layer on the GPU, the
+  routed experts on the CPU, the most used ones in VRAM): UD-IQ3_XXS by default, 17–19 tok/s of prompt
+  and 9.6–9.7 of generation on the reference laptop; the NVFP4, Q5_0 and IQ2 / IQ3 / IQ4 weight
+  formats; `build.sh --download-model=inkling-2-mini`; the landing page groups the models by RAM.
 - v0.8.0: voice on the Xbox One with LFM3-Audio-2B: push-to-talk through the controller's headset,
   spoken answers with an adaptive playback buffer, Talk mode (full screen) and hands-free listening,
   a reasoning level in the TV chat; speech at 0.87× real time on the console (depth decoder on
