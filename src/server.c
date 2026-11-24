@@ -933,12 +933,13 @@ const char *ik_effort(int budget) {
     return budget == THINK_OFF ? "0" : budget > 0 && budget <= 512 ? "0.2" : budget > 0 && budget <= 2048 ? "0.7" : "0.9";
 }
 
-/* The request's effort level: "reasoning_effort" by the template's names (or a number), else
- * from the reasoning setting */
+/* The request's effort level: "reasoning_effort" by the template's names (or a number), also
+ * inside chat_template_kwargs as llama.cpp clients send it, else from the reasoning setting */
 static const char *ik_effort_req(const Json *body, int budget, char *buf, int len) {
     static const char *names[][2] = { {"none", "0"}, {"minimal", "0.1"}, {"low", "0.2"}, {"medium", "0.7"},
                                       {"high", "0.9"}, {"xhigh", "0.99"}, {"max", "0.99"} };
     const Json *e = json_get(body, "reasoning_effort");
+    if (!e) e = json_get(json_get(body, "chat_template_kwargs"), "reasoning_effort");
     if (!e) e = json_get(json_get(body, "reasoning"), "effort");
     if (e && e->t == J_NUM && e->num >= 0 && e->num <= 0.99) {
         if (e->num == 0) return "0";
