@@ -413,34 +413,41 @@ format. It reasons before it answers (its "thinking effort", set with
 `--reasoning` or `reasoning_effort`) and calls tools in JSON, with the same chat, server, Pandora and
 terminal agent as the other models. Images are not supported yet.
 
-Pithos takes Unsloth's 3-bit file (UD-IQ3_XXS, 10.9 GiB), which fits in 16 GB of RAM with
-everything else; its experts mix the IQ3_XXS and IQ2 formats with NVFP4 ones. The 4-bit file
-(UD-Q4_K_M, 15.5 GiB) also runs: on 16 GB its less used experts come from the disk.
+Three of Unsloth's files were tested with Pithos, all from
+[unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), folder
+`Mainline_Support` (the llama.cpp layout; there they are named `.gguf_file`: rename them to
+`.gguf`). The 3-bit one is the default: it fits in 16 GB of RAM with everything else, while the two
+4-bit ones read their less used experts from the disk on 16 GB.
+
+| File | Size | Experts | Against llama.cpp, same file | `bash build.sh` |
+|---|---:|---|---|---|
+| **`Inkling-2-Mini-UD-IQ3_XXS.gguf`** (default) | 10.9 GiB | IQ3_XXS and IQ2, NVFP4, IQ4_NL | same top token 97.4%, KL divergence 0.011 | `--download-model=inkling-2-mini` |
+| `Inkling-2-Mini-UD-IQ4_XS.gguf` | 14.7 GiB | NVFP4, IQ4_XS, IQ4_NL, Q5_0, Q4_K / Q5_K | 97.1%, 0.008 | `--download-model=inkling-2-mini-iq4xs` |
+| `Inkling-2-Mini-UD-Q4_K_M.gguf` | 15.5 GiB | NVFP4, Q5_K, Q8_0 | 97.1%, 0.011 | `--download-model=inkling-2-mini-q4` |
 
 With Vulkan (the default for this model on a discrete NVIDIA GPU) every layer runs on the GPU and the
 routed experts on the CPU, the most used of them also in the VRAM that is left (about 450, 1.9 GB on a
 4 GB GPU), computed by the GPU while the CPU computes the others. The window layers keep only their
 last positions, so the KV cache takes about 32 KB per token.
 
-| Inkling 2 Mini on the reference laptop (6-core CPU, 16 GB, 4 GB laptop GPU), warm | Prompt | Generation |
-|---|---:|---:|
-| llama.cpp (b12670), CUDA, experts on the CPU, UD-IQ3_XXS | 5.5–6.1 tok/s | 4.0–4.6 tok/s |
-| Pithos, CPU only (`--gpu off`), UD-IQ3_XXS | 11 tok/s | 4.6–5.5 tok/s |
-| Pithos, Vulkan, UD-Q4_K_M | 6.0 tok/s | 8.1–8.4 tok/s |
-| **Pithos, Vulkan (default here), UD-IQ3_XXS** | **17–19 tok/s** | **9.6–9.7 tok/s** |
+| Inkling 2 Mini on the reference laptop (6-core CPU, 16 GB, 4 GB laptop GPU), warm; prompt / generation, tok/s | Pithos, Vulkan (default here) | Pithos, CPU only (`--gpu off`) | llama.cpp b12670, CUDA, experts on the CPU |
+|---|---:|---:|---:|
+| UD-IQ3_XXS | **17–19 / 9.6–9.7** | 11 / 4.6–5.5 | 5.5–6.1 / 4.0–4.6 |
+| UD-IQ4_XS | 7.0 / 8.9–9.3 | 5.6–7.2 / 4.3–4.6 | 5.2 / 2.9 |
+| UD-Q4_K_M | 6.0 / 8.1–8.4 | 5.1–7.1 / 3.9–4.2 | 2.9–5.0 / 3.2 |
 
-A 249-token prompt, then 128 tokens. Each token reads about 1.3 GB of experts, twice as much as
-Qwen3.6. Checked against llama.cpp on the same files and tokens (3 × 256 tokens): the same
-most likely token 97% of the time (KL divergence 0.011 on both files); the tokenizer gives the same
-ids as Hugging Face's, and the chat template the same text as the model's own.
+Pithos: a 249-token prompt, then 128 tokens; llama.cpp: `llama-bench` with 256 and 64–128. Each token
+reads about 1.3 GB of experts with the 3-bit file, twice as much as Qwen3.6. The KL divergence is
+measured on 3 × 256 tokens of the model license against llama.cpp's own logits; the tokenizer gives
+the same ids as Hugging Face's, and the chat template the same text as the model's own.
 
-| | |
-|---|---|
-| File | `Inkling-2-Mini-UD-IQ3_XXS.gguf` from [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), folder `Mainline_Support` (the llama.cpp layout; there it is named `.gguf_file`) |
-| Size | 11,663,310,784 bytes (10.9 GiB): keep about 12 GB free on the disk |
-| SHA-256 | `fd9ccedae17c1bb89744612fbb46730b5275f2a342133d0419776bd1ae311657` |
-| Download | `bash build.sh --download-model=inkling-2-mini` (`inkling-2-mini-q4`: the 4-bit file) |
-| License | Apache 2.0 (see the model card) |
+| File | Bytes | SHA-256 |
+|---|---:|---|
+| `Inkling-2-Mini-UD-IQ3_XXS.gguf` | 11,663,310,784 | `fd9ccedae17c1bb89744612fbb46730b5275f2a342133d0419776bd1ae311657` |
+| `Inkling-2-Mini-UD-IQ4_XS.gguf` | 15,733,756,512 | `374970bf6f151fc50da49419751c3e77b82e373a3b9445ded617bd386cd12163` |
+| `Inkling-2-Mini-UD-Q4_K_M.gguf` | 16,610,544,608 | `78fcedcf93c5d1bfe83e225513b71392bb52259be0eaa5f8899c856a2e5834ae` |
+
+Keep about 1 GB more than the file free on the disk. License: Apache 2.0 (see the model card).
 
 ```
 build/pithos -m models/Inkling-2-Mini-UD-IQ3_XXS.gguf -i

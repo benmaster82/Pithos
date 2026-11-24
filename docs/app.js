@@ -43,7 +43,7 @@ const MODELS = {
     hash:'fd9ccedae17c1bb89744612fbb46730b5275f2a342133d0419776bd1ae311657',
     download:'11.7 GB',ram:'16',gpu:'~9.5 tok/s',cpu:'4.5–5.5 tok/s',
     disk:'At least 12 GB free for the model',diskDetail:'About 11.7 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
-    blurb:'26 billion parameters in a looped transformer: the middle 12 of its 24 layers run three times, 48 per token (experimental). Strong at coding and agents for its size; this 3-bit file fits in 16 GB of RAM.'}
+    blurb:'26 billion parameters in a looped transformer: the middle 12 of its 24 layers run three times, 48 per token (experimental). Strong at coding and agents for its size; this 3-bit file fits in 16 GB of RAM (the 4-bit IQ4_XS and Q4_K_M files run too).'}
 };
 // " -m models/FILE" for a model that is not the engine's default
 const modelArg = (m, windows) => m === MODELS.big ? '' : windows ? ` -m models\\${m.file}` : ` -m models/${m.file}`;
