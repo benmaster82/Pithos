@@ -423,6 +423,7 @@ typedef struct {
 
 typedef struct {
     const uint8_t *host;
+    uint32_t requant;               /* the file's type when it goes up converted to Q8_0, else 0 */
     int kernel, rows, K;
     size_t row_bytes, gpu_row;      /* bytes per row in the file / on the GPU */
     int nparts, part_rows;          /* rows [p * part_rows, ...) in part[p]; nparts 0: not on the GPU */
@@ -828,9 +829,25 @@ static int vmat_init(VMat *x, const Mat *w, const uint8_t *host) {
     return 1;
 }
 
-static void add_mat(Vulkan *v, const Mat *w, int *cap) {
+/* any other type the CPU reads, as Q8_0 rows converted on the way up (Inkling's Q5_K dense weights) */
+static int vmat_init_requant(VMat *x, const Mat *w, const uint8_t *host) {
+    if (!host || w->type == GGML_F32 || w->type == GGML_F16 || w->type == GGML_NVFP4 || !type_supported(w->type) ||
+        w->cols % QK_K)
+        return 0;
+    memset(x, 0, sizeof(*x));
+    x->host = host;
+    x->requant = w->type;
+    x->kernel = K_Q8_0;
+    x->rows = w->rows;
+    x->K = w->cols;
+    x->row_bytes = w->row_bytes;
+    x->gpu_row = (size_t)(w->cols / QK_K) * Q80_GPU_BYTES;
+    return 1;
+}
+
+static void add_mat(Vulkan *v, const Mat *w, int *cap, int requant) {
     VMat x;
-    if (!vmat_init(&x, w, w->data)) return;
+    if (!vmat_init(&x, w, w->data) && !(requant && vmat_init_requant(&x, w, w->data))) return;
     if (v->nmats == *cap) {
         *cap = *cap ? *cap * 2 : 64;
         v->mats = (VMat *)realloc(v->mats, sizeof(VMat) * (size_t)*cap);
@@ -884,6 +901,24 @@ static void pack_rows(const VMat *x, int r0, int r1, uint8_t *dst) {
     }
     const uint8_t *src = x->host + (size_t)r0 * x->row_bytes;
     const size_t nblk = (size_t)(r1 - r0) * (size_t)(x->K / QK_K);
+    if (x->requant) {
+        float *f = (float *)malloc(sizeof(float) * (size_t)x->K);
+        for (int r = r0; r < r1; r++) {
+            dequant_row(x->requant, x->host + (size_t)r * x->row_bytes, f, x->K);
+            for (int i = 0; i < x->K / QK_K; i++, dst += Q80_GPU_BYTES)
+                for (int j = 0; j < QK_K / QK8_0; j++) {
+                    const float *y = f + i * QK_K + j * QK8_0;
+                    float amax = 0;
+                    for (int l = 0; l < QK8_0; l++) amax = fabsf(y[l]) > amax ? fabsf(y[l]) : amax;
+                    const float d = amax / 127.f, id = d > 0 ? 1.f / d : 0.f;
+                    for (int l = 0; l < QK8_0; l++) dst[j * QK8_0 + l] = (uint8_t)(int8_t)lrintf(y[l] * id);
+                    const f16_t h = f32_to_f16(d);
+                    memcpy(dst + QK_K + j * 2, &h, 2);
+                }
+        }
+        free(f);
+        return;
+    }
     if (x->kernel == K_Q8_0) {
         const block_q8_0 *b = (const block_q8_0 *)src;
         for (size_t i = 0; i < nblk; i++, dst += Q80_GPU_BYTES)
@@ -1063,9 +1098,9 @@ Vulkan *vk_create(const Model *m, int device, char *info, int infolen) {
         const Mat *ws[] = {&L->in_proj, &L->out_proj, &L->wq, &L->wk, &L->wv, &L->wo, &L->attn_gate,
                            &L->w_gate, &L->w_up, &L->w_down, &L->ssm_qkv, &L->ssm_z, &L->ssm_alpha,
                            &L->ssm_beta, &L->ssm_out, &L->sh_gate, &L->sh_up, &L->sh_down, &L->ik_rel, &L->ik_gate};
-        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) add_mat(v, ws[i], &cap);
+        for (size_t i = 0; i < sizeof(ws) / sizeof(ws[0]); i++) add_mat(v, ws[i], &cap, m->ik);
     }
-    add_mat(v, &m->output, &cap);
+    add_mat(v, &m->output, &cap, m->ik);
     if (!v->nmats) {
         snprintf(info, (size_t)infolen, "no Q4_K / Q6_K / Q8_0 dense weights in this model");
         vk_destroy(v);
@@ -2388,8 +2423,10 @@ static int xp_init(Vulkan *v, const Model *m, size_t used, double *mb) {
         const Layer *L = &m->layers[l];
         const Mat *ws[3] = {&L->gate_exps, &L->up_exps, &L->down_exps};
         size_t o = 0;
-        if (t->ik) {   /* Inkling: [gate | up] and down in NVFP4; the other layers' experts stay on the CPU (tm rows 0) */
-            if (!vmat_init_nvfp4(&p->tm[l * 3], ws[0], ws[0]->data) || !vmat_init_nvfp4(&p->tm[l * 3 + 2], ws[2], ws[2]->data)) {
+        if (t->ik) {   /* Inkling: down in NVFP4, [gate | up] in NVFP4 or converted to Q8_0 (the IQ quants); the
+                        * other layers' experts stay on the CPU (tm rows 0) */
+            if (!(vmat_init_nvfp4(&p->tm[l * 3], ws[0], ws[0]->data) || vmat_init_requant(&p->tm[l * 3], ws[0], ws[0]->data)) ||
+                !vmat_init_nvfp4(&p->tm[l * 3 + 2], ws[2], ws[2]->data)) {
                 memset(&p->tm[l * 3], 0, 3 * sizeof(VMat));
                 continue;
             }

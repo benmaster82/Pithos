@@ -60,8 +60,9 @@ static int load_mat(Model *m, Mat *mat, const char *name, int required, char *er
     mat->rows = (int)t->ne[1];
     mat->row_bytes = row_bytes(t->type, mat->cols);
     mat->expert_stride = mat->row_bytes * (size_t)mat->rows;
-    /* Inkling's 1152-long expert rows: NVFP4 and Q8_0 rows may end in a partial Q8_K block */
-    const int blk = !m->ik ? QK_K : t->type == GGML_NVFP4 ? QK_NVFP4 : t->type == GGML_Q8_0 ? QK8_0 : QK_K;
+    /* Inkling's 1152-long expert rows: NVFP4 and the 32-block rows may end in a partial Q8_K block */
+    const int blk = !m->ik ? QK_K : t->type == GGML_NVFP4 ? QK_NVFP4
+                  : t->type == GGML_Q8_0 || t->type == GGML_Q5_0 || t->type == GGML_IQ4_NL ? QK8_0 : QK_K;
     if (t->type != GGML_F32 && t->type != GGML_F16 && (mat->cols % blk) != 0) {
         snprintf(err, errlen, "tensor %s: row length %d not a multiple of %d", name, mat->cols, blk);
         return -1;

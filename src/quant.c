@@ -2,6 +2,7 @@
 #include "quant.h"
 #include "gguf.h"
 #include "platform.h"
+#include "iq_tables.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -56,7 +57,9 @@ size_t row_bytes(uint32_t type, int K) {
 
 int type_supported(uint32_t t) {
     return t == GGML_F32 || t == GGML_F16 || t == GGML_Q4_0 || t == GGML_Q8_0 ||
-           t == GGML_Q4_K || t == GGML_Q5_K || t == GGML_Q6_K || t == GGML_NVFP4;
+           t == GGML_Q4_K || t == GGML_Q5_K || t == GGML_Q6_K || t == GGML_NVFP4 || t == GGML_Q5_0 ||
+           t == GGML_IQ2_XXS || t == GGML_IQ2_XS || t == GGML_IQ2_S || t == GGML_IQ3_XXS || t == GGML_IQ3_S ||
+           t == GGML_IQ4_NL || t == GGML_IQ4_XS;
 }
 
 const int8_t nvfp4_values[16] = { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
@@ -175,6 +178,141 @@ void dequant_row(uint32_t type, const void *src, float *y, int K) {
                 }
                 y += 16;
             }
+    } break;
+    case GGML_Q5_0: {
+        const block_q5_0 *b = (const block_q5_0 *)src;
+        for (int i = 0; i < K / QK8_0; i++) {
+            const float d = f16_to_f32(b[i].d);
+            uint32_t qh;
+            memcpy(&qh, b[i].qh, 4);
+            for (int j = 0; j < 16; j++) {
+                y[j] = d * ((int)((b[i].qs[j] & 0xF) | (((qh >> j) << 4) & 0x10)) - 16);
+                y[j + 16] = d * ((int)((b[i].qs[j] >> 4) | ((qh >> (j + 12)) & 0x10)) - 16);
+            }
+            y += 32;
+        }
+    } break;
+    case GGML_IQ4_NL: {
+        const block_iq4_nl *b = (const block_iq4_nl *)src;
+        for (int i = 0; i < K / QK8_0; i++) {
+            const float d = f16_to_f32(b[i].d);
+            for (int j = 0; j < 16; j++) {
+                y[j] = d * kvalues_iq4nl[b[i].qs[j] & 0xF];
+                y[j + 16] = d * kvalues_iq4nl[b[i].qs[j] >> 4];
+            }
+            y += 32;
+        }
+    } break;
+    case GGML_IQ4_XS: {
+        const block_iq4_xs *b = (const block_iq4_xs *)src;
+        for (int i = 0; i < K / QK_K; i++) {
+            const float d = f16_to_f32(b[i].d);
+            const uint8_t *qs = b[i].qs;
+            for (int ib = 0; ib < 8; ib++) {
+                const int ls = ((b[i].scales_l[ib / 2] >> 4 * (ib % 2)) & 0xF) | (((b[i].scales_h >> 2 * ib) & 3) << 4);
+                const float dl = d * (ls - 32);
+                for (int j = 0; j < 16; j++) {
+                    y[j] = dl * kvalues_iq4nl[qs[j] & 0xF];
+                    y[j + 16] = dl * kvalues_iq4nl[qs[j] >> 4];
+                }
+                y += 32;
+                qs += 16;
+            }
+        }
+    } break;
+    case GGML_IQ2_XXS: {
+        const block_iq2_xxs *b = (const block_iq2_xxs *)src;
+        for (int i = 0; i < K / QK_K; i++) {
+            const float d = f16_to_f32(b[i].d);
+            for (int ib = 0; ib < 8; ib++) {
+                uint32_t a[2];
+                memcpy(a, b[i].qs + 4 * ib, 8);
+                const float db = d * (0.5f + (a[1] >> 28)) * 0.25f;
+                for (int l = 0; l < 4; l++) {
+                    const uint8_t *g = (const uint8_t *)(iq2xxs_grid + ((a[0] >> 8 * l) & 0xFF));
+                    const uint8_t sg = ksigns_iq2xs[(a[1] >> 7 * l) & 127];
+                    for (int j = 0; j < 8; j++) y[j] = db * g[j] * (sg >> j & 1 ? -1.f : 1.f);
+                    y += 8;
+                }
+            }
+        }
+    } break;
+    case GGML_IQ2_XS: {
+        const block_iq2_xs *b = (const block_iq2_xs *)src;
+        for (int i = 0; i < K / QK_K; i++) {
+            const float d = f16_to_f32(b[i].d);
+            for (int ib = 0; ib < 8; ib++)
+                for (int l = 0; l < 4; l++) {
+                    const float db = d * (0.5f + ((b[i].scales[ib] >> 4 * (l / 2)) & 0xF)) * 0.25f;
+                    const uint16_t q = b[i].qs[4 * ib + l];
+                    const uint8_t *g = (const uint8_t *)(iq2xs_grid + (q & 511));
+                    const uint8_t sg = ksigns_iq2xs[q >> 9];
+                    for (int j = 0; j < 8; j++) y[j] = db * g[j] * (sg >> j & 1 ? -1.f : 1.f);
+                    y += 8;
+                }
+        }
+    } break;
+    case GGML_IQ2_S: {
+        const block_iq2_s *b = (const block_iq2_s *)src;
+        for (int i = 0; i < K / QK_K; i++) {
+            const float d = f16_to_f32(b[i].d);
+            const uint8_t *qs = b[i].qs, *sg = b[i].qs + QK_K / 8;
+            for (int ib = 0; ib < 8; ib++) {
+                for (int l = 0; l < 4; l++) {
+                    const float db = d * (0.5f + ((b[i].scales[ib] >> 4 * (l / 2)) & 0xF)) * 0.25f;
+                    const uint8_t *g = (const uint8_t *)(iq2s_grid + (qs[l] | ((b[i].qh[ib] << (8 - 2 * l)) & 0x300)));
+                    for (int j = 0; j < 8; j++) y[j] = db * g[j] * (sg[l] >> j & 1 ? -1.f : 1.f);
+                    y += 8;
+                }
+                qs += 4;
+                sg += 4;
+            }
+        }
+    } break;
+    case GGML_IQ3_XXS: {
+        const block_iq3_xxs *b = (const block_iq3_xxs *)src;
+        for (int i = 0; i < K / QK_K; i++) {
+            const float d = f16_to_f32(b[i].d);
+            const uint8_t *qs = b[i].qs, *gas = b[i].qs + QK_K / 4;
+            for (int ib = 0; ib < 8; ib++) {
+                uint32_t a;
+                memcpy(&a, gas + 4 * ib, 4);
+                const float db = d * (0.5f + (a >> 28)) * 0.5f;
+                for (int l = 0; l < 4; l++) {
+                    const uint8_t sg = ksigns_iq2xs[(a >> 7 * l) & 127];
+                    const uint8_t *g1 = (const uint8_t *)(iq3xxs_grid + qs[2 * l]);
+                    const uint8_t *g2 = (const uint8_t *)(iq3xxs_grid + qs[2 * l + 1]);
+                    for (int j = 0; j < 4; j++) {
+                        y[j] = db * g1[j] * (sg >> j & 1 ? -1.f : 1.f);
+                        y[j + 4] = db * g2[j] * (sg >> (j + 4) & 1 ? -1.f : 1.f);
+                    }
+                    y += 8;
+                }
+                qs += 8;
+            }
+        }
+    } break;
+    case GGML_IQ3_S: {
+        const block_iq3_s *b = (const block_iq3_s *)src;
+        for (int i = 0; i < K / QK_K; i++) {
+            const float d = f16_to_f32(b[i].d);
+            const uint8_t *qs = b[i].qs, *sg = b[i].signs;
+            for (int ib = 0; ib < 8; ib++) {
+                const float db = d * (1 + 2 * ((b[i].scales[ib / 2] >> 4 * (ib % 2)) & 0xF));
+                const int qh = b[i].qh[ib];
+                for (int l = 0; l < 4; l++) {
+                    const uint8_t *g1 = (const uint8_t *)(iq3s_grid + (qs[2 * l] | ((qh << (8 - 2 * l)) & 256)));
+                    const uint8_t *g2 = (const uint8_t *)(iq3s_grid + (qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256)));
+                    for (int j = 0; j < 4; j++) {
+                        y[j] = db * g1[j] * (sg[l] >> j & 1 ? -1.f : 1.f);
+                        y[j + 4] = db * g2[j] * (sg[l] >> (j + 4) & 1 ? -1.f : 1.f);
+                    }
+                    y += 8;
+                }
+                qs += 8;
+                sg += 4;
+            }
+        }
     } break;
     default:
         memset(y, 0, (size_t)K * 4);
@@ -358,6 +496,39 @@ DEF_ROWS(rows_q8_0_scalar, block_q8_0, dot_q8_0_1)
 DEF_ROWS(rows_q4_0_scalar, block_q4_0, dot_q4_0_1)
 DEF_ROWS(rows_nvfp4_scalar, block_nvfp4, dot_nvfp4_1)
 
+/* The other formats through dequantization, 256 values at a time: K a multiple of the type's
+ * block, the last Q8_K block may be partial */
+static void rows_deq_scalar(uint32_t type, int K, const void *w, const block_q8_K *x, int xs, int nt, float *out,
+                            int os) {
+    float buf[QK_K];
+    for (int t = 0; t < nt; t++) {
+        const uint8_t *p = (const uint8_t *)w;
+        const block_q8_K *y = x + (size_t)t * xs;
+        float sumf = 0;
+        for (int i = 0; i * QK_K < K; i++) {
+            const int n = K - i * QK_K < QK_K ? K - i * QK_K : QK_K;
+            dequant_row(type, p, buf, n);
+            p += row_bytes(type, n);
+            float s = 0;
+            for (int j = 0; j < n; j++) s += buf[j] * y[i].qs[j];
+            sumf += s * y[i].d;
+        }
+        out[(size_t)t * os] = sumf;
+    }
+}
+#define DEF_DEQ(NAME, TYPE)                                                                          \
+    static void NAME(int K, const void *w, const block_q8_K *x, int xs, int nt, float *out, int os) { \
+        rows_deq_scalar(TYPE, K, w, x, xs, nt, out, os);                                             \
+    }
+DEF_DEQ(rows_q5_0_scalar, GGML_Q5_0)
+DEF_DEQ(rows_iq4_nl_scalar, GGML_IQ4_NL)
+DEF_DEQ(rows_iq4_xs_scalar, GGML_IQ4_XS)
+DEF_DEQ(rows_iq2_xxs_scalar, GGML_IQ2_XXS)
+DEF_DEQ(rows_iq2_xs_scalar, GGML_IQ2_XS)
+DEF_DEQ(rows_iq2_s_scalar, GGML_IQ2_S)
+DEF_DEQ(rows_iq3_xxs_scalar, GGML_IQ3_XXS)
+DEF_DEQ(rows_iq3_s_scalar, GGML_IQ3_S)
+
 static void f16_to_f32_row_scalar(const f16_t *x, float *y, int n) {
     for (int i = 0; i < n; i++) y[i] = f16_to_f32(x[i]);
 }
@@ -406,6 +577,14 @@ static void init_scalar(Kernels *k) {
     k->dot[GGML_Q8_0] = rows_q8_0_scalar;
     k->dot[GGML_Q4_0] = rows_q4_0_scalar;
     k->dot[GGML_NVFP4] = rows_nvfp4_scalar;
+    k->dot[GGML_Q5_0] = rows_q5_0_scalar;
+    k->dot[GGML_IQ4_NL] = rows_iq4_nl_scalar;
+    k->dot[GGML_IQ4_XS] = rows_iq4_xs_scalar;
+    k->dot[GGML_IQ2_XXS] = rows_iq2_xxs_scalar;
+    k->dot[GGML_IQ2_XS] = rows_iq2_xs_scalar;
+    k->dot[GGML_IQ2_S] = rows_iq2_s_scalar;
+    k->dot[GGML_IQ3_XXS] = rows_iq3_xxs_scalar;
+    k->dot[GGML_IQ3_S] = rows_iq3_s_scalar;
     k->quantize_q8_K = quantize_q8_K_scalar;
     k->f16_to_f32_row = f16_to_f32_row_scalar;
     k->f32_to_f16_row = f32_to_f16_row_scalar;

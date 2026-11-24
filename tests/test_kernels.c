@@ -63,9 +63,7 @@ static int synth_check(const char *kname, const Kernels *k, uint32_t type, int K
     uint8_t *data = malloc(rb * rows);
     unsigned s = 99 + type;
     for (size_t i = 0; i < rb * rows; i++) { s = s * 1664525u + 1013904223u; data[i] = (uint8_t)(s >> 24); }
-    const size_t bsz = type == GGML_Q8_0 ? sizeof(block_q8_0) : type == GGML_Q4_0 ? sizeof(block_q4_0)
-                     : type == GGML_Q4_K ? sizeof(block_q4_K) : type == GGML_Q5_K ? sizeof(block_q5_K)
-                     : type == GGML_NVFP4 ? sizeof(block_nvfp4) : sizeof(block_q6_K);
+    const size_t bsz = (size_t)ggml_type_size(type);
     for (size_t off = 0; off + bsz <= rb * rows; off += bsz) {
         if (type == GGML_NVFP4) {
             /* E4M3 scales around 2^-6, with some zero sub-blocks */
@@ -114,8 +112,10 @@ int main(int argc, char **argv) {
             const GGUFTensor *t = gguf_tensor(&g, names[i]);
             if (t && ks[ki].dot[t->type]) ok &= check(ks[ki].name, &ks[ki], t);
         }
-    const uint32_t types[] = { GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0, GGML_Q4_0, GGML_NVFP4, GGML_NVFP4 };
-    const int sizes[] = { 2048, 2048, 2048, 2048, 2048, 2304, 1152 };
+    const uint32_t types[] = { GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0, GGML_Q4_0, GGML_NVFP4, GGML_NVFP4,
+                               GGML_Q5_0, GGML_Q5_0, GGML_IQ4_NL, GGML_IQ4_NL, GGML_IQ4_XS, GGML_IQ2_XXS,
+                               GGML_IQ2_XS, GGML_IQ2_S, GGML_IQ3_XXS, GGML_IQ3_S };
+    const int sizes[] = { 2048, 2048, 2048, 2048, 2048, 2304, 1152, 2304, 1152, 2304, 1152, 2304, 2304, 2304, 2304, 2304, 2304 };
     for (int ki = 0; ki < nk; ki++)
         for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++)
             if (ks[ki].dot[types[i]]) ok &= synth_check(ks[ki].name, &ks[ki], types[i], sizes[i]);
