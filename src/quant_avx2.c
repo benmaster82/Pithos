@@ -533,6 +533,61 @@ DEF_IQ_ROWS(rows_iq3_xxs, block_iq3_xxs, unpack_iq3_xxs)
 DEF_IQ_ROWS(rows_iq3_s, block_iq3_s, unpack_iq3_s)
 DEF_IQ_ROWS(rows_iq4_xs, block_iq4_xs, unpack_iq4_xs)
 
+/* 8 int16 values times f, rounded, as int32 in two halves packed back to int16 */
+static inline __m128i q8_round8(__m128i v, __m128 f) {
+    const __m128i a = _mm_cvtps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(_mm_cvtepi16_epi32(v)), f));
+    const __m128i b = _mm_cvtps_epi32(_mm_mul_ps(_mm_cvtepi32_ps(_mm_cvtepi16_epi32(_mm_srli_si128(v, 8))), f));
+    return _mm_packs_epi32(a, b);
+}
+
+/* an unpacked block (q * sc * d) as 8 Q8_0 blocks: the products fit in int16 (|q| <= 127, |sc| <= 32 for IQ4_XS) */
+static inline void iq_block_q8_0(const __m256i q[8], const __m256i sc[8], float d, int8_t *qs, f16_t *dq) {
+    for (int j = 0; j < 8; j++, qs += 32) {
+        const __m256i lo = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(q[j]));
+        const __m256i hi = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(q[j], 1));
+        const __m256i plo = _mm256_mullo_epi16(lo, _mm256_set1_epi16((short)_mm256_extract_epi16(sc[j], 0)));
+        const __m256i phi = _mm256_mullo_epi16(hi, _mm256_set1_epi16((short)_mm256_extract_epi16(sc[j], 8)));
+        __m256i mx = _mm256_max_epi16(_mm256_abs_epi16(plo), _mm256_abs_epi16(phi));
+        __m128i m = _mm_max_epi16(_mm256_castsi256_si128(mx), _mm256_extracti128_si256(mx, 1));
+        m = _mm_max_epi16(m, _mm_srli_si128(m, 8));
+        m = _mm_max_epi16(m, _mm_srli_si128(m, 4));
+        m = _mm_max_epi16(m, _mm_srli_si128(m, 2));
+        const int amax = _mm_extract_epi16(m, 0);
+        if (!amax) {
+            memset(qs, 0, 32);
+            dq[j] = 0;
+            continue;
+        }
+        const __m128 f = _mm_set1_ps(127.f / (float)amax);
+        _mm_storeu_si128((__m128i *)qs, _mm_packs_epi16(q8_round8(_mm256_castsi256_si128(plo), f), q8_round8(_mm256_extracti128_si256(plo, 1), f)));
+        _mm_storeu_si128((__m128i *)(qs + 16), _mm_packs_epi16(q8_round8(_mm256_castsi256_si128(phi), f), q8_round8(_mm256_extracti128_si256(phi, 1), f)));
+        dq[j] = f2h(d * (float)amax / 127.f);
+    }
+}
+
+static void (*row_to_q8_0_other)(uint32_t type, const void *row, int K, int8_t *qs, f16_t *d);
+
+#define IQ_Q8(BT, UNPACK)                                                     \
+    for (int i = 0; i < K / QK_K; i++) {                                     \
+        __m256i q[8], sc[8];                                                 \
+        float dd;                                                            \
+        UNPACK((const BT *)row + i, q, sc, &dd);                             \
+        iq_block_q8_0(q, sc, dd, qs + i * QK_K, d + i * 8);                  \
+    }                                                                        \
+    break;
+static void row_to_q8_0(uint32_t type, const void *row, int K, int8_t *qs, f16_t *d) {
+    switch (type) {
+    case GGML_IQ2_XXS: IQ_Q8(block_iq2_xxs, unpack_iq2_xxs)
+    case GGML_IQ2_XS: IQ_Q8(block_iq2_xs, unpack_iq2_xs)
+    case GGML_IQ2_S: IQ_Q8(block_iq2_s, unpack_iq2_s)
+    case GGML_IQ3_XXS: IQ_Q8(block_iq3_xxs, unpack_iq3_xxs)
+    case GGML_IQ3_S: IQ_Q8(block_iq3_s, unpack_iq3_s)
+    case GGML_IQ4_XS: IQ_Q8(block_iq4_xs, unpack_iq4_xs)
+    default: row_to_q8_0_other(type, row, K, qs, d);
+    }
+}
+#undef IQ_Q8
+
 /* IQ4_NL and Q5_0: 32-blocks with an f16 scale, like Q8_0 (the last Q8_K block may be partial) */
 static inline __m256i unpack_iq4_nl(const block_iq4_nl *b) { return iq4_values(b->qs); }
 
@@ -715,6 +770,8 @@ static float exp_sum(float *s, int n, float mx) {
 void kernels_init_avx2(Kernels *k) {
     k->silu_mul = silu_mul;
     k->exp_sum = exp_sum;
+    if (k->row_to_q8_0 != row_to_q8_0) row_to_q8_0_other = k->row_to_q8_0;
+    k->row_to_q8_0 = row_to_q8_0;
     k->name = "avx2";
     k->dot[GGML_Q4_K] = rows_q4_K;
     k->dot[GGML_Q5_K] = rows_q5_K;

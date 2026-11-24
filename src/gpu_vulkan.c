@@ -901,22 +901,18 @@ static void pack_rows(const VMat *x, int r0, int r1, uint8_t *dst) {
     }
     const uint8_t *src = x->host + (size_t)r0 * x->row_bytes;
     const size_t nblk = (size_t)(r1 - r0) * (size_t)(x->K / QK_K);
-    if (x->requant) {
-        float *f = (float *)malloc(sizeof(float) * (size_t)x->K);
+    if (x->requant) {   /* the SIMD conversion: the cache swaps experts while tokens are generated */
+        int8_t *qs = (int8_t *)malloc((size_t)x->K);
+        f16_t *d = (f16_t *)malloc(sizeof(f16_t) * (size_t)(x->K / QK8_0));
         for (int r = r0; r < r1; r++) {
-            dequant_row(x->requant, x->host + (size_t)r * x->row_bytes, f, x->K);
-            for (int i = 0; i < x->K / QK_K; i++, dst += Q80_GPU_BYTES)
-                for (int j = 0; j < QK_K / QK8_0; j++) {
-                    const float *y = f + i * QK_K + j * QK8_0;
-                    float amax = 0;
-                    for (int l = 0; l < QK8_0; l++) amax = fabsf(y[l]) > amax ? fabsf(y[l]) : amax;
-                    const float d = amax / 127.f, id = d > 0 ? 1.f / d : 0.f;
-                    for (int l = 0; l < QK8_0; l++) dst[j * QK8_0 + l] = (uint8_t)(int8_t)lrintf(y[l] * id);
-                    const f16_t h = f32_to_f16(d);
-                    memcpy(dst + QK_K + j * 2, &h, 2);
-                }
+            KS.row_to_q8_0(x->requant, x->host + (size_t)r * x->row_bytes, x->K, qs, d);
+            for (int i = 0; i < x->K / QK_K; i++, dst += Q80_GPU_BYTES) {
+                memcpy(dst, qs + i * QK_K, QK_K);
+                memcpy(dst + QK_K, d + i * (QK_K / QK8_0), 2 * (QK_K / QK8_0));
+            }
         }
-        free(f);
+        free(qs);
+        free(d);
         return;
     }
     if (x->kernel == K_Q8_0) {

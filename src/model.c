@@ -2133,6 +2133,29 @@ static void ik_attn_task(void *ctx, int task, int tid) {
     memcpy(c->tmp + (size_t)t * qd + (size_t)h * hd, acc, sizeof(float) * hd);
 }
 
+typedef struct {
+    Context *c;
+    const Layer *L;
+} IkActArgs;
+
+/* SITU of expert assignment `task`'s [gate | up] rows, quantized for the down matrix */
+static void ik_act_task(void *ctx, int task, int tid) {
+    (void)tid;
+    const IkActArgs *a = (const IkActArgs *)ctx;
+    Context *c = a->c;
+    const Model *m = c->m;
+    const int F = m->ff_exp, FP = (F + QK_K - 1) / QK_K * QK_K;
+    const float s = a->L->ik_gu_scale ? a->L->ik_gu_scale[c->a_slot[task]] : 1.f;
+    const float *g = c->ik.gu + (size_t)task * 2 * F, *u = g + F;
+    float *o = c->ik.act + (size_t)task * FP;
+    for (int i = 0; i < F; i++) {
+        const float gi = g[i] * s, ui = u[i] * s;
+        o[i] = m->situ_beta * tanhf(gi / m->situ_beta) / (1.f + expf(-gi)) * (m->situ_lb > 0 ? m->situ_lb * tanhf(ui / m->situ_lb) : ui);
+    }
+    for (int i = F; i < FP; i++) o[i] = 0;
+    KS.quantize_q8_K(o, c->ik.eq + (size_t)task * (FP / QK_K), FP);
+}
+
 /* the MoE of physical layer ip over the n rows of c->h, into c->out */
 static void ik_moe(Context *c, const Layer *L, int ip, int n) {
     const Model *m = c->m;
@@ -2205,17 +2228,8 @@ static void ik_moe(Context *c, const Layer *L, int ip, int n) {
                       nbd, cnt[e], c->ik.gu + (size_t)off[e] * 2 * F, 2 * F);
     job_run(c, CAT_EXP_GU);
     const int na = off[E];
-    for (int a = 0; a < na; a++) {
-        const float s = L->ik_gu_scale ? L->ik_gu_scale[c->a_slot[a]] : 1.f;
-        const float *g = c->ik.gu + (size_t)a * 2 * F, *u = g + F;
-        float *o = c->ik.act + (size_t)a * FP;
-        for (int i = 0; i < F; i++) {
-            const float gi = g[i] * s, ui = u[i] * s;
-            o[i] = m->situ_beta * tanhf(gi / m->situ_beta) / (1.f + expf(-gi)) * (m->situ_lb > 0 ? m->situ_lb * tanhf(ui / m->situ_lb) : ui);
-        }
-        for (int i = F; i < FP; i++) o[i] = 0;
-    }
-    quantize_rows(c->ik.act, na, FP, c->ik.eq);
+    IkActArgs aa = {c, L};
+    pool_run(c->pool, ik_act_task, &aa, na);
     job_clear(c);
     for (int e = 0; e < E; e++)
         if (cnt[e])

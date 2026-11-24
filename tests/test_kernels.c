@@ -119,6 +119,34 @@ int main(int argc, char **argv) {
     for (int ki = 0; ki < nk; ki++)
         for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++)
             if (ks[ki].dot[types[i]]) ok &= synth_check(ks[ki].name, &ks[ki], types[i], sizes[i]);
+    /* rows converted to Q8_0 (Vulkan's copy of the IQ experts): every SIMD set against the scalar one,
+     * within one step of the Q8_0 grid */
+    const uint32_t qt[] = { GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ2_S, GGML_IQ3_XXS, GGML_IQ3_S, GGML_IQ4_XS, GGML_Q4_K, GGML_Q6_K };
+    for (int ki = 1; ki < nk; ki++)
+        for (size_t i = 0; i < sizeof(qt) / sizeof(qt[0]); i++) {
+            const int K = 2304;
+            const size_t rb = row_bytes(qt[i], K), bsz = (size_t)ggml_type_size(qt[i]);
+            uint8_t *data = malloc(rb);
+            unsigned s = 5 + qt[i];
+            for (size_t j = 0; j < rb; j++) { s = s * 1664525u + 1013904223u; data[j] = (uint8_t)(s >> 24); }
+            for (size_t off = 0; off < rb; off += bsz) {
+                f16_t d = f32_to_f16(0.01f + 0.001f * (float)(off % 7));
+                memcpy(data + (qt[i] == GGML_Q6_K ? off + bsz - 2 : off), &d, 2);
+            }
+            int8_t qa[2304], qb[2304];
+            f16_t da[72], db[72];
+            K_scalar.row_to_q8_0(qt[i], data, K, qa, da);
+            ks[ki].row_to_q8_0(qt[i], data, K, qb, db);
+            double worst = 0;
+            for (int j = 0; j < K; j++) {
+                const double a = f16_to_f32(da[j / 32]) * qa[j], b = f16_to_f32(db[j / 32]) * qb[j];
+                const double step = f16_to_f32(da[j / 32]) + 1e-12;
+                if (fabs(a - b) / step > worst) worst = fabs(a - b) / step;
+            }
+            printf("%-7s to Q8_0 %-7s max diff %.2f steps %s\n", ks[ki].name, ggml_type_name(qt[i]), worst, worst <= 1.01 ? "OK" : "FAIL");
+            ok &= worst <= 1.01;
+            free(data);
+        }
     /* fp16 round trip */
     for (float f = -70000.f; f < 70000.f; f += 13.37f) {
         f16_t h = f32_to_f16(f);

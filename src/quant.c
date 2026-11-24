@@ -565,6 +565,21 @@ static float exp_sum_scalar(float *s, int n, float mx) {
     return sum;
 }
 
+static void row_to_q8_0_scalar(uint32_t type, const void *row, int K, int8_t *qs, f16_t *d) {
+    float y[QK_K];
+    for (int i = 0; i < K / QK_K; i++) {
+        dequant_row(type, (const uint8_t *)row + row_bytes(type, i * QK_K), y, QK_K);
+        for (int j = 0; j < QK_K / QK8_0; j++, qs += QK8_0) {
+            const float *b = y + j * QK8_0;
+            float amax = 0;
+            for (int l = 0; l < QK8_0; l++) amax = fabsf(b[l]) > amax ? fabsf(b[l]) : amax;
+            const float dd = amax / 127.f, id = dd > 0 ? 1.f / dd : 0.f;
+            for (int l = 0; l < QK8_0; l++) qs[l] = (int8_t)lrintf(b[l] * id);
+            *d++ = f32_to_f16(dd);
+        }
+    }
+}
+
 Kernels K_scalar;
 Kernels KS;
 
@@ -593,6 +608,7 @@ static void init_scalar(Kernels *k) {
     k->axpy_f16 = axpy_f16_scalar;
     k->silu_mul = silu_mul_scalar;
     k->exp_sum = exp_sum_scalar;
+    k->row_to_q8_0 = row_to_q8_0_scalar;
 }
 
 const char *quant_init(const char *force) {

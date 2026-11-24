@@ -62,6 +62,8 @@ typedef struct {
     void (*axpy_f16)(float a, const f16_t *x, float *y, int n);   /* y += a*x */
     void (*silu_mul)(float *g, const float *u, int n);            /* g = silu(g) * u */
     float (*exp_sum)(float *s, int n, float mx);                  /* s = exp(s - mx), returns sum */
+    /* one row of a supported type (K a multiple of 256) as Q8_0: K int8 values and an f16 scale per 32 */
+    void (*row_to_q8_0)(uint32_t type, const void *row, int K, int8_t *qs, f16_t *d);
 } Kernels;
 
 extern Kernels K_scalar;
