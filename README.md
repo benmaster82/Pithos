@@ -48,7 +48,9 @@ are validated too: [LFM2.5-8B-A1B](#lfm25-8b-a1b-the-middle-ground), a mixture o
 in 8 GB of RAM (about 22 tokens per second on the CPU alone), and the small
 [LFM3-1.7B](#lfm3-17b-small-and-fast): about 80 tokens per second with the GPU, 20 on the CPU alone.
 [LFM3-Audio-2B](#lfm3-audio-2b-speech-input-and-output-experimental) (experimental) adds speech: it
-transcribes, translates, speaks and holds voice conversations.
+transcribes, translates, speaks and holds voice conversations. Two models of other families run too,
+as experimental: [Qwen3.6-35B-A3B](#qwen36-35b-a3b-experimental), the largest, and
+[Inkling 2 Mini](#inkling-2-mini-experimental), a looped mixture of experts.
 
 **Pithos** is the engine and the server (in the myth, the *pithos* is Pandora's jar: it holds the
 model). **Pandora** is the agent in the web interface.
@@ -1166,8 +1168,8 @@ checkpoint and only processes the rest:
 
 | `--gpu` | What runs on the GPU | Best for |
 |---|---|---|
-| `auto` (default) | dense models (LFM3): the whole forward pass through Vulkan, on a **discrete NVIDIA GPU** only; models with experts (LFM2.5-24B and 8B), or without such a GPU: OpenCL as below, on a dedicated GPU; otherwise the CPU | not having to choose |
-| `vulkan` | the whole forward pass of dense models; the matmuls of models with experts (Windows, Linux; experimental) | LFM3, fastest generation measured |
+| `auto` (default) | dense models (LFM3), Qwen3.6 and Inkling 2 Mini: the whole forward pass through Vulkan, on a **discrete NVIDIA GPU** only (Qwen3.6 and Inkling keep their most used experts in VRAM, the others run on the CPU); the LFM2.5 models with experts (24B and 8B), or without such a GPU: OpenCL as below, on a dedicated GPU; otherwise the CPU | not having to choose |
+| `vulkan` | the whole forward pass of dense models, Qwen3.6 and Inkling 2 Mini; the matmuls of the LFM2.5 models with experts (Windows, Linux; experimental) | LFM3, Qwen3.6 and Inkling 2 Mini, fastest measured |
 | `d3d12` | the same through Direct3D 12 (Windows; Xbox in Game mode) | LFM3 on Windows, the Xbox |
 | `opencl` | hot experts and all dense layers in VRAM, the other experts on the CPU in parallel; on a dedicated GPU with an int8 dot product in hardware, the prompt matmuls and the resident experts of the prompt too | the MoE models (LFM2.5-24B, 8B), fastest measured |
 | `opencl+vulkan`, `opencl+d3d12` | OpenCL as above, with the prompt matmuls on the other backend | GPUs where OpenCL leaves the prompt on the CPU |
@@ -1207,11 +1209,12 @@ without its reasoning is processed again.
 
 ### Other models
 Any GGUF of the `lfm2` (dense), `lfm2moe` or `lfm3` architecture loads, as long as its tensors use
-the supported formats: Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16, F32. BF16, Q2_K, Q3_K and IQ formats are
-not supported. GPU acceleration needs Q4_K / Q6_K weights (the Q4_K_M files; a Q4_0 file runs on
-the CPU): MoE models keep their hot experts and
-dense layers in VRAM, dense models (LFM3) all their layers. Validated so far: LFM2.5-24B-A2B,
-LFM2.5-8B-A1B and LFM3-1.7B.
+the supported formats: Q4_K, Q5_K, Q6_K, Q8_0, Q5_0, Q4_0, NVFP4, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+IQ3_S, IQ4_NL, IQ4_XS, F16, F32. BF16, Q2_K, Q3_K and IQ1 are not supported. The `qwen35moe` and
+`inkling2_loop` architectures load too (Qwen3.6, Inkling 2 Mini; the latter also as Unsloth's IQ
+files). GPU acceleration of the LFM models needs Q4_K / Q6_K weights (the Q4_K_M files; a Q4_0 file
+runs on the CPU): MoE models keep their hot experts and dense layers in VRAM, dense models (LFM3)
+all their layers. Validated so far: LFM2.5-24B-A2B, LFM2.5-8B-A1B and LFM3-1.7B.
 
 `lfm3` adds to LFM2: an RMSNorm on the output of every block before the residual sum (sandwich
 norm), a sigmoid gate per head on the attention output, sliding-window attention (256 tokens) on 5
@@ -1239,7 +1242,7 @@ for each of the 30 convolution layers.
 | `src/gguf.c` | zero-copy GGUF reader on the memory-mapped file |
 | `src/tokenizer.c` | GPT-2 byte-level BPE with LFM2's pre-tokenizer and special tokens; generated Unicode tables (`tools/gen_unicode.py`) |
 | `src/model.c` | forward pass, KV cache, matmul scheduler, MoE, prefetch |
-| `src/quant.c`, `quant_avx2.c`, `quant_neon.c` | Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/F16/F32 formats; scalar, AVX2 and NEON kernels |
+| `src/quant.c`, `quant_avx2.c`, `quant_neon.c`, `iq_tables.h` | Q4_K/Q5_K/Q6_K/Q8_0/Q5_0/Q4_0/NVFP4/IQ/F16/F32 formats; scalar kernels for all, AVX2 for all, NEON for Q4_K and Q6_K |
 | `src/gpu_opencl.c`, `src/kernels.cl` | expert cache and dense layers in VRAM through OpenCL loaded at runtime |
 | `src/gpu_d3d12.c`, `src/kernels_dx.hlsl`, `src/kernels_dx_token.hlsl` | Direct3D 12 backend: matmul kernels and the other steps of the forward pass (compiled into `src/kernels_dx.h` by `tools\dx_shaders.cmd`, which needs `fxc` from the Windows SDK) |
 | `src/gpu_vulkan.c`, `src/kernels_vk.h` | Vulkan backend: the Direct3D 12 HLSL kernels compiled to SPIR-V (`tools\vk_shaders.cmd` or `tools/vk_shaders.sh`, which need `dxc` with SPIR-V support) |
@@ -1442,8 +1445,9 @@ for each of the 30 convolution layers.
 ## Limitations
 Planned improvements, in order of priority, are in [ROADMAP.md](ROADMAP.md).
 
-- Only the `lfm2` / `lfm2moe` / `lfm3` architectures. Formats Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, F16
-  and F32; on the GPU only Q4_K and Q6_K. With OpenCL only decoding runs on the GPU, and the prompt
+- Only the `lfm2` / `lfm2moe` / `lfm3` architectures, plus `qwen35moe` and `inkling2_loop`
+  (experimental). Formats: the K-quants Q4_K to Q6_K, Q8_0, Q5_0, Q4_0, NVFP4, the IQ2 / IQ3 / IQ4
+  codebooks, F16 and F32; on the GPU, for the LFM models, only Q4_K and Q6_K. With OpenCL only decoding runs on the GPU, and the prompt
   is read on the CPU. Direct3D 12 runs the whole forward pass of dense models only: for MoE models
   it takes just the prompt matmuls. `--ppl` (logits of every token) uses its matmuls-only path.
   Vulkan, the same.
