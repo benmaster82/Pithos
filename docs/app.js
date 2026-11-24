@@ -1,27 +1,28 @@
 'use strict';
 
 const REPO = 'https://github.com/benmaster82/Pithos';
-// The models, as in models.tsv. big is the engine's default (no -m needed).
+// The models, as in models.tsv. big is the engine's default (no -m needed). The picker groups them by
+// tier (the GB of RAM they need), in this order; role is their line in the list, tag an optional label.
 const MODELS = {
-  big:{id:'lfm2.5-24b',name:'LFM2.5-24B-A2B',file:'LFM2.5-24B-A2B-Q4_K_M.gguf',
+  big:{id:'lfm2.5-24b',name:'LFM2.5-24B-A2B',file:'LFM2.5-24B-A2B-Q4_K_M.gguf',tier:16,role:'The reference · MoE',
     url:'https://huggingface.co/LiquidAI/LFM2.5-24B-A2B-GGUF/resolve/0912d33141f77e10705345a6732bfd83f0252fdc/LFM2.5-24B-A2B-Q4_K_M.gguf',
     hash:'d3334405b96228eb9908cdebb5c6194908f2da64282bda852afc3a3910c64e7d',
     download:'14.5 GB',ram:'16',gpu:'12–22 tok/s',cpu:'5–8 tok/s',cpuBench:'benchmark 11–15',
     disk:'At least 15 GB free for the model',diskDetail:'About 14.5 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
     blurb:'24 billion parameters, about 2 billion active per token. The deepest answers; runs from disk when RAM is short.'},
-  mid:{id:'lfm2.5-8b',name:'LFM2.5-8B-A1B',file:'LFM2.5-8B-A1B-Q4_K_M.gguf',
+  mid:{id:'lfm2.5-8b',name:'LFM2.5-8B-A1B',file:'LFM2.5-8B-A1B-Q4_K_M.gguf',tier:8,role:'Fast on the CPU · MoE',
     url:'https://huggingface.co/LiquidAI/LFM2.5-8B-A1B-GGUF/resolve/49c14831707011e64d70b2ebd8462ba08d608434/LFM2.5-8B-A1B-Q4_K_M.gguf',
     hash:'4923ec14f06b968b74d663e5949867d2d9c3bf13a20b8be1a9f9af39989b2bb0',
     download:'5.2 GB',ram:'8',gpu:'~50 tok/s',cpu:'~20 tok/s',
     disk:'At least 6 GB free for the model',diskDetail:'About 5.2 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
     blurb:'8.3 billion parameters, 1.5 billion active per token. A larger model that fits in 8 GB of RAM and stays fast on the CPU alone.'},
-  small:{id:'lfm3-1.7b',name:'LFM3-1.7B',file:'LFM3-1.7B-Q4_K_M.gguf',
+  small:{id:'lfm3-1.7b',name:'LFM3-1.7B',file:'LFM3-1.7B-Q4_K_M.gguf',tier:4,role:'Small and fast · dense',
     url:'https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/bad5729bba61d076fff20d2548e62526665af215/LFM3-1.7B-Q4_K_M.gguf',
     hash:'3793e1e6e2266919d6e015287221b41100175a98eddaba92e111aed3b05c93c4',
     download:'1.1 GB',ram:'4',gpu:'~80 tok/s',cpu:'~20 tok/s',
     disk:'At least 2 GB free for the model',diskDetail:'About 1.1 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
     blurb:'1.7 billion parameters with sliding-window attention. Quick answers on modest hardware; the whole model fits in a 4 GB GPU.'},
-  audio:{id:'lfm3-audio-2b',name:'LFM3-Audio-2B',file:'LFM3-Audio-2B-Q4_K_M.gguf',
+  audio:{id:'lfm3-audio-2b',name:'LFM3-Audio-2B',file:'LFM3-Audio-2B-Q4_K_M.gguf',tier:4,role:'Hears and speaks',tag:'experimental',
     url:'https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF/resolve/39670cb5c42e9c4bfe046519ba7ffbe47f9552ad/LFM3-Audio-2B-Q4_K_M.gguf',
     hash:'9a773289bd321ed879cd3a76545f6aca506e403851a45fb315420aee45625be2',
     projector:{file:'mmproj-LFM3-Audio-2B-Q4_K_M.gguf',download:'172 MB',
@@ -30,12 +31,19 @@ const MODELS = {
     download:'1.3 GB',ram:'4',gpu:'2.7× real time',cpu:'~1× real time',cpuBench:'speech output',
     disk:'At least 2 GB free for the model',diskDetail:'About 1.3 GB to download: the model and its audio projector. Allow extra room for the compiler and, if used, Ubuntu.',
     blurb:'LFM3 with ears and a voice (experimental): transcription and translation in 18 languages, speech output, and voice conversations on the /talk page.'},
-  qwen:{id:'qwen3.6-35b',name:'Qwen3.6-35B-A3B',file:'Qwen3.6-35B-A3B-Q4_K_M.gguf',
+  qwen:{id:'qwen3.6-35b',name:'Qwen3.6-35B-A3B',file:'Qwen3.6-35B-A3B-Q4_K_M.gguf',tier:16,role:'The largest · MoE',tag:'experimental',
     url:'https://huggingface.co/ggml-org/Qwen3.6-35B-A3B-GGUF/resolve/52f9f9b8052fb9c8b69bba4a95eda0f319ac3d2a/Qwen3.6-35B-A3B-Q4_K_M.gguf',
     hash:'f4ffe03c9139e6a905a5d346f77d9fabdd179367c3280dfd005d1e75ca5ed8c8',
     download:'20.5 GB',ram:'16',gpu:'10–13 tok/s',gpuBench:'benchmark 22',cpu:'5–7 tok/s',cpuBench:'benchmark 7.3',
     disk:'At least 21 GB free for the model',diskDetail:'About 20.5 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
-    blurb:'35 billion parameters, about 3 billion active per token, with Gated DeltaNet layers (experimental). The largest: it reasons and calls tools, runs from disk when RAM is short, and is at its best with a GPU.'}
+    blurb:'35 billion parameters, about 3 billion active per token, with Gated DeltaNet layers (experimental). The largest: it reasons and calls tools, runs from disk when RAM is short, and is at its best with a GPU.'},
+  inkling:{id:'inkling-2-mini',name:'Inkling 2 Mini',file:'Inkling-2-Mini-UD-IQ3_XXS.gguf',tier:16,role:'Looped MoE · coding and agents',tag:'experimental',
+    saved:'Inkling-2-Mini-UD-IQ3_XXS.gguf_file',
+    url:'https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/8078d149286eec7193795413b9e0643da6d11fa1/Mainline_Support/Inkling-2-Mini-UD-IQ3_XXS.gguf_file',
+    hash:'fd9ccedae17c1bb89744612fbb46730b5275f2a342133d0419776bd1ae311657',
+    download:'11.7 GB',ram:'16',gpu:'~9.5 tok/s',cpu:'4.5–5.5 tok/s',
+    disk:'At least 12 GB free for the model',diskDetail:'About 11.7 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
+    blurb:'26 billion parameters in a looped transformer: the middle 12 of its 24 layers run three times, 48 per token (experimental). Strong at coding and agents for its size; this 3-bit file fits in 16 GB of RAM.'}
 };
 // " -m models/FILE" for a model that is not the engine's default
 const modelArg = (m, windows) => m === MODELS.big ? '' : windows ? ` -m models\\${m.file}` : ` -m models/${m.file}`;
@@ -56,7 +64,7 @@ const buildGuide = m => ({
         command:'pacman -S mingw-w64-ucrt-x86_64-gcc', context:'MSYS2 UCRT64 · not PowerShell',
         note:'Already have MSYS2 GCC or Visual Studio/Build Tools MSVC? Skip to step 2. WSL2 is not needed.'},
       {title:'Set up Pithos and its model.', label:'02 / PROGRAM + MODEL',
-        description:`<p><strong>1.</strong> Download and extract the project ZIP. Open <strong>Pithos-main</strong>, type <code>powershell</code> in the address bar, and press Enter.</p><p><strong>2.</strong> Run the commands below. Then download the model and move <strong>${m.file}</strong>${m.projector?` and its audio projector <strong>${m.projector.file}</strong>`:''} into the <strong>models</strong> folder you just created.</p>`,
+        description:`<p><strong>1.</strong> Download and extract the project ZIP. Open <strong>Pithos-main</strong>, type <code>powershell</code> in the address bar, and press Enter.</p><p><strong>2.</strong> Run the commands below. Then download the model${m.saved?`, rename <strong>${m.saved}</strong> to <strong>${m.file}</strong>,`:''} and move <strong>${m.file}</strong>${m.projector?` and its audio projector <strong>${m.projector.file}</strong>`:''} into the <strong>models</strong> folder you just created.</p>`,
         command:'.\\build.cmd\nNew-Item -ItemType Directory -Force models', context:'PowerShell · inside Pithos-main',
         actions:[{url:`${REPO}/archive/refs/heads/main.zip`,label:'Project · ZIP'},{url:m.url,label:`Model · about ${m.projector?'1.1 GB':m.download}`},
           ...(m.projector?[{url:m.projector.url,label:`Audio projector · ${m.projector.download}`}]:[])],
@@ -153,7 +161,27 @@ function renderGuide() {
 // The model picker at the top: figures, requirements and every command on the page follow it.
 function renderModel() {
   const m=MODELS[state.model];
-  document.querySelectorAll('[data-model]').forEach(button=>{const selected=button.dataset.model===state.model;button.setAttribute('aria-selected',String(selected));button.tabIndex=selected?0:-1;});
+  document.querySelectorAll('[data-tier]').forEach(button=>button.setAttribute('aria-pressed',String(Number(button.dataset.tier)===m.tier)));
+  const list=document.querySelector('.model-tabs');
+  document.querySelector('.tier-more')?.remove();
+  list.replaceChildren(...Object.entries(MODELS).filter(([,x])=>x.tier===m.tier).map(([key,x])=>{
+    const button=document.createElement('button');
+    button.id=`model-${key}`;button.type='button';button.dataset.model=key;
+    button.setAttribute('role','tab');button.setAttribute('aria-controls','model-card');
+    const selected=key===state.model;button.setAttribute('aria-selected',String(selected));button.tabIndex=selected?0:-1;
+    button.innerHTML=`<strong>${x.name}</strong><span>${x.role}</span>${x.tag?`<em>${x.tag}</em>`:''}`;
+    button.addEventListener('click',()=>{state.model=key;renderGuide();});
+    return button;
+  }));
+  // more memory runs the smaller models too: a link to the tier below
+  const below=[4,8,16].filter(t=>t<m.tier);
+  if(below.length){
+    const more=document.createElement('button');
+    more.type='button';more.className='tier-more';
+    more.textContent=`Also runs here: the ${below.reverse().map(t=>`${t} GB`).join(' and ')} models →`;
+    more.addEventListener('click',()=>document.querySelector(`[data-tier="${below[0]}"]`).click());
+    list.after(more);
+  }
   document.querySelector('#model-card').setAttribute('aria-labelledby',`model-${state.model}`);
   document.querySelector('#model-size').textContent=m.download;
   document.querySelector('#model-ram').textContent=`${m.ram} GB`;
@@ -213,7 +241,10 @@ function renderMode() {
 document.querySelectorAll('[data-os]').forEach(button=>button.addEventListener('click',()=>{state.os=button.dataset.os;state.step=0;renderGuide();}));
 document.querySelectorAll('[data-step]').forEach(button=>button.addEventListener('click',()=>{state.step=Number(button.dataset.step);renderGuide();}));
 document.querySelectorAll('[data-mode]').forEach(button=>button.addEventListener('click',()=>{activeMode=button.dataset.mode;renderMode();}));
-document.querySelectorAll('[data-model]').forEach(button=>button.addEventListener('click',()=>{state.model=button.dataset.model;renderGuide();}));
+document.querySelectorAll('[data-tier]').forEach(button=>button.addEventListener('click',()=>{
+  const tier=Number(button.dataset.tier);
+  if(MODELS[state.model].tier!==tier){state.model=Object.keys(MODELS).find(key=>MODELS[key].tier===tier);renderGuide();}
+}));
 document.querySelector('#guide-back').addEventListener('click',()=>{state.step=Math.max(0,state.step-1);renderGuide();});
 document.querySelector('#guide-next').addEventListener('click',()=>{if(!state.done[state.os].includes(state.step))state.done[state.os].push(state.step);if(state.step<2)state.step++;renderGuide();document.querySelector('.step-title').focus({preventScroll:true});});
 
@@ -223,7 +254,7 @@ function bindTabKeyboard(container,selector) {
     const tabs=[...container.querySelectorAll(selector)];const index=tabs.indexOf(document.activeElement);
     if(index<0)return;event.preventDefault();
     const next=event.key==='Home'?0:event.key==='End'?tabs.length-1:(index+(event.key==='ArrowRight'?1:-1)+tabs.length)%tabs.length;
-    tabs[next].click();tabs[next].focus();
+    tabs[next].click();(tabs[next].id&&container.querySelector(`#${tabs[next].id}`)||tabs[next]).focus();   /* the model list is made again on click */
   });
 }
 bindTabKeyboard(document.querySelector('.os-tabs'),'[data-os]');
