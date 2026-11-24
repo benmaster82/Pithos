@@ -406,8 +406,8 @@ transformer: 24 layers, the middle 12 of which run three times with the same wei
 goes through 48 layers. Its feed-forward layers are mixtures of 128 experts, 8 per token (26.4 billion
 parameters, 3.4 billion active per layer pass). Attention has no rotary positions: a learned
 relative-position bias, 20 layers with a 1,024-token window and 4 over the whole context; the later
-passes of the loop get messages from the earlier ones. The experts are stored in NVFP4, the 4-bit
-format the model was trained in. It reasons before it answers (its "thinking effort", set with
+passes of the loop get messages from the earlier ones. Its experts were trained in NVFP4, a 4-bit
+format. It reasons before it answers (its "thinking effort", set with
 `--reasoning` or `reasoning_effort`) and calls tools in JSON, with the same chat, server, Pandora and
 terminal agent as the other models. Images are not supported yet.
 
