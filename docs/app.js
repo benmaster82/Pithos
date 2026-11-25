@@ -43,7 +43,14 @@ const MODELS = {
     hash:'fd9ccedae17c1bb89744612fbb46730b5275f2a342133d0419776bd1ae311657',
     download:'11.7 GB',ram:'16',gpu:'~9.5 tok/s',cpu:'4.5–5.5 tok/s',
     disk:'At least 12 GB free for the model',diskDetail:'About 11.7 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
-    blurb:'26 billion parameters in a looped transformer: the middle 12 of its 24 layers run three times, 48 per token (experimental). Strong at coding and agents for its size; this 3-bit file fits in 16 GB of RAM (the 4-bit IQ4_XS and Q4_K_M files run too).'}
+    blurb:'26 billion parameters in a looped transformer: the middle 12 of its 24 layers run three times, 48 per token (experimental). Strong at coding and agents for its size; this 3-bit file fits in 16 GB of RAM (the 4-bit IQ4_XS and Q4_K_M files run too).'},
+  inklingSmall:{id:'inkling-2-mini-iq1m',name:'Inkling 2 Mini',file:'Inkling-2-Mini-UD-IQ1_M.gguf',tier:12,role:'Looped MoE · the smallest file',tag:'experimental',
+    saved:'Inkling-2-Mini-UD-IQ1_M.gguf_file',
+    url:'https://huggingface.co/unsloth/Inkling-2-Mini-GGUF/resolve/8078d149286eec7193795413b9e0643da6d11fa1/Mainline_Support/Inkling-2-Mini-UD-IQ1_M.gguf_file',
+    hash:'af7b45e1c0097fb2602d4c69abf72a009cad78e54201da2265853f5ef11a514a',
+    download:'8.0 GB',ram:'12',gpu:'~10 tok/s',cpu:'~5 tok/s',
+    disk:'At least 9 GB free for the model',diskDetail:'About 8.0 GB to download. Allow extra room for the compiler and, if used, Ubuntu.',
+    blurb:'Inkling 2 Mini in Unsloth\'s smallest file, 1–2 bits per weight (experimental): it fits in 12 GB of RAM and is a little faster than the 3-bit file, at a lower quality.'}
 };
 // " -m models/FILE" for a model that is not the engine's default
 const modelArg = (m, windows) => m === MODELS.big ? '' : windows ? ` -m models\\${m.file}` : ` -m models/${m.file}`;
@@ -174,11 +181,12 @@ function renderModel() {
     return button;
   }));
   // more memory runs the smaller models too: a link to the tier below
-  const below=[4,8,16].filter(t=>t<m.tier);
+  const below=[4,8,12,16].filter(t=>t<m.tier);
   if(below.length){
     const more=document.createElement('button');
     more.type='button';more.className='tier-more';
-    more.textContent=`Also runs here: the ${below.reverse().map(t=>`${t} GB`).join(' and ')} models →`;
+    const sizes=below.reverse().map(t=>`${t} GB`);
+    more.textContent=`Also runs here: the ${sizes.length>1?`${sizes.slice(0,-1).join(', ')} and ${sizes.at(-1)}`:sizes[0]} models →`;
     more.addEventListener('click',()=>document.querySelector(`[data-tier="${below[0]}"]`).click());
     list.after(more);
   }
