@@ -413,17 +413,21 @@ format. It reasons before it answers (its "thinking effort", set with
 `--reasoning` or `reasoning_effort`) and calls tools in JSON, with the same chat, server, Pandora and
 terminal agent as the other models. Images are not supported yet.
 
-Three of Unsloth's files were tested with Pithos, all from
+Four of Unsloth's files were tested with Pithos, all from
 [unsloth/Inkling-2-Mini-GGUF](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), folder
 `Mainline_Support` (the llama.cpp layout; there they are named `.gguf_file`: rename them to
 `.gguf`). The 3-bit one is the default: it fits in 16 GB of RAM with everything else, while the two
-4-bit ones read their less used experts from the disk on 16 GB.
+4-bit ones read their less used experts from the disk on 16 GB. The smallest one (1–2 bits) fits in
+12 GB and is a little faster, but it is further from the original: against the logits of the Q4_K_M
+file its KL divergence is 0.246 and its top token the same 85.6% of the time (the 3-bit file: 0.049
+and 92.9%).
 
 | File | Size | Experts | Against llama.cpp, same file | `bash build.sh` |
 |---|---:|---|---|---|
 | **`Inkling-2-Mini-UD-IQ3_XXS.gguf`** (default) | 10.9 GiB | IQ3_XXS and IQ2, NVFP4, IQ4_NL | same top token 97.4%, KL divergence 0.011 | `--download-model=inkling-2-mini` |
 | `Inkling-2-Mini-UD-IQ4_XS.gguf` | 14.7 GiB | NVFP4, IQ4_XS, IQ4_NL, Q5_0, Q4_K / Q5_K | 97.1%, 0.008 | `--download-model=inkling-2-mini-iq4xs` |
 | `Inkling-2-Mini-UD-Q4_K_M.gguf` | 15.5 GiB | NVFP4, Q5_K, Q8_0 | 97.1%, 0.011 | `--download-model=inkling-2-mini-q4` |
+| `Inkling-2-Mini-UD-IQ1_M.gguf` (smallest) | 7.5 GiB | IQ1_S and IQ2, Q2_0, NVFP4 | 96.9%, 0.011 | `--download-model=inkling-2-mini-iq1m` |
 
 With Vulkan (the default for this model on a discrete NVIDIA GPU) every layer runs on the GPU and the
 routed experts on the CPU, the most used of them also in the VRAM that is left (about 450, 1.9 GB on a
@@ -435,6 +439,7 @@ last positions, so the KV cache takes about 32 KB per token.
 | UD-IQ3_XXS | **17–19 / 9.6–9.7** | 11 / 4.6–5.5 | 5.5–6.1 / 4.0–4.6 |
 | UD-IQ4_XS | 7.0 / 8.9–9.3 | 5.6–7.2 / 4.3–4.6 | 5.2 / 2.9 |
 | UD-Q4_K_M | 6.0 / 8.1–8.4 | 5.1–7.1 / 3.9–4.2 | 2.9–5.0 / 3.2 |
+| UD-IQ1_M | 18–20 / 10.0 | 11 / 5.3 | 29.6 / 7.0 |
 
 Pithos: a 249-token prompt, then 128 tokens; llama.cpp: `llama-bench` with 256 and 64–128. Each token
 reads about 1.3 GB of experts with the 3-bit file, twice as much as Qwen3.6. The KL divergence is
@@ -446,6 +451,7 @@ the same ids as Hugging Face's, and the chat template the same text as the model
 | `Inkling-2-Mini-UD-IQ3_XXS.gguf` | 11,663,310,784 | `fd9ccedae17c1bb89744612fbb46730b5275f2a342133d0419776bd1ae311657` |
 | `Inkling-2-Mini-UD-IQ4_XS.gguf` | 15,733,756,512 | `374970bf6f151fc50da49419751c3e77b82e373a3b9445ded617bd386cd12163` |
 | `Inkling-2-Mini-UD-Q4_K_M.gguf` | 16,610,544,608 | `78fcedcf93c5d1bfe83e225513b71392bb52259be0eaa5f8899c856a2e5834ae` |
+| `Inkling-2-Mini-UD-IQ1_M.gguf` | 8,024,442,304 | `af7b45e1c0097fb2602d4c69abf72a009cad78e54201da2265853f5ef11a514a` |
 
 Keep about 1 GB more than the file free on the disk. License: Apache 2.0 (see the model card).
 
@@ -1216,12 +1222,12 @@ without its reasoning is processed again.
 
 ### Other models
 Any GGUF of the `lfm2` (dense), `lfm2moe` or `lfm3` architecture loads, as long as its tensors use
-the supported formats: Q4_K, Q5_K, Q6_K, Q8_0, Q5_0, Q4_0, NVFP4, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
-IQ3_S, IQ4_NL, IQ4_XS, F16, F32. BF16, Q2_K, Q3_K and IQ1 are not supported. The `qwen35moe` and
-`inkling2_loop` architectures load too (Qwen3.6, Inkling 2 Mini; the latter also as Unsloth's IQ
-files). GPU acceleration of the LFM models needs Q4_K / Q6_K weights (the Q4_K_M files; a Q4_0 file
-runs on the CPU): MoE models keep their hot experts and dense layers in VRAM, dense models (LFM3)
-all their layers. Validated so far: LFM2.5-24B-A2B, LFM2.5-8B-A1B and LFM3-1.7B.
+the supported formats: Q4_K, Q5_K, Q6_K, Q8_0, Q5_0, Q4_0, Q2_0, NVFP4, IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S,
+IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS, F16, F32. BF16, Q2_K, Q3_K, IQ1_M and MXFP4 are not supported. The
+`qwen35moe` and `inkling2_loop` architectures load too (Qwen3.6, Inkling 2 Mini; the latter also as
+Unsloth's IQ files). GPU acceleration of the LFM models needs Q4_K / Q6_K weights (the Q4_K_M files;
+a Q4_0 file runs on the CPU): MoE models keep their hot experts and dense layers in VRAM, dense
+models (LFM3) all their layers. Validated so far: LFM2.5-24B-A2B, LFM2.5-8B-A1B and LFM3-1.7B.
 
 `lfm3` adds to LFM2: an RMSNorm on the output of every block before the residual sum (sandwich
 norm), a sigmoid gate per head on the attention output, sliding-window attention (256 tokens) on 5

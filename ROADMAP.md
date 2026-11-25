@@ -151,7 +151,8 @@ for it, few and simple, since LFM3-Audio is a ~2B model:
 Runs on the CPU and on Vulkan (every layer on the GPU, the routed experts on the CPU, the most used
 ones in VRAM, NVFP4 and IQ2 / IQ3_XXS). Reference laptop, UD-IQ3_XXS (it fits in 16 GB of RAM):
 prompt 17–19 tok/s, generation 9.6–9.7 tok/s with Vulkan. About 40% of each token's experts still
-run on the CPU, and they set the speed of generation.
+run on the CPU, and they set the speed of generation. The smallest file, UD-IQ1_M (12 GB of RAM),
+generates 10.0 tok/s, with a lower quality.
 
 - [ ] **Images**: the vision encoder (a 23-layer ViT, `mmproj-F16.gguf`) and the image blocks of the
   chat template (`<|content_image|>`); today image parts are refused.
@@ -161,6 +162,9 @@ run on the CPU, and they set the speed of generation.
   Q5_K and Q8_0 rows of 1,152 values); the expert cache has slots of one size, so they need slots of
   their own.
 - [ ] **IQ4_XS and IQ3_S on the GPU**: the CPU reads them, Vulkan converts them to Q8_0.
+- [ ] **A compact VRAM layout for the 1–2-bit experts**: on the GPU the IQ1_S and IQ2 experts take
+  4.6 bits a value (as nibbles), so the UD-IQ1_M file keeps about as many in VRAM as the 3-bit one
+  (~400). Keeping their own blocks with the grid tables on the GPU would fit about twice as many.
 - [ ] **Smaller session files**: every checkpoint of a conversation holds the window layers' last
   positions (up to ~164 MB); consecutive checkpoints share most of them.
 - [ ] **Direct3D 12 and OpenCL**: Vulkan only for now.
@@ -170,6 +174,8 @@ run on the CPU, and they set the speed of generation.
   where every expert fits in VRAM.
 
 ## Done
+- Next release: Inkling 2 Mini's smallest file, UD-IQ1_M (7.5 GiB, for 12 GB of RAM): the IQ1_S and
+  Q2_0 formats on the CPU (AVX2) and on Vulkan, `build.sh --download-model=inkling-2-mini-iq1m`.
 - v0.8.5: Inkling 2 Mini (experimental), on the CPU and with Vulkan (every layer on the GPU, the
   routed experts on the CPU, the most used ones in VRAM): UD-IQ3_XXS by default, 17–19 tok/s of prompt
   and 9.6–9.7 of generation on the reference laptop; the NVFP4, Q5_0 and IQ2 / IQ3 / IQ4 weight
