@@ -149,7 +149,7 @@ int main(int argc, char **argv) {
             free(data);
         }
     /* rows in Vulkan's nibble layout (mv_iq), decoded back here: the same values as dequant_row */
-    const uint32_t nt4[] = { GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ2_S, GGML_IQ3_XXS };
+    const uint32_t nt4[] = { GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ2_S, GGML_IQ3_XXS, GGML_IQ1_S };
     for (int ki = 1; ki < nk; ki++)
         for (size_t i = 0; ks[ki].row_to_iq4 && i < sizeof(nt4) / sizeof(nt4[0]); i++) {
             const int K = 2304;
@@ -166,8 +166,8 @@ int main(int argc, char **argv) {
             dequant_row(nt4[i], data, ref, K);
             double worst = 0;
             for (int j = 0; good && j < K; j++) {
-                const int b = j / QK_K, two = scb[b * 16] >> 7, c = (nib[j / 2] >> (4 * (j & 1))) & 15, m = c & 7;
-                const int mag = two ? (m == 0 ? 8 : m == 1 ? 25 : 43) : 8 * m + (m == 7 ? 6 : 4);
+                const int b = j / QK_K, two = scb[b * 16] >> 7, one = scb[b * 16] >> 6 & 1, c = (nib[j / 2] >> (4 * (j & 1))) & 15, m = c & 7;
+                const int mag = one ? (m == 0 ? 1 : m == 1 ? 7 : 9) : two ? (m == 0 ? 8 : m == 1 ? 25 : 43) : 8 * m + (m == 7 ? 6 : 4);
                 const double v = dd[b] * (scb[j / 16] & 31) * (c & 8 ? -mag : mag);
                 if (fabs(v - ref[j]) > worst) worst = fabs(v - ref[j]);
             }

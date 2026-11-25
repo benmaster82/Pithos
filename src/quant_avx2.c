@@ -758,13 +758,20 @@ static void row_to_q8_0(uint32_t type, const void *row, int K, int8_t *qs, f16_t
 }
 #undef IQ_Q8
 
-/* an unpacked IQ2 / IQ3_XXS block as nibbles: the magnitude's index ((|q| - 8) >> 4 of 8 25 43, or
- * (|q| - 4) >> 3 of 4 12 .. 62) in bits 0-2, the sign in bit 3; value 2k in the low nibble of byte k */
-static inline void iq_block_nib(const __m256i q[8], const __m256i sc[8], int two, uint8_t *nib, uint8_t *scb) {
-    const __m256i base = _mm256_set1_epi8(two ? 8 : 4), m7 = _mm256_set1_epi8(7), m8 = _mm256_set1_epi8(8);
+/* an unpacked IQ1_S / IQ2 / IQ3_XXS block (mode 2, 1, 0) as nibbles: the magnitude's index (of 1 7 9,
+ * (|q| - 8) >> 4 of 8 25 43, or (|q| - 4) >> 3 of 4 12 .. 62) in bits 0-2, the sign in bit 3; value 2k
+ * in the low nibble of byte k */
+static inline void iq_block_nib(const __m256i q[8], const __m256i sc[8], int mode, uint8_t *nib, uint8_t *scb) {
+    const __m256i base = _mm256_set1_epi8(mode == 1 ? 8 : 4), m7 = _mm256_set1_epi8(7), m8 = _mm256_set1_epi8(8);
     for (int j = 0; j < 8; j++) {
-        const __m256i a = _mm256_sub_epi8(_mm256_abs_epi8(q[j]), base);
-        __m256i c = _mm256_and_si256(two ? _mm256_srli_epi16(a, 4) : _mm256_srli_epi16(a, 3), m7);
+        __m256i c;
+        if (mode == 2) {
+            const __m256i a = _mm256_abs_epi8(q[j]);
+            c = _mm256_sub_epi8(_mm256_setzero_si256(), _mm256_add_epi8(_mm256_cmpgt_epi8(a, _mm256_set1_epi8(1)), _mm256_cmpgt_epi8(a, m7)));
+        } else {
+            const __m256i a = _mm256_sub_epi8(_mm256_abs_epi8(q[j]), base);
+            c = _mm256_and_si256(mode ? _mm256_srli_epi16(a, 4) : _mm256_srli_epi16(a, 3), m7);
+        }
         c = _mm256_or_si256(c, _mm256_and_si256(_mm256_cmpgt_epi8(_mm256_setzero_si256(), q[j]), m8));
         const __m256i pr = _mm256_maddubs_epi16(c, _mm256_set1_epi16(0x1001));   /* c[2k] + 16 c[2k+1] */
         const __m256i pk = _mm256_permute4x64_epi64(_mm256_packus_epi16(pr, pr), 0x08);
@@ -772,14 +779,14 @@ static inline void iq_block_nib(const __m256i q[8], const __m256i sc[8], int two
         scb[2 * j] = (uint8_t)_mm256_extract_epi16(sc[j], 0);
         scb[2 * j + 1] = (uint8_t)_mm256_extract_epi16(sc[j], 8);
     }
-    if (two) scb[0] |= 0x80;
+    if (mode) scb[0] |= mode == 1 ? 0x80 : 0x40;
 }
 
-#define IQ_NIB(BT, UNPACK, TWO)                                                \
+#define IQ_NIB(BT, UNPACK, MODE)                                               \
     for (int i = 0; i < K / QK_K; i++) {                                      \
         __m256i q[8], s[8];                                                   \
         UNPACK((const BT *)row + i, q, s, d + i);                             \
-        iq_block_nib(q, s, TWO, nib + i * (QK_K / 2), sc + i * (QK_K / 16));  \
+        iq_block_nib(q, s, MODE, nib + i * (QK_K / 2), sc + i * (QK_K / 16)); \
     }                                                                         \
     return 1;
 static int row_to_iq4(uint32_t type, const void *row, int K, uint8_t *nib, uint8_t *sc, float *d) {
@@ -788,6 +795,7 @@ static int row_to_iq4(uint32_t type, const void *row, int K, uint8_t *nib, uint8
     case GGML_IQ2_XS: IQ_NIB(block_iq2_xs, unpack_iq2_xs, 1)
     case GGML_IQ2_S: IQ_NIB(block_iq2_s, unpack_iq2_s, 1)
     case GGML_IQ3_XXS: IQ_NIB(block_iq3_xxs, unpack_iq3_xxs, 0)
+    case GGML_IQ1_S: IQ_NIB(block_iq1_s, unpack_iq1_s, 2)
     default: return 0;
     }
 }

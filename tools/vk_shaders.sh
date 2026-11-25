@@ -28,6 +28,8 @@ cat "$TMP/mvx_nvfp4.h" >> "$TMP/out.h"
 # IQ2 / IQ3_XXS as nibbles (Inkling's smaller files), on its own as well
 "$DXC" $OPT -D MV_EXPERTS -D MV_IQ -E mv_iq -Vn g_vk_mvx_iq -Fh "$TMP/mvx_iq.h" src/kernels_dx.hlsl >/dev/null || { echo "[vk] shader compilation failed"; exit 1; }
 cat "$TMP/mvx_iq.h" >> "$TMP/out.h"
+"$DXC" $OPT -D MV_EXPERTS -D MV_Q2 -E mv_q2_0 -Vn g_vk_mvx_q2_0 -Fh "$TMP/mvx_q2_0.h" src/kernels_dx.hlsl >/dev/null || { echo "[vk] shader compilation failed"; exit 1; }
+cat "$TMP/mvx_q2_0.h" >> "$TMP/out.h"
 # the matmul kernels again for Intel GPUs (see kernels_dx.hlsl)
 for e in mm_q4_K mm_q6_K mm_q8_0 mv_q4_K mv_q6_K mv_q8_0; do
     "$DXC" $OPT -D MM_INTEL -D MV_LANES=8 -D MV_LOG2=3 -D MV_GROUP=128 -D MV_SWAR -E $e -Vn g_vk_${e}_intel -Fh "$TMP/$e.h" src/kernels_dx.hlsl >/dev/null || { echo "[vk] shader compilation failed"; exit 1; }

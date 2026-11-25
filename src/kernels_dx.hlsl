@@ -541,14 +541,14 @@ void mv_nvfp4(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
 #endif
 
 #ifdef MV_IQ      // compiled on its own too
-// IQ2_XXS/XS/S and IQ3_XXS experts (Inkling's smaller files), recoded on upload: their codebooks use
-// 3 magnitudes (8 25 43, the IQ2 ones) or 8 (4 12 .. 52 62, IQ3_XXS), so each value is a nibble,
+// IQ1_S, IQ2_XXS/XS/S and IQ3_XXS experts (Inkling's smaller files), recoded on upload: their codebooks use
+// 3 magnitudes (1 7 9, IQ1_S times 8; 8 25 43, the IQ2 ones) or 8 (4 12 .. 52 62, IQ3_XXS), so each value is a nibble,
 // its magnitude's index in bits 0-2 and its sign in bit 3, value j of a 32-value group in nibble
 // j % 8 of word j / 8. A row: nb blocks of 8 groups (128 bytes each), then 16 scale bytes per block
-// (the integer scale of each 16 values; bit 7 of a block's first byte: IQ2 magnitudes), then a
+// (the integer scale of each 16 values; bit 7 of a block's first byte: IQ2 magnitudes, bit 6: IQ1_S), then a
 // float per block (the f16 scale times 1/8 or 1/4). Here nb counts the 256-value blocks.
-int iq_mag(uint c, bool two) {
-    return two ? (c == 0 ? 8 : (c == 1 ? 25 : 43)) : int(8 * c + (c == 7 ? 6 : 4));
+int iq_mag(uint c, bool two, bool one) {
+    return one ? (c == 0 ? 1 : (c == 1 ? 7 : 9)) : two ? (c == 0 ? 8 : (c == 1 ? 25 : 43)) : int(8 * c + (c == 7 ? 6 : 4));
 }
 
 [numthreads(MV_GROUP, 1, 1)]
@@ -561,7 +561,7 @@ void mv_iq(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
         for (uint p = li & (MV_LANES - 1); p < nb * 8; p += MV_LANES) {
             const uint b = p >> 3, g = p & 7, xb = xbase + b * Q8_BYTES, xq = (xb + Q8_QS) / 16 + g * 2;
             const uint4 q = W4[wq + p], sc = W4[ws + b];
-            const bool two = (sc.x & 0x80) != 0;
+            const bool two = (sc.x & 0x80) != 0, one = (sc.x & 0x40) != 0;
             const uint s2 = sc[g >> 1] >> (16 * (g & 1));   // the scales of values 0-15 and 16-31
             const uint4 x[2] = { X4[xq], X4[xq + 1] };
             int d[2] = { 0, 0 };
@@ -569,12 +569,39 @@ void mv_iq(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
                 const uint w = q[e];
                 [unroll] for (uint k = 0; k < 8; k++) {
                     const uint c = (w >> (4 * k)) & 15;
-                    const int v = iq_mag(c & 7, two);
+                    const int v = iq_mag(c & 7, two, one);
                     d[e >> 1] += (c & 8 ? -v : v) * sx(x[e >> 1][(2 * e + (k >> 2)) & 3], k & 3);
                 }
             }
             const float f = asfloat(W.Load(wbase + nb * 144 + 4 * b));
             sum += asfloat(X.Load(xb + Q8_D)) * f * float(int(s2 & 31) * d[0] + int((s2 >> 8) & 31) * d[1]);
+        }
+    }
+    reduce_store(li, r, t, sum);
+}
+#endif
+
+#ifdef MV_Q2      // compiled on its own too
+// Q2_0 (the down experts of Inkling's smallest files): a row is nb blocks of 64 values q - 1, two bits
+// each (value j in bits 2 (j % 4) of byte j / 4), their 16 bytes each, then their f16 scales (the row
+// padded to 16). The activations as for NVFP4; nb counts the 64-value blocks.
+[numthreads(MV_GROUP, 1, 1)]
+void mv_q2_0(uint3 gid : SV_GroupID, uint li : SV_GroupIndex) {
+    const uint r = gid.x * (MV_GROUP / MV_LANES) + (li >> MV_LOG2), t = gid.y;
+    float sum = 0;
+    if (r < rows) {
+        MV_BASES;
+        for (uint p = li & (MV_LANES - 1); p < nb; p += MV_LANES) {
+            const uint xb = xbase + (p >> 2) * Q8_BYTES, xq = (xb + Q8_QS + (p & 3) * 64) / 16;
+            const uint4 q = W4[wbase / 16 + p];
+            const float dw = f16tof32(W.Load(wbase + 16 * nb + 4 * (p >> 1)) >> (16 * (p & 1)));
+            int d = 0;
+            [unroll] for (uint s = 0; s < 4; s++) {
+                const uint4 x = X4[xq + s];
+                [unroll] for (uint e = 0; e < 4; e++)
+                    [unroll] for (uint k = 0; k < 4; k++) d += (int((q[s] >> (8 * e + 2 * k)) & 3) - 1) * sx(x[e], k);
+            }
+            sum += asfloat(X.Load(xb + Q8_D)) * dw * float(d);
         }
     }
     reduce_store(li, r, t, sum);
