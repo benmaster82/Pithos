@@ -174,7 +174,7 @@ generates 10.0 tok/s, with a lower quality.
   where every expert fits in VRAM.
 
 ## Done
-- Next release: Inkling 2 Mini's smallest file, UD-IQ1_M (7.5 GiB, for 12 GB of RAM): the IQ1_S and
+- v0.8.6: Inkling 2 Mini's smallest file, UD-IQ1_M (7.5 GiB, for 12 GB of RAM): the IQ1_S and
   Q2_0 formats on the CPU (AVX2) and on Vulkan, `build.sh --download-model=inkling-2-mini-iq1m`.
 - v0.8.5: Inkling 2 Mini (experimental), on the CPU and with Vulkan (every layer on the GPU, the
   routed experts on the CPU, the most used ones in VRAM): UD-IQ3_XXS by default, 17–19 tok/s of prompt
