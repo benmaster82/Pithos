@@ -36,6 +36,11 @@ typedef struct { f16_t d; uint8_t qs[QK_K / 4]; uint8_t qh[QK_K / 32]; uint8_t s
 typedef struct { f16_t d; uint8_t qs[QK8_0 / 2]; } block_iq4_nl;                                   /* 18 B */
 typedef struct { f16_t d; uint16_t scales_h; uint8_t scales_l[QK_K / 64]; uint8_t qs[QK_K / 2]; } block_iq4_xs; /* 136 B */
 typedef struct { f16_t d; uint8_t qh[4]; uint8_t qs[QK8_0 / 2]; } block_q5_0;                       /* 22 B */
+/* IQ1_S: 11-bit grid indices (qs low 8 bits, qh 3 bits each), qh bits 12-14 the 32-block scale, bit 15 the shift sign */
+typedef struct { f16_t d; uint8_t qs[QK_K / 8]; uint16_t qh[QK_K / 32]; } block_iq1_s;              /* 50 B */
+/* Q2_0: 64 values (q - 1) * d, q the 2 bits j%4 of qs[j/4] */
+#define QK2_0 64
+typedef struct { f16_t d; uint8_t qs[QK2_0 / 4]; } block_q2_0;                                     /* 18 B */
 
 /* E2M1 values times 2, and the E4M3 scales times 0.5 (the product is the weight) */
 extern const int8_t nvfp4_values[16];
@@ -46,7 +51,7 @@ f16_t f32_to_f16(float f);
 
 /* Kernel: dot one weight row (K elements, format-specific) against nt activation
  * rows (Q8_K, consecutive rows `xstride` blocks apart), writing out[t*ostride].
- * K is a multiple of 256, except for NVFP4 (a multiple of 64) and Q8_0, Q5_0, IQ4_NL (a multiple of 32):
+ * K is a multiple of 256, except for NVFP4, Q2_0 (a multiple of 64) and Q8_0, Q5_0, IQ4_NL (a multiple of 32):
  * the activation rows then end in a partial Q8_K block, zero-padded. */
 typedef void (*dot_rows_fn)(int K, const void *w, const block_q8_K *x, int xstride,
                             int nt, float *out, int ostride);

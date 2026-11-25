@@ -59,7 +59,7 @@ int type_supported(uint32_t t) {
     return t == GGML_F32 || t == GGML_F16 || t == GGML_Q4_0 || t == GGML_Q8_0 ||
            t == GGML_Q4_K || t == GGML_Q5_K || t == GGML_Q6_K || t == GGML_NVFP4 || t == GGML_Q5_0 ||
            t == GGML_IQ2_XXS || t == GGML_IQ2_XS || t == GGML_IQ2_S || t == GGML_IQ3_XXS || t == GGML_IQ3_S ||
-           t == GGML_IQ4_NL || t == GGML_IQ4_XS;
+           t == GGML_IQ4_NL || t == GGML_IQ4_XS || t == GGML_IQ1_S || t == GGML_Q2_0;
 }
 
 const int8_t nvfp4_values[16] = { 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
@@ -190,6 +190,31 @@ void dequant_row(uint32_t type, const void *src, float *y, int K) {
                 y[j + 16] = d * ((int)((b[i].qs[j] >> 4) | ((qh >> (j + 12)) & 0x10)) - 16);
             }
             y += 32;
+        }
+    } break;
+    case GGML_Q2_0: {
+        const block_q2_0 *b = (const block_q2_0 *)src;
+        for (int i = 0; i < K / QK2_0; i++) {
+            const float d = f16_to_f32(b[i].d);
+            for (int j = 0; j < QK2_0; j++) y[j] = ((int)((b[i].qs[j / 4] >> 2 * (j % 4)) & 3) - 1) * d;
+            y += QK2_0;
+        }
+    } break;
+    case GGML_IQ1_S: {
+        const block_iq1_s *b = (const block_iq1_s *)src;
+        for (int i = 0; i < K / QK_K; i++) {
+            const float d = f16_to_f32(b[i].d);
+            const uint8_t *qs = b[i].qs;
+            for (int ib = 0; ib < 8; ib++) {
+                const int qh = b[i].qh[ib];
+                const float dl = d * (2 * ((qh >> 12) & 7) + 1), delta = qh & 0x8000 ? -IQ1S_DELTA : IQ1S_DELTA;
+                for (int l = 0; l < 4; l++) {
+                    const int8_t *g = (const int8_t *)(iq1s_grid + (qs[l] | (((qh >> 3 * l) & 7) << 8)));
+                    for (int j = 0; j < 8; j++) y[j] = dl * (g[j] + delta);
+                    y += 8;
+                }
+                qs += 4;
+            }
         }
     } break;
     case GGML_IQ4_NL: {
@@ -528,6 +553,8 @@ DEF_DEQ(rows_iq2_xs_scalar, GGML_IQ2_XS)
 DEF_DEQ(rows_iq2_s_scalar, GGML_IQ2_S)
 DEF_DEQ(rows_iq3_xxs_scalar, GGML_IQ3_XXS)
 DEF_DEQ(rows_iq3_s_scalar, GGML_IQ3_S)
+DEF_DEQ(rows_iq1_s_scalar, GGML_IQ1_S)
+DEF_DEQ(rows_q2_0_scalar, GGML_Q2_0)
 
 static void f16_to_f32_row_scalar(const f16_t *x, float *y, int n) {
     for (int i = 0; i < n; i++) y[i] = f16_to_f32(x[i]);
@@ -600,6 +627,8 @@ static void init_scalar(Kernels *k) {
     k->dot[GGML_IQ2_S] = rows_iq2_s_scalar;
     k->dot[GGML_IQ3_XXS] = rows_iq3_xxs_scalar;
     k->dot[GGML_IQ3_S] = rows_iq3_s_scalar;
+    k->dot[GGML_IQ1_S] = rows_iq1_s_scalar;
+    k->dot[GGML_Q2_0] = rows_q2_0_scalar;
     k->quantize_q8_K = quantize_q8_K_scalar;
     k->f16_to_f32_row = f16_to_f32_row_scalar;
     k->f32_to_f16_row = f32_to_f16_row_scalar;

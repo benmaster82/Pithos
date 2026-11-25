@@ -114,14 +114,15 @@ int main(int argc, char **argv) {
         }
     const uint32_t types[] = { GGML_Q4_K, GGML_Q5_K, GGML_Q6_K, GGML_Q8_0, GGML_Q4_0, GGML_NVFP4, GGML_NVFP4,
                                GGML_Q5_0, GGML_Q5_0, GGML_IQ4_NL, GGML_IQ4_NL, GGML_IQ4_XS, GGML_IQ2_XXS,
-                               GGML_IQ2_XS, GGML_IQ2_S, GGML_IQ3_XXS, GGML_IQ3_S };
-    const int sizes[] = { 2048, 2048, 2048, 2048, 2048, 2304, 1152, 2304, 1152, 2304, 1152, 2304, 2304, 2304, 2304, 2304, 2304 };
+                               GGML_IQ2_XS, GGML_IQ2_S, GGML_IQ3_XXS, GGML_IQ3_S, GGML_IQ1_S, GGML_Q2_0, GGML_Q2_0 };
+    const int sizes[] = { 2048, 2048, 2048, 2048, 2048, 2304, 1152, 2304, 1152, 2304, 1152, 2304, 2304, 2304, 2304, 2304, 2304,
+                          2304, 2304, 1152 };
     for (int ki = 0; ki < nk; ki++)
         for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++)
             if (ks[ki].dot[types[i]]) ok &= synth_check(ks[ki].name, &ks[ki], types[i], sizes[i]);
     /* rows converted to Q8_0 (Vulkan's copy of the IQ experts): every SIMD set against the scalar one,
      * within one step of the Q8_0 grid */
-    const uint32_t qt[] = { GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ2_S, GGML_IQ3_XXS, GGML_IQ3_S, GGML_IQ4_XS, GGML_Q4_K, GGML_Q6_K };
+    const uint32_t qt[] = { GGML_IQ2_XXS, GGML_IQ2_XS, GGML_IQ2_S, GGML_IQ3_XXS, GGML_IQ3_S, GGML_IQ4_XS, GGML_IQ1_S, GGML_Q4_K, GGML_Q6_K };
     for (int ki = 1; ki < nk; ki++)
         for (size_t i = 0; i < sizeof(qt) / sizeof(qt[0]); i++) {
             const int K = 2304;

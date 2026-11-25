@@ -477,6 +477,23 @@ static inline void unpack_iq3_s(const block_iq3_s *b, __m256i q[8], __m256i sc[8
     }
 }
 
+/* IQ1_S times 8: 8 g + 1 or 8 g - 1 (g in -1, 0, 1 from the grid, the sign that of the shift) */
+static inline __m256i iq1s_values(__m256i g, int neg) {
+    return _mm256_add_epi8(_mm256_sign_epi8(_mm256_set1_epi8(8), g), _mm256_set1_epi8(neg ? -1 : 1));
+}
+
+static inline void unpack_iq1_s(const block_iq1_s *b, __m256i q[8], __m256i sc[8], float *d) {
+    *d = 0.125f * h2f(b->d);
+    for (int ib = 0; ib < 8; ib++) {
+        const uint8_t *qs = b->qs + 4 * ib;
+        const int h = b->qh[ib];
+        const __m256i g = _mm256_set_epi64x((long long)iq1s_grid[qs[3] | (h >> 1 & 0x700)], (long long)iq1s_grid[qs[2] | (h << 2 & 0x700)],
+                                            (long long)iq1s_grid[qs[1] | (h << 5 & 0x700)], (long long)iq1s_grid[qs[0] | (h << 8 & 0x700)]);
+        q[ib] = iq1s_values(g, h & 0x8000);
+        sc[ib] = _mm256_set1_epi16((short)(2 * (h >> 12 & 7) + 1));
+    }
+}
+
 /* 16 bytes of nibbles -> 32 int8 codebook values: low nibbles first, then high */
 static inline __m256i iq4_values(const uint8_t *qs) {
     const __m128i tab = _mm_loadu_si128((const __m128i *)kvalues_iq4nl), m4 = _mm_set1_epi8(0xF);
@@ -619,6 +636,31 @@ static float dot1_iq2_s(int K, const block_iq2_s *b, const block_q8_K *y) {
     return hsum_ps(acc);
 }
 
+static float dot1_iq1_s(int K, const block_iq1_s *b, const block_q8_K *y) {
+    const __m128i sh = _mm_setr_epi32(8, 5, 2, -1), m700 = _mm_set1_epi32(0x700);
+    __m256 acc = _mm256_setzero_ps();
+    for (int i = 0; i < K / QK_K; i++) {
+        __m256i s0 = _mm256_setzero_si256(), s1 = _mm256_setzero_si256();
+        for (int g = 0; g < 8; g++) {
+            uint32_t q4;
+            memcpy(&q4, b[i].qs + 4 * g, 4);
+            const int h = b[i].qh[g];
+            /* bits 3l..3l+2 of qh to bits 8-10: shifts 8, 5, 2 left and 1 right */
+            const __m128i hv = _mm_set1_epi32(h);
+            const __m128i hi = _mm_and_si128(_mm_blend_epi32(_mm_sllv_epi32(hv, sh), _mm_srli_epi32(hv, 1), 8), m700);
+            const __m128i idx = _mm_or_si128(_mm_cvtepu8_epi32(_mm_cvtsi32_si128((int)q4)), hi);
+            const __m256i q = iq1s_values(_mm256_i32gather_epi64((const long long *)iq1s_grid, idx, 8), h & 0x8000);
+            const __m256i a = _mm256_loadu_si256((const __m256i *)(y[i].qs + 32 * g));
+            const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_abs_epi8(q), _mm256_sign_epi8(a, q)),
+                                                _mm256_set1_epi16((short)(2 * (h >> 12 & 7) + 1)));
+            if (g & 1) s1 = _mm256_add_epi32(s1, p);
+            else s0 = _mm256_add_epi32(s0, p);
+        }
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(0.125f * h2f(b[i].d) * y[i].d), _mm256_cvtepi32_ps(_mm256_add_epi32(s0, s1)), acc);
+    }
+    return hsum_ps(acc);
+}
+
 /* each weight block is unpacked once per group of MT_MAX tokens */
 #define DEF_IQ_ROWS(NAME, BT, UNPACK)                                                                     \
     static void NAME(int K, const void *w, const block_q8_K *x, int xs, int nt, float *out, int os) {    \
@@ -646,6 +688,7 @@ DEF_IQ_ROWS(rows_iq2_s_mt, block_iq2_s, unpack_iq2_s)
 DEF_IQ_ROWS(rows_iq3_xxs_mt, block_iq3_xxs, unpack_iq3_xxs)
 DEF_IQ_ROWS(rows_iq3_s, block_iq3_s, unpack_iq3_s)
 DEF_IQ_ROWS(rows_iq4_xs, block_iq4_xs, unpack_iq4_xs)
+DEF_IQ_ROWS(rows_iq1_s_mt, block_iq1_s, unpack_iq1_s)
 
 /* one token through the gathering kernels above, more through the unpacked blocks */
 #define DEF_IQ_ROWS1(NAME, MT, BT, DOT1)                                                                  \
@@ -657,6 +700,7 @@ DEF_IQ_ROWS1(rows_iq2_xxs, rows_iq2_xxs_mt, block_iq2_xxs, dot1_iq2_xxs)
 DEF_IQ_ROWS1(rows_iq2_xs, rows_iq2_xs_mt, block_iq2_xs, dot1_iq2_xs)
 DEF_IQ_ROWS1(rows_iq2_s, rows_iq2_s_mt, block_iq2_s, dot1_iq2_s)
 DEF_IQ_ROWS1(rows_iq3_xxs, rows_iq3_xxs_mt, block_iq3_xxs, dot1_iq3_xxs)
+DEF_IQ_ROWS1(rows_iq1_s, rows_iq1_s_mt, block_iq1_s, dot1_iq1_s)
 
 /* 8 int16 values times f, rounded, as int32 in two halves packed back to int16 */
 static inline __m128i q8_round8(__m128i v, __m128 f) {
@@ -708,6 +752,7 @@ static void row_to_q8_0(uint32_t type, const void *row, int K, int8_t *qs, f16_t
     case GGML_IQ3_XXS: IQ_Q8(block_iq3_xxs, unpack_iq3_xxs)
     case GGML_IQ3_S: IQ_Q8(block_iq3_s, unpack_iq3_s)
     case GGML_IQ4_XS: IQ_Q8(block_iq4_xs, unpack_iq4_xs)
+    case GGML_IQ1_S: IQ_Q8(block_iq1_s, unpack_iq1_s)
     default: row_to_q8_0_other(type, row, K, qs, d);
     }
 }
@@ -781,6 +826,41 @@ static inline __m256i unpack_q5_0(const block_q5_0 *b) {
     }
 DEF_32_ROWS(rows_iq4_nl, block_iq4_nl, unpack_iq4_nl)
 DEF_32_ROWS(rows_q5_0, block_q5_0, unpack_q5_0)
+
+/* Q2_0: 64 values q - 1 per f16 scale, value j in bits 2 (j % 4) of byte j / 4; four blocks per Q8_K block
+ * (the last one may be partial), each unpacked once per group of MT_MAX tokens */
+static inline void unpack_q2_0(const block_q2_0 *b, __m256i *lo, __m256i *hi) {
+    const __m128i v = _mm_loadu_si128((const __m128i *)b->qs), m3 = _mm_set1_epi8(3), one = _mm_set1_epi8(1);
+    const __m128i p0 = _mm_and_si128(v, m3), p1 = _mm_and_si128(_mm_srli_epi16(v, 2), m3);
+    const __m128i p2 = _mm_and_si128(_mm_srli_epi16(v, 4), m3), p3 = _mm_and_si128(_mm_srli_epi16(v, 6), m3);
+    const __m128i a0 = _mm_unpacklo_epi8(p0, p1), b0 = _mm_unpacklo_epi8(p2, p3);
+    const __m128i a1 = _mm_unpackhi_epi8(p0, p1), b1 = _mm_unpackhi_epi8(p2, p3);
+    *lo = _mm256_set_m128i(_mm_sub_epi8(_mm_unpackhi_epi16(a0, b0), one), _mm_sub_epi8(_mm_unpacklo_epi16(a0, b0), one));
+    *hi = _mm256_set_m128i(_mm_sub_epi8(_mm_unpackhi_epi16(a1, b1), one), _mm_sub_epi8(_mm_unpacklo_epi16(a1, b1), one));
+}
+
+static void rows_q2_0(int K, const void *w, const block_q8_K *x, int xs, int nt, float *out, int os) {
+    const block_q2_0 *b = (const block_q2_0 *)w;
+    const int nb = K / QK2_0;
+    __m256 acc[MT_MAX];
+    for (int t0 = 0; t0 < nt; t0 += MT_MAX) {
+        const int tn = nt - t0 < MT_MAX ? nt - t0 : MT_MAX;
+        for (int t = 0; t < tn; t++) acc[t] = _mm256_setzero_ps();
+        for (int j = 0; j < nb; j++) {
+            __m256i lo, hi;
+            unpack_q2_0(b + j, &lo, &hi);
+            const float d = h2f(b[j].d);
+            const int i = j / 4, o = QK2_0 * (j % 4);
+            for (int t = 0; t < tn; t++) {
+                const block_q8_K *y = x + (size_t)(t0 + t) * xs + i;
+                const __m256i p = _mm256_add_epi32(dot_i8_32(lo, _mm256_loadu_si256((const __m256i *)(y->qs + o))),
+                                                   dot_i8_32(hi, _mm256_loadu_si256((const __m256i *)(y->qs + o + 32))));
+                acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * y->d), _mm256_cvtepi32_ps(p), acc[t]);
+            }
+        }
+        for (int t = 0; t < tn; t++) out[(size_t)(t0 + t) * os] = hsum_ps(acc[t]);
+    }
+}
 
 /* ------------------------------------------------------------------ activation quantization */
 
@@ -949,6 +1029,8 @@ void kernels_init_avx2(Kernels *k) {
     k->dot[GGML_IQ2_S] = rows_iq2_s;
     k->dot[GGML_IQ3_XXS] = rows_iq3_xxs;
     k->dot[GGML_IQ3_S] = rows_iq3_s;
+    k->dot[GGML_IQ1_S] = rows_iq1_s;
+    k->dot[GGML_Q2_0] = rows_q2_0;
     k->quantize_q8_K = quantize_q8_K;
     k->f16_to_f32_row = f16_to_f32_row;
     k->f32_to_f16_row = f32_to_f16_row;
